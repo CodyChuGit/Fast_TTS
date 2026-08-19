@@ -10,7 +10,8 @@
     "design"
   ],
   "modes": [
-    "offline"
+    "offline",
+    "streaming"
   ],
   "languages": [
     "zh",
@@ -160,6 +161,29 @@
         "required": false,
         "min": 1,
         "default": 8192
+      },
+      {
+        "name": "chunk_frames",
+        "type": "int",
+        "description": "Complete codec frames per emitted PCM chunk in streaming mode; default 2.",
+        "required": false,
+        "min": 1,
+        "default": 2
+      },
+      {
+        "name": "decoder_context_frames",
+        "type": "int",
+        "description": "Speech decoder left-context frames retained across streaming chunks; default 25.",
+        "required": false,
+        "min": 0,
+        "default": 25
+      },
+      {
+        "name": "stream_accumulate",
+        "type": "bool",
+        "description": "Retain and return the completed waveform in addition to emitting PCM chunks; default false keeps memory bounded.",
+        "required": false,
+        "default": false
       }
     ],
     "session": [

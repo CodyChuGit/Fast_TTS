@@ -987,6 +987,7 @@ audiocpp_add_model(qwen3_tts
         src/models/qwen3_tts/tokenizer_text.cpp
         src/models/qwen3_tts/tokenizer_speech_encoder.cpp
         src/models/qwen3_tts/tokenizer_speech_decoder.cpp
+        src/models/qwen3_tts/stream_decoder.cpp
         src/models/qwen3_tts/speaker_encoder.cpp
         src/models/qwen3_tts/talker.cpp
         src/models/qwen3_tts/prompt_tts_voice_clone.cpp
@@ -1590,6 +1591,8 @@ if (ENGINE_BUILD_WARMBENCH)
     add_engine_warmbench(qwen3_asr_warm_bench tests/qwen3_asr/qwen3_asr_warm_bench.cpp)
     add_engine_warmbench(qwen3_forced_aligner_warm_bench tests/qwen3_forced_aligner/qwen3_forced_aligner_warm_bench.cpp)
     add_engine_warmbench(qwen3_tts_warm_bench tests/qwen3_tts/qwen3_tts_warm_bench.cpp)
+    add_engine_warmbench(qwen3_tts_stream_latency benchmarks/stream_latency/main.cpp)
+    add_engine_warmbench(qwen3_tts_streaming_integration tests/qwen3_tts/qwen3_tts_streaming_integration.cpp)
     add_engine_warmbench(seed_vc_warm_bench tests/seed_vc/seed_vc_warm_bench.cpp)
     add_engine_warmbench(silero_vad_warm_bench tests/silero_vad/silero_vad_warm_bench.cpp)
     add_engine_warmbench(sortformer_diar_warm_bench tests/sortformer_diar/sortformer_diar_warm_bench.cpp)
@@ -1928,6 +1931,14 @@ if (ENGINE_BUILD_TESTS)
     add_test(
         NAME qwen3_forced_aligner_processor_test
         COMMAND qwen3_forced_aligner_processor_test
+    )
+
+    add_engine_unittest(qwen3_tts_stream_decoder_test tests/unittests/test_qwen3_tts_stream_decoder.cpp)
+    target_include_directories(qwen3_tts_stream_decoder_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
+
+    add_test(
+        NAME qwen3_tts_stream_decoder_test
+        COMMAND qwen3_tts_stream_decoder_test
     )
 
     add_engine_unittest(fun_asr_nano_assets_test tests/unittests/test_fun_asr_nano_assets.cpp)
@@ -2290,6 +2301,9 @@ if (ENGINE_BUILD_TESTS)
 endif()
 
 if (ENGINE_BUILD_EXAMPLES)
+    add_executable(qwen3_tts_live examples/live_tts.cpp)
+    target_link_libraries(qwen3_tts_live PRIVATE engine_runtime ggml)
+
     add_executable(ggml_simple_inference
         examples/ggml_simple_inference.cpp
     )

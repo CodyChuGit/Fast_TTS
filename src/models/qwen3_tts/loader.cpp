@@ -34,17 +34,17 @@ runtime::CapabilitySet capabilities(const Qwen3TTSAssets & assets) {
     runtime::CapabilitySet out;
     if (assets.config.variant == Qwen3TTSVariant::Base) {
         out.supported_tasks = {
-            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline}},
+            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline, runtime::RunMode::Streaming}},
         };
         out.supports_speaker_reference = true;
     } else if (assets.config.variant == Qwen3TTSVariant::VoiceDesign) {
         out.supported_tasks = {
-            {runtime::VoiceTaskKind::VoiceDesign, {runtime::RunMode::Offline}},
+            {runtime::VoiceTaskKind::VoiceDesign, {runtime::RunMode::Offline, runtime::RunMode::Streaming}},
         };
         out.supports_style_condition = true;
     } else if (assets.config.variant == Qwen3TTSVariant::CustomVoice) {
         out.supported_tasks = {
-            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline}},
+            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline, runtime::RunMode::Streaming}},
         };
         out.supports_style_condition = true;
     }
@@ -54,6 +54,11 @@ runtime::CapabilitySet capabilities(const Qwen3TTSAssets & assets) {
 
 runtime::ModelCliInterface cli(const Qwen3TTSAssets &) {
     runtime::ModelCliInterface out;
+    out.request_options = {
+        {"chunk_frames", "n", "Codec frames per PCM event; default 2."},
+        {"decoder_context_frames", "n", "Sliding speech-decoder left context; default 25."},
+        {"stream_accumulate", "true|false", "Also retain the completed waveform for --out; default false."},
+    };
     out.session_options = {
         {"qwen3_tts.mem_saver", "true|false", "Release the talker cached-step graph after each request; default false."},
         {"qwen3_tts.perf_mode", "off|flash_attention", "Q8_0-only attention performance mode; default off keeps the exact-safe path."},
@@ -71,8 +76,8 @@ public:
     runtime::CapabilitySet advertised_capabilities() const override {
         runtime::CapabilitySet out;
         out.supported_tasks = {
-            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline}},
-            {runtime::VoiceTaskKind::VoiceDesign, {runtime::RunMode::Offline}},
+            {runtime::VoiceTaskKind::Tts, {runtime::RunMode::Offline, runtime::RunMode::Streaming}},
+            {runtime::VoiceTaskKind::VoiceDesign, {runtime::RunMode::Offline, runtime::RunMode::Streaming}},
         };
         out.supports_speaker_reference = true;
         out.supports_style_condition = true;
@@ -134,8 +139,8 @@ const runtime::CapabilitySet & Qwen3TTSLoadedModel::capabilities() const noexcep
 std::unique_ptr<runtime::IVoiceTaskSession> Qwen3TTSLoadedModel::create_task_session(
     const runtime::TaskSpec & task,
     const runtime::SessionOptions & options) const {
-    if (task.mode != runtime::RunMode::Offline) {
-        throw std::runtime_error("Qwen3 TTS only supports offline sessions");
+    if (task.mode != runtime::RunMode::Offline && task.mode != runtime::RunMode::Streaming) {
+        throw std::runtime_error("Qwen3 TTS requires an offline or streaming session");
     }
     if (assets_->config.variant == Qwen3TTSVariant::Base && task.task != runtime::VoiceTaskKind::Tts) {
         throw std::runtime_error("Qwen3 base TTS model only supports the Tts task");

@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,6 +38,20 @@ struct Qwen3TalkerCodes {
     Qwen3SpeechCodes decoder_input_codes;
 };
 
+// A complete temporal codec frame. Qwen3-TTS predicts the first codebook in
+// the talker and the remaining codebooks in the code predictor; callbacks are
+// invoked only after that complete set is available.
+struct Qwen3TalkerFrame {
+    int64_t index = 0;
+    std::vector<int32_t> codes;
+};
+
+// Return false to stop generation after the delivered frame. This is used by
+// streaming sessions for prompt cancellation and by network sinks when a
+// client disconnects.
+using Qwen3TalkerFrameCallback = std::function<bool(const Qwen3TalkerFrame &)>;
+using Qwen3TalkerCancelCheck = std::function<bool()>;
+
 void validate_qwen3_talker_voice_clone_prefill(
     const Qwen3TalkerPrefill & prefill,
     int64_t hidden_size);
@@ -53,6 +68,12 @@ public:
     Qwen3TalkerCodes generate(
         const Qwen3TalkerPrefill & prefill,
         const Qwen3TTSGenerationOptions & options,
+        float repetition_penalty = 1.05F);
+    Qwen3TalkerCodes generate_streaming(
+        const Qwen3TalkerPrefill & prefill,
+        const Qwen3TTSGenerationOptions & options,
+        const Qwen3TalkerFrameCallback & on_frame,
+        const Qwen3TalkerCancelCheck & cancelled = {},
         float repetition_penalty = 1.05F);
     int64_t release_cached_step_graph();
 

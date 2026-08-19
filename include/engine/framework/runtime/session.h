@@ -270,6 +270,9 @@ public:
     virtual void set_stream_event_sink(StreamEventCallback sink) {
         (void)sink;
     }
+    virtual void cancel_stream() {
+        reset();
+    }
     virtual TaskResult finish_stream() {
         return finalize();
     }

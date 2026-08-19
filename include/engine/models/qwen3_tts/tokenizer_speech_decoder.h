@@ -18,6 +18,9 @@ namespace engine::models {
 
 namespace qwen3_tts {
 
+inline constexpr int64_t kQwen3TTSSampleRate = 24000;
+inline constexpr int64_t kQwen3TTSSamplesPerCodecFrame = 1920;
+
 struct Qwen3SpeechTokenizerDecoderWeights;
 class Qwen3SpeechTokenizerDecoderGraph;
 

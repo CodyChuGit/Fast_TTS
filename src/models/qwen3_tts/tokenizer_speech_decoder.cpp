@@ -42,8 +42,6 @@ namespace {
 using Clock = std::chrono::steady_clock;
 namespace binding = modules::binding;
 
-constexpr int64_t kSampleRate = 24000;
-constexpr int64_t kDecodeSamplesPerCode = 1920;
 constexpr int64_t kChunkCodes = 300;
 constexpr int64_t kLeftContextCodes = 25;
 constexpr std::array<int64_t, 2> kStrixHaloCachedChunkFrames{300, 105};
@@ -1186,7 +1184,7 @@ runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode(const Qwen3Speec
         throw std::runtime_error("Qwen3 speech decoder codec payload size mismatch");
     }
     std::vector<float> samples;
-    samples.reserve(static_cast<size_t>(codec_codes.frames * kDecodeSamplesPerCode));
+    samples.reserve(static_cast<size_t>(codec_codes.frames * kQwen3TTSSamplesPerCodecFrame));
     double graph_build_ms = 0.0;
     double input_upload_ms = 0.0;
     double graph_compute_ms = 0.0;
@@ -1242,11 +1240,11 @@ runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode(const Qwen3Speec
         graph_compute_ms += graph->last_graph_compute_ms();
         output_read_ms += graph->last_output_read_ms();
         ++chunks;
-        const int64_t drop = context * kDecodeSamplesPerCode;
+        const int64_t drop = context * kQwen3TTSSamplesPerCodecFrame;
         if (drop > static_cast<int64_t>(decoded.size())) {
             throw std::runtime_error("Qwen3 speech decoder chunk context exceeds decoded waveform");
         }
-        const int64_t valid_samples = chunk_frames * kDecodeSamplesPerCode;
+        const int64_t valid_samples = chunk_frames * kQwen3TTSSamplesPerCodecFrame;
         if (valid_samples < drop || valid_samples > static_cast<int64_t>(decoded.size())) {
             throw std::runtime_error("Qwen3 speech decoder valid sample range exceeds decoded waveform");
         }
@@ -1261,7 +1259,7 @@ runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode(const Qwen3Speec
     debug::timing_log_scalar("qwen3_tts.speech_decoder.graph.compute_ms", graph_compute_ms);
     debug::timing_log_scalar("qwen3_tts.speech_decoder.output_read_ms", output_read_ms);
     debug::timing_log_scalar("qwen3_tts.speech_decoder.total_ms", engine::debug::elapsed_ms(total_start, Clock::now()));
-    return runtime::AudioBuffer{kSampleRate, 1, std::move(samples)};
+    return runtime::AudioBuffer{static_cast<int>(kQwen3TTSSampleRate), 1, std::move(samples)};
 }
 
 runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode_and_trim_reference(
@@ -1290,10 +1288,10 @@ runtime::AudioBuffer Qwen3SpeechTokenizerDecoderRuntime::decode_and_trim_referen
     combined.codes.insert(combined.codes.end(), reference_codes.codes.begin(), reference_codes.codes.end());
     combined.codes.insert(combined.codes.end(), generated_codes.codes.begin(), generated_codes.codes.end());
     auto audio = decode(combined);
-    if (reference_codes.frames > std::numeric_limits<int64_t>::max() / kDecodeSamplesPerCode) {
+    if (reference_codes.frames > std::numeric_limits<int64_t>::max() / kQwen3TTSSamplesPerCodecFrame) {
         throw std::runtime_error("Qwen3 speech decoder reference sample count is too large");
     }
-    const int64_t cut = reference_codes.frames * kDecodeSamplesPerCode;
+    const int64_t cut = reference_codes.frames * kQwen3TTSSamplesPerCodecFrame;
     if (static_cast<uint64_t>(cut) > audio.samples.size()) {
         throw std::runtime_error("Qwen3 speech decoder reference trim is out of range");
     }

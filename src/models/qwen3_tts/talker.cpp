@@ -1684,7 +1684,10 @@ public:
     Qwen3TalkerCodes generate(
         const Qwen3TalkerPrefill & request,
         const Qwen3TTSGenerationOptions & options,
-        float repetition_penalty) {
+        float repetition_penalty,
+        const Qwen3TalkerFrameCallback & on_frame,
+        const Qwen3TalkerCancelCheck & cancelled,
+        bool collect_output_codes) {
         const auto total_start = Clock::now();
         const int64_t max_new_tokens = options.max_new_tokens;
         if (max_new_tokens <= 0 || max_new_tokens > generation_capacity_) {
@@ -1771,7 +1774,11 @@ public:
         double cached_step_ms = 0.0;
         CodePredictorTiming code_predictor_timing;
         CachedStepTiming cached_step_timing;
+        int64_t generated_frames = 0;
         for (int64_t step = 0; step < max_new_tokens; ++step) {
+            if (cancelled && cancelled()) {
+                break;
+            }
             auto logits = current.logits.values;
             const auto processor_start = Clock::now();
             apply_main_talker_processors(logits, config, generated_first_codes, step, repetition_penalty);
@@ -1804,8 +1811,23 @@ public:
             code_predictor_timing.input_upload_ms += predictor_timing.input_upload_ms;
             code_predictor_timing.graph_compute_ms += predictor_timing.graph_compute_ms;
             code_predictor_timing.output_read_ms += predictor_timing.output_read_ms;
-            out.generated_codes.codes.insert(out.generated_codes.codes.end(), frame.codes.begin(), frame.codes.end());
-            ++out.generated_codes.frames;
+            if (collect_output_codes) {
+                out.generated_codes.codes.insert(
+                    out.generated_codes.codes.end(), frame.codes.begin(), frame.codes.end());
+            }
+            ++generated_frames;
+            out.generated_codes.frames = collect_output_codes ? generated_frames : 0;
+
+            // Deliver the frame before computing the next talker step. A
+            // decoder callback can therefore emit PCM while later codec
+            // frames have not yet been generated; this is the key ordering
+            // guarantee required for true model streaming.
+            if (on_frame && !on_frame(Qwen3TalkerFrame{
+                                generated_frames - 1,
+                                frame.codes,
+                            })) {
+                break;
+            }
 
             const auto frame_embed_start = Clock::now();
             const auto text_hidden = step < trailing_rows
@@ -1814,7 +1836,7 @@ public:
             const auto embed = frame_embedding(frame, text_hidden, weights_->weights(), config);
             frame_embed_ms += engine::debug::elapsed_ms(frame_embed_start, Clock::now());
             if (step + 1 < max_new_tokens) {
-                ensure_cached_step_capacity(prompt_steps + out.generated_codes.frames);
+                ensure_cached_step_capacity(prompt_steps + generated_frames);
                 const auto step_start = Clock::now();
                 current = cached_step_graph_->run_step(embed);
                 cached_step_ms += engine::debug::elapsed_ms(step_start, Clock::now());
@@ -1826,15 +1848,17 @@ public:
                 cached_step_timing.kv_copy_ms += step_timing.kv_copy_ms;
             }
         }
-        if (request.reference_codes.has_value()) {
-            out.decoder_input_codes.codes = request.reference_codes->codes;
-            out.decoder_input_codes.frames = request.reference_codes->frames;
+        if (collect_output_codes) {
+            if (request.reference_codes.has_value()) {
+                out.decoder_input_codes.codes = request.reference_codes->codes;
+                out.decoder_input_codes.frames = request.reference_codes->frames;
+            }
+            out.decoder_input_codes.codes.insert(
+                out.decoder_input_codes.codes.end(),
+                out.generated_codes.codes.begin(),
+                out.generated_codes.codes.end());
+            out.decoder_input_codes.frames += out.generated_codes.frames;
         }
-        out.decoder_input_codes.codes.insert(
-            out.decoder_input_codes.codes.end(),
-            out.generated_codes.codes.begin(),
-            out.generated_codes.codes.end());
-        out.decoder_input_codes.frames += out.generated_codes.frames;
         debug::timing_log_scalar("qwen3_tts.talker.prompt_state_ms", engine::debug::elapsed_ms(prompt_state_start, prompt_state_end));
         debug::timing_log_scalar("qwen3_tts.talker.prefill_ms", engine::debug::elapsed_ms(prefill_start, prefill_end));
         debug::timing_log_scalar("qwen3_tts.talker.prefill_cache.hit", prefill_cache_hit);
@@ -1905,7 +1929,19 @@ Qwen3TalkerCodes Qwen3TalkerStepRuntime::generate(
     const Qwen3TalkerPrefill & prefill,
     const Qwen3TTSGenerationOptions & options,
     float repetition_penalty) {
-    return impl_->generate(prefill, options, repetition_penalty);
+    return impl_->generate(prefill, options, repetition_penalty, {}, {}, true);
+}
+
+Qwen3TalkerCodes Qwen3TalkerStepRuntime::generate_streaming(
+    const Qwen3TalkerPrefill & prefill,
+    const Qwen3TTSGenerationOptions & options,
+    const Qwen3TalkerFrameCallback & on_frame,
+    const Qwen3TalkerCancelCheck & cancelled,
+    float repetition_penalty) {
+    if (!on_frame) {
+        throw std::runtime_error("Qwen3 streaming talker requires a frame callback");
+    }
+    return impl_->generate(prefill, options, repetition_penalty, on_frame, cancelled, false);
 }
 
 int64_t Qwen3TalkerStepRuntime::release_cached_step_graph() {
