@@ -1590,8 +1590,9 @@ const ServerState::LoadedModel::RuntimeVoicePreset * ServerState::select_voice_p
 engine::runtime::TaskRequest ServerState::build_speech_request(const LoadedModel & model, const Value & body) const {
     std::shared_lock<std::shared_mutex> metadata_lock(model.metadata_mutex);
     engine::runtime::TaskRequest request;
+    const auto * input = body.find("input");
     request.text_input = engine::runtime::Transcript{
-        engine::io::json::require_string(body, "input"),
+        input != nullptr ? input->as_string() : engine::io::json::require_string(body, "text"),
         engine::io::json::optional_string(body, "language", ""),
     };
 
@@ -1605,7 +1606,14 @@ engine::runtime::TaskRequest ServerState::build_speech_request(const LoadedModel
     add_option_from_json(request.options, body, "repetition_penalty", "repetition_penalty");
     add_option_from_json(request.options, body, "guidance_scale", "guidance_scale");
     add_option_from_json(request.options, body, "num_inference_steps", "num_inference_steps");
+    add_option_from_json(request.options, body, "chunk_frames", "chunk_frames");
+    add_option_from_json(request.options, body, "decoder_context_frames", "decoder_context_frames");
+    add_option_from_json(request.options, body, "speaker_embedding_only", "speaker_embedding_only");
+    add_option_from_json(request.options, body, "stream_accumulate", "stream_accumulate");
     if (const auto * value = body.find("instructions")) {
+        request.options["instruction"] = value->as_string();
+    }
+    if (const auto * value = body.find("instruction")) {
         request.options["instruction"] = value->as_string();
     }
 
@@ -1824,11 +1832,17 @@ ServerState::TimedTaskResult ServerState::run_streaming_model_from(
 HttpResponse ServerState::handle_speech(const std::string & body_text) {
     const auto body = engine::io::json::parse(body_text);
     auto & model = require_model(body);
-    const auto request = build_speech_request(model, body);
+    auto request = build_speech_request(model, body);
     if (body.find("stream_format") != nullptr || bool_field(body, "stream", false)) {
         return handle_speech_stream(model, request, body);
     }
     const auto busy_timeout_ms = parse_busy_timeout_override(body);
+    if (model_run_mode(model) == engine::runtime::RunMode::Streaming) {
+        // A non-streaming OpenAI-compatible request still expects a completed
+        // WAV response. Streaming Qwen sessions otherwise keep no whole-output
+        // buffer by design.
+        request.options["stream_accumulate"] = "true";
+    }
     const auto timed_result = model_run_mode(model) == engine::runtime::RunMode::Streaming
         ? run_streaming_model(model, request, {}, busy_timeout_ms)
         : run_model(model, request, busy_timeout_ms);

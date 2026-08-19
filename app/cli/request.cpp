@@ -3,6 +3,7 @@
 #include "args.h"
 
 #include "engine/framework/audio/wav_reader.h"
+#include "engine/framework/io/filesystem.h"
 
 #include <cmath>
 #include <filesystem>
@@ -272,6 +273,13 @@ engine::runtime::TaskRequest build_request_from_cli(int argc, char ** argv) {
     if (const auto text = find_arg(argc, argv, "--text")) {
         request.text_input = engine::runtime::Transcript{*text, language};
     }
+    if (const auto text_file = find_arg(argc, argv, "--text-file")) {
+        if (request.text_input.has_value()) {
+            throw std::runtime_error("choose only one of --text or --text-file");
+        }
+        request.text_input = engine::runtime::Transcript{
+            engine::io::read_text_file(std::filesystem::path(*text_file)), language};
+    }
     if (const auto audio_path = find_arg(argc, argv, "--audio")) {
         if (is_stdin_audio_source(*audio_path)) {
             // Live PCM arrives chunk by chunk, so only the format contract is known up front.
@@ -374,6 +382,10 @@ engine::runtime::TaskRequest build_request_from_cli(int argc, char ** argv) {
     set_option_from_arg(argc, argv, "--num-inference-steps", "num_inference_steps", request.options);
     set_option_from_arg(argc, argv, "--text-chunk-size", "text_chunk_size", request.options);
     set_option_from_arg(argc, argv, "--text-chunk-mode", "text_chunk_mode", request.options);
+    set_option_from_arg(argc, argv, "--chunk-frames", "chunk_frames", request.options);
+    set_option_from_arg(argc, argv, "--decoder-context-frames", "decoder_context_frames", request.options);
+    set_option_from_arg(argc, argv, "--speaker-embedding-only", "speaker_embedding_only", request.options);
+    set_option_from_arg(argc, argv, "--stream-accumulate", "stream_accumulate", request.options);
     set_option_from_arg(argc, argv, "--audio-chunk-seconds", "audio_chunk_seconds", request.options);
     set_option_from_arg(argc, argv, "--audio-chunk-mode", "audio_chunk_mode", request.options);
     set_option_from_arg(argc, argv, "--use-prosody-code", "use_prosody_code", request.options);
