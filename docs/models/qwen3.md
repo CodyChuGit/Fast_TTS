@@ -11,7 +11,7 @@ Qwen3 TTS Base is the voice-clone TTS path. It needs reference audio and can use
 | Family | `qwen3_tts` |
 | Model directory | `models/Qwen3-TTS-12Hz-1.7B-Base` |
 | Task | `tts` |
-| Modes | `offline` |
+| Modes | `offline`, `streaming` |
 | Voice input | Reference WAV through `--voice-ref` |
 | Transcript | Optional `--reference-text` |
 
@@ -37,7 +37,7 @@ Qwen3 VoiceDesign creates a voice from an instruction. It does not require a spe
 | Family | `qwen3_tts` |
 | Model directory | `models/Qwen3-TTS-12Hz-1.7B-VoiceDesign` |
 | Task | `vdes` |
-| Modes | `offline` |
+| Modes | `offline`, `streaming` |
 | Voice input | Instruction text through `--instruct` |
 | Reference audio | Not required |
 
@@ -62,7 +62,7 @@ Qwen3 CustomVoice uses speaker ids packaged with the model. The CLI passes the s
 | Family | `qwen3_tts` |
 | Model directory | `models/Qwen3-TTS-12Hz-1.7B-CustomVoice` |
 | Task | `tts` |
-| Modes | `offline` |
+| Modes | `offline`, `streaming` |
 | Voice input | Built-in speaker id through `--speaker` |
 | Style control | Optional instruction through `--instruct` |
 | External voice WAV | Not used by this path |

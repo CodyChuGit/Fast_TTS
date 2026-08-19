@@ -1,5 +1,11 @@
 # audio.cpp
 
+> [!NOTE]
+> This fork adds **true incremental Qwen3-TTS generation**: persistent talker
+> KV state, complete codec-frame callbacks, a 25-frame sliding speech decoder,
+> Base/CustomVoice/VoiceDesign streaming, and HTTP PCM delivery. See the
+> [qwen3-tts-streamer guide](README_QWEN3_TTS_STREAMING.md).
+
 [![0xShug0/audio.cpp | Trendshift](https://trendshift.io/api/badge/trendshift/repositories/64983/daily?language=C%2B%2B)](https://trendshift.io/repositories/64983?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-64983)
 
 `audio.cpp` is a high-performance C++ audio inference framework built on top of `ggml`, designed to make modern local audio models practical, portable, and fast.
@@ -96,7 +102,7 @@ Runtime tags: safetensors is the default model loading path. `GGUF 16/Q8/Q4/INT8
 | **nemotron_asr** | ASR | 100+ ASR prompt codes incl. auto | Nemotron 3.5 ASR Streaming 0.6B | GGUF 16/Q8, Stream |
 | **qwen3_asr** | ASR | zh, en, yue, ar, de, fr, es, pt, id, it, ko, ru, th, vi, ja, tr, hi, ms, nl, sv, da, fi, pl, cs, fil, fa, el, ro, hu, mk | Qwen3-ASR-0.6B, Qwen3-ASR-1.7B-hf | GGUF 16/Q8, Stream |
 | **qwen3_forced_aligner** | Align | zh, yue, en, de, es, fr, it, pt, ru, ko, ja | Qwen3-ForcedAligner-0.6B | GGUF 16/Q8 |
-| **qwen3_tts** | TTS, Clone, Design, Ctrl | zh, en, fr, de, it, ja, ko, pt, ru, es | Qwen3-TTS-12Hz-0.6B-Base, Qwen3-TTS-12Hz-1.7B-Base, Qwen3-TTS-12Hz-1.7B-CustomVoice, Qwen3-TTS-12Hz-1.7B-VoiceDesign | GGUF 16/Q8 |
+| **qwen3_tts** | TTS, Clone, Design, Ctrl | zh, en, fr, de, it, ja, ko, pt, ru, es | Qwen3-TTS-12Hz-0.6B-Base, Qwen3-TTS-12Hz-1.7B-Base, Qwen3-TTS-12Hz-1.7B-CustomVoice, Qwen3-TTS-12Hz-1.7B-VoiceDesign | GGUF 16/Q8, Stream |
 | **neutts** | TTS, Ctrl | en | NeuTTS 2E with built-in speaker prompts and emotion control | GGUF original precision, Stream |
 | **rvc** | VC | lang agnostic | RVC F16 GGUF with packaged v1/v2 voices and optional retrieval blending | GGUF 16 |
 | **seed_vc** | VC | lang agnostic | SeedVC XLS-R + HiFT, SeedVC Whisper-small + BigVGAN | GGUF 16/Q8 |
