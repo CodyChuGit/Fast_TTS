@@ -65,7 +65,7 @@ void print_task_list_help() {
         << "    --weight <id>\n"
         << "    --log  Stream framework progress and timing logs to stdout\n"
         << "    --log-file <path>  Stream framework progress and timing logs to a file\n"
-        << "    --metrics  Print compact wall time, audio duration, and RTF summary after offline generation\n"
+        << "    --metrics  Print compact wall time, TTFA (streaming), audio duration, and RTF summary\n"
         << "    --load-option key=value\n"
         << "    --session-option key=value\n"
         << "    --request-option key=value\n"
@@ -536,11 +536,40 @@ void run_streaming(
     char ** argv,
     engine::runtime::IStreamingVoiceTaskSession & streaming,
     engine::runtime::IVoiceTaskSession & session,
-    engine::runtime::TaskRequest & request) {
+    engine::runtime::TaskRequest & request,
+    std::chrono::steady_clock::time_point started_at) {
     const auto out_dir = minitts::cli::optional_path_arg(argc, argv, "--out-dir");
+    const bool metrics_requested = minitts::cli::has_arg(argc, argv, "--metrics");
+    std::optional<std::chrono::steady_clock::time_point> first_audio_at;
+    size_t emitted_audio_samples = 0;
+    int emitted_sample_rate = 0;
+    int emitted_channels = 0;
+
+    const auto record_emitted_audio = [&](const engine::runtime::AudioBuffer & audio) {
+        if (audio.samples.empty()) {
+            return;
+        }
+        if (!first_audio_at.has_value()) {
+            first_audio_at = std::chrono::steady_clock::now();
+            emitted_sample_rate = audio.sample_rate;
+            emitted_channels = audio.channels;
+        }
+        if (audio.sample_rate != emitted_sample_rate || audio.channels != emitted_channels) {
+            throw std::runtime_error("streaming output audio format changed between chunks");
+        }
+        emitted_audio_samples += audio.samples.size();
+    };
+
     minitts::cli::PartialTextRenderer partial_renderer(stdout_is_terminal());
     const minitts::app::StreamEventSink sink =
         [&](const engine::runtime::StreamEvent & event) {
+            if (metrics_requested) {
+                if (event.audio_output.has_value()) {
+                    record_emitted_audio(*event.audio_output);
+                } else if (event.named_audio_outputs.size() == 1) {
+                    record_emitted_audio(event.named_audio_outputs.front().audio);
+                }
+            }
             if (event.partial_text.has_value()) {
                 // Flushed so a live source's partials appear as they are produced rather than
                 // when the stdio buffer happens to fill.
@@ -580,6 +609,7 @@ void run_streaming(
     const auto result = stream_audio_from_stdin(argc, argv)
         ? run_streaming_from_stdin(argc, argv, streaming, request, sink)
         : minitts::app::run_streaming_task(streaming, request, sink);
+    const auto generation_finished_at = std::chrono::steady_clock::now();
     // Close the transcript line so the summary below starts on a fresh row.
     std::cout << partial_renderer.finish();
     std::cout << "family=" << session.family() << "\n";
@@ -595,6 +625,28 @@ void run_streaming(
         minitts::cli::optional_path_arg(argc, argv, "--words-out"));
     if (const auto text_out = minitts::cli::optional_path_arg(argc, argv, "--text-out")) {
         write_text_output(result, *text_out, "text_out");
+    }
+    if (metrics_requested) {
+        const double wall_ms = duration_ms(generation_finished_at - started_at);
+        std::cout << "metrics.wall_ms=" << wall_ms << "\n";
+        if (first_audio_at.has_value()) {
+            std::cout << "metrics.ttfa_ms=" << duration_ms(*first_audio_at - started_at) << "\n";
+        }
+        if (emitted_sample_rate > 0 && emitted_channels > 0) {
+            const double audio_duration_ms = 1000.0 * static_cast<double>(emitted_audio_samples) /
+                static_cast<double>(emitted_sample_rate * emitted_channels);
+            std::cout << "metrics.audio_duration_ms=" << audio_duration_ms << "\n";
+            if (audio_duration_ms > 0.0) {
+                const double rtf = wall_ms / audio_duration_ms;
+                std::cout << "metrics.rtf=" << rtf << "\n";
+                if (rtf > 0.0) {
+                    std::cout << "metrics.x_realtime=" << (1.0 / rtf) << "\n";
+                }
+            }
+            std::cout << "metrics.audio_duration_source=stream_events\n";
+            std::cout << "metrics.sample_rate=" << emitted_sample_rate << "\n";
+            std::cout << "metrics.channels=" << emitted_channels << "\n";
+        }
     }
 }
 
@@ -808,10 +860,6 @@ int audiocpp_cli_main(int argc, char ** argv) {
         if (stream_audio_from_stdin(argc, argv) && task_spec.mode != engine::runtime::RunMode::Streaming) {
             throw std::runtime_error("--audio - reads live PCM and requires --mode streaming");
         }
-        if (metrics_requested && task_spec.mode != engine::runtime::RunMode::Offline) {
-            throw std::runtime_error("--metrics currently supports offline mode only");
-        }
-
         engine::runtime::SessionOptions session_options;
         session_options.backend.type = parse_backend(find_arg(argc, argv, "--backend").value_or("cpu"));
         session_options.backend.device = parse_int_arg(argc, argv, "--device", 0);
@@ -971,7 +1019,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
         if (streaming == nullptr) {
             throw std::runtime_error("selected task session does not support streaming execution");
         }
-        run_streaming(argc, argv, *streaming, *session, request);
+        run_streaming(argc, argv, *streaming, *session, request, session_start);
         return 0;
     } catch (const std::exception & ex) {
         std::cerr << "audiocpp_cli failed: " << ex.what() << "\n";
