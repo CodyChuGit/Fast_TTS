@@ -136,7 +136,7 @@ private:
     HttpResponse handle_speech(const std::string & body_text);
     HttpResponse handle_speech_stream(
         LoadedModel & model,
-        const engine::runtime::TaskRequest & request,
+        engine::runtime::TaskRequest request,
         const engine::io::json::Value & body);
     HttpResponse handle_transcription(const HttpRequest & request);
     HttpResponse handle_transcription_json(const std::string & body_text);

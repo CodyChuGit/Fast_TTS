@@ -1,4 +1,5 @@
 #include "engine/framework/audio/wav_reader.h"
+#include "engine/framework/debug/trace.h"
 #include "engine/framework/runtime/registry.h"
 #include "engine/models/qwen3_tts/session.h"
 
@@ -55,8 +56,16 @@ int main(int argc, char ** argv) {
         if (!model_path.has_value()) {
             std::cerr << "usage: qwen3_tts_stream_latency --model PATH [--reference-audio WAV] "
                          "[--reference-text TEXT] [--speaker NAME] [--instruction TEXT] "
-                         "[--voice-design] [--backend cpu|cuda] [--text TEXT]\n";
+                         "[--voice-design] [--backend cpu|cuda] [--text TEXT] "
+                         "[--max-tokens N] [--timing-file PATH]\n";
             return 2;
+        }
+        if (const auto timing_path = arg(argc, argv, "--timing-file")) {
+            const auto path = std::filesystem::path(*timing_path);
+            if (!path.parent_path().empty()) {
+                std::filesystem::create_directories(path.parent_path());
+            }
+            engine::debug::configure_logging(engine::debug::LoggingConfig{true, *timing_path});
         }
         const bool voice_design = flag(argc, argv, "--voice-design");
         const auto load_started = std::chrono::steady_clock::now();
@@ -91,6 +100,7 @@ int main(int argc, char ** argv) {
         request.options["do_sample"] = "false";
         request.options["subtalker_do_sample"] = "false";
         request.options["seed"] = arg(argc, argv, "--seed").value_or("1234");
+        request.options["max_tokens"] = arg(argc, argv, "--max-tokens").value_or("512");
         request.options["decoder_context_frames"] =
             arg(argc, argv, "--decoder-context-frames").value_or("25");
         if (const auto value = arg(argc, argv, "--speaker")) request.options["speaker"] = *value;
@@ -107,6 +117,7 @@ int main(int argc, char ** argv) {
 
         std::cout << "model_load_ms=" << model_load_ms << "\n";
         std::cout << "chunk_frames,ttfa_ms,codec_frames_per_sec,decoder_ms_per_chunk,audio_sec_per_sec,rtf,peak_rss_mib,true_streaming\n";
+        std::cout.flush();
         for (const int chunk_frames : {1, 2, 4, 8}) {
             request.options["chunk_frames"] = std::to_string(chunk_frames);
             int64_t sample_count = 0;
@@ -131,7 +142,7 @@ int main(int argc, char ** argv) {
             std::cout << chunk_frames << ',' << metrics->time_to_first_pcm_ms << ','
                       << codec_fps << ',' << decoder_per_chunk << ',' << audio_per_second << ','
                       << rtf << ',' << peak_rss_mib() << ','
-                      << (metrics->first_pcm_before_generation_end ? "true" : "false") << "\n";
+                      << (metrics->first_pcm_before_generation_end ? "true" : "false") << std::endl;
         }
         streaming->set_stream_event_sink(nullptr);
         return 0;

@@ -1,6 +1,13 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { browserDecodeToWav, concatenateAudioBlobs } from '$lib/audio';
+  import {
+    browserDecodeToWav,
+    closePcm16Playback,
+    concatenateAudioBlobs,
+    Pcm16StreamPlayer,
+    primePcm16Playback,
+    VerifiedPcmPrefixSkipper
+  } from '$lib/audio';
   import {
     base64AudioUrl,
     availableVoices,
@@ -18,6 +25,8 @@
     runTask,
     setModelsRoot,
     speech,
+    speechStream,
+    warmSpeechVoice,
     stopModelInstall,
     transcription,
     unloadModel,
@@ -78,6 +87,8 @@
   let outputArtifacts: Array<{ id: string; url: string; extension: string }> = [];
   let outputText = '';
   let outputJson = '';
+  let activeStreamPlayer: Pcm16StreamPlayer | null = null;
+  let livePlaybackActive = false;
   let logs: string[] = [];
   let aborter: AbortController | null = null;
   let longText = true;
@@ -115,6 +126,16 @@
   let configuredVoices: string[] = [];
   let bundledVoices: string[] = [];
   let quickStartVoice = '';
+  let quickVoiceWarmupTicket = 0;
+  let quickVoiceWarmupTimer: number | null = null;
+  type PreparedQuickVoicePrefix = { key: string; pcm: Uint8Array };
+  type QuickVoiceWarmup = {
+    key: string;
+    promise: Promise<Uint8Array>;
+    controller: AbortController;
+  };
+  let preparedQuickVoicePrefix: PreparedQuickVoicePrefix | null = null;
+  let quickVoiceWarmupInFlight: QuickVoiceWarmup | null = null;
   let uiLanguage = 'en';
   let tr = createTranslator(uiLanguage);
   $: tr = createTranslator(uiLanguage);
@@ -125,6 +146,11 @@
     demo_3_woman: 'demo_3_woman',
     demo_4_woman: 'demo_4_woman'
   };
+
+  const qwenCodecFramePcmBytes = 1920 * 2;
+  // A complete 160 ms prefix is already resident, so it can start on the next
+  // audio render quantum without an additional software buffering delay.
+  const preparedPrefixPlaybackLeadSeconds = 0;
 
   function chooseUiLanguage(code: string) {
     uiLanguage = resolveUiLanguage([code]);
@@ -360,6 +386,8 @@
   $: showsText = ['tts', 'clon', 'gen', 's2s', 'align', 'vdes'].includes(selected?.task);
   $: supportsLiveAsr = selected?.task === 'asr' &&
     ['voxtral_realtime', 'nemotron_asr', 'higgs_audio_stt', 'sense_asr'].includes(selected?.family);
+  $: supportsLiveTtsPlayback = ['tts', 'clon', 'vdes'].includes(selected?.task) &&
+    selected?.family === 'qwen3_tts' && selected?.mode === 'streaming';
   $: modelInventoryLoading = server === null ||
     (Boolean(server.ui_management) && Object.keys(packageSizes).length === 0 && packageSizeState !== 'failed');
   $: selectableModelIds = new Set(activeCatalog.filter((entry) => {
@@ -494,9 +522,98 @@
     }
   }
 
+  function canonicalJsonValue(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(canonicalJsonValue);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, child]) => [key, canonicalJsonValue(child)])
+      );
+    }
+    return value;
+  }
+
+  function preparedPrefixKey(body: Record<string, unknown>): string {
+    return JSON.stringify(canonicalJsonValue({
+      model: body.model,
+      input: body.input,
+      language: body.language,
+      voice: body.voice,
+      reference_text: body.reference_text || null,
+      instructions: body.instructions || body.instruction || null,
+      seed: body.seed,
+      options: body.options || {}
+    }));
+  }
+
+  function canReusePreparedPrefix(options: Record<string, unknown>, requestSeed: number): boolean {
+    const chunkFrames = Number(options.chunk_frames ?? 1);
+    const contextFrames = Number(options.decoder_context_frames ?? 25);
+    return requestSeed >= 0 && maxTokens >= 3 && chunkFrames === 1 && contextFrames === 25;
+  }
+
+  function scheduleQuickVoiceWarmup(delayMs = 120) {
+    if (quickVoiceWarmupTimer !== null) window.clearTimeout(quickVoiceWarmupTimer);
+    quickVoiceWarmupInFlight?.controller.abort();
+    quickVoiceWarmupInFlight = null;
+    const ticket = ++quickVoiceWarmupTicket;
+    const voice = quickStartVoice;
+    preparedQuickVoicePrefix = null;
+    if (!voice || !isLoaded || !supportsLiveTtsPlayback) return;
+    quickVoiceWarmupTimer = window.setTimeout(async () => {
+      quickVoiceWarmupTimer = null;
+      if (ticket !== quickVoiceWarmupTicket || quickStartVoice !== voice || running) return;
+      const warmChunks = text.trim()
+        ? (longText ? splitTtsChunks(text, Math.max(40, chunkBudget)) : [text])
+        : ['Ready for immediate natural speech.'];
+      const warmText = warmChunks[0];
+      let warmup: QuickVoiceWarmup | null = null;
+      try {
+        const options = requestOptions();
+        const warmSeed = seed >= 0 ? seed : 1234;
+        const body: Record<string, unknown> = {
+          model: selected.id,
+          input: warmText,
+          language,
+          voice: demoVoiceSources[voice] || voice,
+          seed: warmSeed,
+          options
+        };
+        if (referenceText.trim() && supportsRequestOption(selected, 'reference_text')) {
+          body.reference_text = referenceText;
+        }
+        const controller = new AbortController();
+        warmup = {
+          key: preparedPrefixKey(body),
+          promise: warmSpeechVoice(body, controller.signal),
+          controller
+        };
+        quickVoiceWarmupInFlight = warmup;
+        const pcm = await warmup.promise;
+        if (ticket !== quickVoiceWarmupTicket || quickStartVoice !== voice || running) return;
+        if (canReusePreparedPrefix(options, seed) && pcm.byteLength >= qwenCodecFramePcmBytes * 2) {
+          preparedQuickVoicePrefix = { key: preparedPrefixKey(body), pcm };
+        }
+        log(`Voice ${voice} and the current text are prewarmed for low first-audio latency.`);
+      } catch (error) {
+        // Prewarming is opportunistic; generation remains fully functional.
+        if ((error as Error)?.name !== 'AbortError') {
+          log(`Voice prewarm skipped: ${error instanceof Error ? error.message : error}`);
+        }
+      } finally {
+        if (warmup && quickVoiceWarmupInFlight === warmup) quickVoiceWarmupInFlight = null;
+      }
+    }, delayMs);
+  }
+
   function chooseQuickStartVoice(voice: string) {
     quickStartVoice = voice;
-    if (!voice) return;
+    if (voice && supportsLiveTtsPlayback) void primePcm16Playback().catch(() => {});
+    if (!voice) {
+      scheduleQuickVoiceWarmup();
+      return;
+    }
     savedVoiceId = '';
     voiceFile = null;
     voiceName = '';
@@ -504,6 +621,12 @@
     referenceText = '';
     if (voiceInput) voiceInput.value = '';
     if (referenceTextInput) referenceTextInput.value = '';
+    scheduleQuickVoiceWarmup(120);
+  }
+
+  function handleTtsTextInput() {
+    if (quickStartVoice && supportsLiveTtsPlayback) void primePcm16Playback().catch(() => {});
+    scheduleQuickVoiceWarmup();
   }
 
   async function chooseReferenceText(file: File | null) {
@@ -1347,10 +1470,22 @@
       errorStatus = '';
       return;
     }
+    if (quickVoiceWarmupTimer !== null) {
+      window.clearTimeout(quickVoiceWarmupTimer);
+      quickVoiceWarmupTimer = null;
+    }
+    // Preserve the newest exact warmup across the click. The model serializes
+    // requests, so waiting for a matching in-flight prefix lets it become
+    // audible as soon as that work finishes instead of discarding it and then
+    // waiting for the foreground request to reach its first decoder frame.
+    const warmupAtRun = quickVoiceWarmupInFlight;
+    quickVoiceWarmupInFlight = null;
+    ++quickVoiceWarmupTicket;
     clearOutput();
     running = true;
     aborter = new AbortController();
     const started = performance.now();
+    let requestPlayer: Pcm16StreamPlayer | null = null;
     warningStatus = '';
     errorStatus = '';
     status = tr('status.runningTask', { task: localizedTaskLabel(selected.task) });
@@ -1366,6 +1501,12 @@
       }
       if (lyricsRequired && !lyrics.trim()) {
         throw new StatusWarning(`${selected.display_name_en || selected.display_name} requires lyrics.`);
+      }
+      if (supportsLiveTtsPlayback) {
+        requestPlayer = new Pcm16StreamPlayer(24000, 1);
+        activeStreamPlayer = requestPlayer;
+        await requestPlayer.start();
+        status = tr('status.waitingForStream');
       }
       await ensureLoaded();
       const options = requestOptions();
@@ -1398,14 +1539,70 @@
             body.reference_text = referenceText;
           }
           if (selected.task === 'vdes' && instructions.trim()) body.instructions = instructions;
-          const result = await speech(body, aborter.signal);
+          if (requestPlayer && options.chunk_frames === undefined) body.chunk_frames = 1;
+          const bodyPrefixKey = preparedPrefixKey(body);
+          let reusablePrefix = preparedQuickVoicePrefix;
+          if (index === 0 && requestPlayer && warmupAtRun) {
+            if (warmupAtRun.key === bodyPrefixKey &&
+                (!reusablePrefix || reusablePrefix.key !== bodyPrefixKey)) {
+              try {
+                const pcm = await warmupAtRun.promise;
+                if (canReusePreparedPrefix(options, seed) &&
+                    pcm.byteLength >= qwenCodecFramePcmBytes * 2) {
+                  reusablePrefix = { key: bodyPrefixKey, pcm };
+                  preparedQuickVoicePrefix = reusablePrefix;
+                }
+              } catch (error) {
+                if ((error as Error)?.name !== 'AbortError') {
+                  log(`In-flight voice prewarm could not be reused: ${error instanceof Error ? error.message : error}`);
+                }
+              }
+            } else if (warmupAtRun.key !== bodyPrefixKey) {
+              warmupAtRun.controller.abort();
+            }
+          }
+          let prefixSkipper: VerifiedPcmPrefixSkipper | null = null;
+          if (index === 0 && requestPlayer && reusablePrefix &&
+              reusablePrefix.key === bodyPrefixKey) {
+            requestPlayer.setInitialPlaybackLeadSeconds(preparedPrefixPlaybackLeadSeconds);
+            requestPlayer.push(reusablePrefix.pcm);
+            prefixSkipper = new VerifiedPcmPrefixSkipper(reusablePrefix.pcm);
+            livePlaybackActive = true;
+            status = 'Playing the prepared prefix while live generation catches up…';
+            log(status);
+          }
+          const result = requestPlayer
+            ? await speechStream(body, {
+                sampleRate: 24000,
+                channels: 1,
+                onPcmChunk: (pcm, first) => {
+                  const playbackPcm = prefixSkipper?.consume(pcm) || pcm;
+                  if (playbackPcm.byteLength) requestPlayer?.push(playbackPcm);
+                  if (first && playbackPcm.byteLength && !livePlaybackActive) {
+                    livePlaybackActive = true;
+                    status = tr('status.livePlayback');
+                    log(status);
+                  }
+                }
+              }, aborter.signal)
+            : await speech(body, aborter.signal);
+          if (prefixSkipper && !prefixSkipper.complete) {
+            throw new Error('Live stream ended before the prepared PCM prefix was verified.');
+          }
           audioChunks.push(result.blob);
           timings.push({
             chunk: index + 1,
             characters: chunks[index].length,
             wall_ms: result.wallMs,
-            rtf: result.rtf
+            rtf: result.rtf,
+            first_pcm_ms: result.firstPcmMs
           });
+        }
+        if (requestPlayer) {
+          status = tr('status.finishingStream');
+          await requestPlayer.finish();
+          activeStreamPlayer = null;
+          livePlaybackActive = false;
         }
         const merged = await concatenateAudioBlobs(audioChunks);
         outputAudio = [{ id: chunks.length > 1 ? 'merged' : 'output', url: URL.createObjectURL(merged) }];
@@ -1488,6 +1685,12 @@
         log(`Request failed: ${status}`);
       }
     } finally {
+      warmupAtRun?.controller.abort();
+      if (requestPlayer && activeStreamPlayer === requestPlayer) {
+        await requestPlayer.stop();
+        activeStreamPlayer = null;
+      }
+      livePlaybackActive = false;
       running = false;
       aborter = null;
     }
@@ -1495,6 +1698,9 @@
 
   function cancel() {
     aborter?.abort();
+    void activeStreamPlayer?.stop();
+    activeStreamPlayer = null;
+    livePlaybackActive = false;
   }
 
   function handleShortcut(event: KeyboardEvent) {
@@ -1791,6 +1997,8 @@
 
   onDestroy(() => {
     aborter?.abort();
+    void activeStreamPlayer?.stop();
+    activeStreamPlayer = null;
     recorder?.state === 'recording' && recorder.stop();
     liveStopRequested = true;
     liveRecorder?.state === 'recording' && liveRecorder.stop();
@@ -1799,6 +2007,10 @@
     for (const output of outputAudio) URL.revokeObjectURL(output.url);
     if (installPoll !== null) window.clearInterval(installPoll);
     if (packageSizePoll !== null) window.clearInterval(packageSizePoll);
+    if (quickVoiceWarmupTimer !== null) window.clearTimeout(quickVoiceWarmupTimer);
+    quickVoiceWarmupInFlight?.controller.abort();
+    quickVoiceWarmupInFlight = null;
+    void closePcm16Playback();
   });
 </script>
 
@@ -1927,6 +2139,7 @@
         {#if showsText}
           <label for="text">{selected.task === 'gen' ? tr('request.prompt') : selected.task === 'align' ? tr('request.alignmentText') : tr('request.text')}</label>
           <textarea id="text" rows={selected.task === 'gen' ? 3 : 4} bind:value={text}
+            on:input={handleTtsTextInput}
             placeholder={selected.task === 'gen' ? tr('request.soundPlaceholder') : tr('request.textPlaceholder')}></textarea>
         {/if}
 
@@ -2166,6 +2379,13 @@
           <div><span>{tr('result.label')}</span><h2>{tr('result.title')}</h2></div>
           {#if outputAudio.length}<span class="task-chip">{outputAudio.length} {outputAudio.length === 1 ? tr('result.track') : tr('result.tracks')}</span>{/if}
         </div>
+        {#if livePlaybackActive}
+          <div class="live-playback" role="status" aria-live="polite">
+            <span class="live-playback-dot"></span>
+            <strong>{tr('result.live')}</strong>
+            <span>{tr('result.livePlayback')}</span>
+          </div>
+        {/if}
         {#if outputAudio.length}
           <div class="audio-list">
             {#each outputAudio as output}
@@ -2185,7 +2405,7 @@
             {/each}
           </div>
         {/if}
-        {#if !outputAudio.length && !outputArtifacts.length}
+        {#if !outputAudio.length && !outputArtifacts.length && !livePlaybackActive}
           <div class="empty-output"><div class="wave">∿</div><p>{tr('result.empty')}</p></div>
         {/if}
         {#if outputText}<textarea class="transcript" readonly rows="7" value={outputText}></textarea>{/if}

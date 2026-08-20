@@ -101,7 +101,8 @@ public:
     std::shared_ptr<Qwen3TalkerStepRuntime> create_step_runtime(
         std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
         int64_t prompt_capacity,
-        int64_t generation_capacity) const;
+        int64_t generation_capacity,
+        size_t prefill_graph_cache_slots = 1) const;
 
 private:
     Qwen3TTSTalkerConfig config_;

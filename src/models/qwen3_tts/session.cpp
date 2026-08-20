@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -161,6 +162,19 @@ std::size_t voice_prompt_cache_slots_from_options(const runtime::SessionOptions 
     return static_cast<std::size_t>(slots);
 }
 
+std::size_t prefill_graph_cache_slots_from_options(const runtime::SessionOptions & options) {
+    constexpr int64_t kDefaultCacheSlots = 1;
+    const int64_t slots = runtime::parse_i64_option(options.options, {"qwen3_tts.prefill_graph_cache_slots"})
+        .value_or(kDefaultCacheSlots);
+    if (slots <= 0) {
+        throw std::runtime_error("qwen3_tts.prefill_graph_cache_slots must be positive");
+    }
+    if (static_cast<std::uint64_t>(slots) > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::runtime_error("qwen3_tts.prefill_graph_cache_slots is too large");
+    }
+    return static_cast<std::size_t>(slots);
+}
+
 void validate_talker_weight_storage(engine::assets::TensorStorageType storage_type) {
     if (storage_type == engine::assets::TensorStorageType::Native ||
         storage_type == engine::assets::TensorStorageType::F32 ||
@@ -285,6 +299,7 @@ Qwen3TTSSession::Qwen3TTSSession(
       talker_(assets_->config.talker),
       voice_prompt_context_(voice_prompt_backend_config(options)),
       voice_prompt_cache_(voice_prompt_cache_slots_from_options(options)) {
+    std::cerr << "Qwen3-TTS startup: configuring resident runtimes...\n";
     talker_graph_arena_bytes_ = runtime::parse_size_mb_option(
         options.options, {"qwen3_tts.talker_graph_arena_mb"}, talker_graph_arena_bytes_);
     speech_encoder_graph_arena_bytes_ = runtime::parse_size_mb_option(
@@ -341,11 +356,13 @@ Qwen3TTSSession::Qwen3TTSSession(
             key != "qwen3_tts.speech_encoder_weight_type" &&
             key != "qwen3_tts.speech_decoder_weight_type" &&
             key != "qwen3_tts.voice_prompt_cache_slots" &&
+            key != "qwen3_tts.prefill_graph_cache_slots" &&
             key != "qwen3_tts.perf_mode" &&
             key != "qwen3_tts.mem_saver") {
             throw std::runtime_error("unknown Qwen3 TTS session option: " + key);
         }
     }
+    std::cerr << "Qwen3-TTS startup: loading talker and code-predictor weights...\n";
     talker_weights_ = talker_.create_weights_runtime(
         assets_,
         options.backend.type,
@@ -356,10 +373,13 @@ Qwen3TTSSession::Qwen3TTSSession(
         code_predictor_constant_context_bytes_,
         talker_weight_storage_type_,
         perf_mode_);
+    std::cerr << "Qwen3-TTS startup: talker weights ready; creating step runtime...\n";
     talker_step_ = talker_.create_step_runtime(
         talker_weights_,
         assets_->config.talker.max_position_embeddings,
-        assets_->config.max_new_tokens);
+        assets_->config.max_new_tokens,
+        prefill_graph_cache_slots_from_options(options));
+    std::cerr << "Qwen3-TTS startup: step runtime ready; loading speech decoder...\n";
     speech_decoder_ = std::make_unique<Qwen3SpeechTokenizerDecoderRuntime>(
         assets_,
         execution_context(),
@@ -368,6 +388,7 @@ Qwen3TTSSession::Qwen3TTSSession(
         speech_decoder_weight_storage_type_,
         conv_weight_storage_type_,
         perf_mode_);
+    std::cerr << "Qwen3-TTS startup: speech decoder ready.\n";
     if (task_.mode != runtime::RunMode::Offline && task_.mode != runtime::RunMode::Streaming) {
         throw std::runtime_error("Qwen3 TTS requires an offline or streaming session");
     }
@@ -381,6 +402,7 @@ Qwen3TTSSession::Qwen3TTSSession(
         throw std::runtime_error("Qwen3 custom voice model only supports the Tts task");
     }
     if (assets_->config.variant == Qwen3TTSVariant::Base) {
+        std::cerr << "Qwen3-TTS startup: loading reference encoders...\n";
         speech_encoder_ = std::make_unique<Qwen3SpeechTokenizerEncoderRuntime>(
             assets_,
             voice_prompt_context_,
@@ -393,6 +415,7 @@ Qwen3TTSSession::Qwen3TTSSession(
             voice_prompt_context_,
             speaker_encoder_graph_arena_bytes_,
             conv_weight_storage_type_);
+        std::cerr << "Qwen3-TTS startup: reference encoders ready.\n";
     }
 }
 

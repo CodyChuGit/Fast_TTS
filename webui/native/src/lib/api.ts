@@ -1,4 +1,5 @@
 import type { LoadedModel, ServerHealth } from './types';
+import { encodePcm16BytesWav } from './audio';
 
 async function errorFrom(response: Response): Promise<Error> {
   let message = `${response.status} ${response.statusText}`;
@@ -167,7 +168,17 @@ export async function uploadWav(blob: Blob, signal?: AbortSignal): Promise<strin
   return response.path;
 }
 
-export async function speech(body: Record<string, unknown>, signal?: AbortSignal) {
+export interface SpeechResponse {
+  blob: Blob;
+  wallMs: string | null;
+  rtf: string | null;
+  firstPcmMs?: string | null;
+}
+
+export async function speech(
+  body: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<SpeechResponse> {
   const response = await fetch('/v1/audio/speech', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -180,6 +191,91 @@ export async function speech(body: Record<string, unknown>, signal?: AbortSignal
     wallMs: response.headers.get('X-AudioCPP-Wall-Ms'),
     rtf: response.headers.get('X-AudioCPP-RTF')
   };
+}
+
+export interface SpeechStreamOptions {
+  sampleRate: number;
+  channels: number;
+  onPcmChunk?: (chunk: Uint8Array, first: boolean) => void;
+}
+
+export async function speechStream(
+  body: Record<string, unknown>,
+  options: SpeechStreamOptions,
+  signal?: AbortSignal
+): Promise<SpeechResponse> {
+  const started = performance.now();
+  const response = await fetch('/v1/audio/speech', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...body,
+      response_format: 'pcm',
+      stream_format: 'audio',
+      stream: true,
+      stream_accumulate: false
+    }),
+    signal
+  });
+  if (!response.ok) throw await errorFrom(response);
+  if (!response.body) throw new Error('Streaming speech response has no readable body.');
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let first = true;
+  let firstPcmMs: number | null = null;
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      const chunk = value.slice();
+      if (first) firstPcmMs = performance.now() - started;
+      chunks.push(chunk);
+      totalBytes += chunk.byteLength;
+      options.onPcmChunk?.(chunk, first);
+      first = false;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!totalBytes) throw new Error('Streaming speech response produced no PCM audio.');
+  const wallMs = performance.now() - started;
+  const audioMs = totalBytes / (options.sampleRate * options.channels * 2) * 1000;
+  return {
+    blob: encodePcm16BytesWav(chunks, options.sampleRate, options.channels),
+    wallMs: wallMs.toFixed(3),
+    rtf: audioMs > 0 ? (wallMs / audioMs).toFixed(6) : null,
+    firstPcmMs: firstPcmMs?.toFixed(3) || null
+  };
+}
+
+export async function warmSpeechVoice(
+  body: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<Uint8Array> {
+  const response = await fetch('/v1/audio/speech', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...body,
+      response_format: 'pcm',
+      stream_format: 'audio',
+      stream: true,
+      stream_accumulate: false,
+      chunk_frames: 1,
+      decoder_context_frames: 25,
+      // Three tokens produce two complete 80 ms codec frames. Besides warming
+      // the exact prompt, the UI can reuse this deterministic 160 ms prefix
+      // while the identical foreground request catches up.
+      max_tokens: 3
+    }),
+    signal
+  });
+  if (!response.ok) throw await errorFrom(response);
+  return new Uint8Array(await response.arrayBuffer());
 }
 
 export async function transcription(body: Record<string, unknown>, signal?: AbortSignal) {

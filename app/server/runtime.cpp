@@ -1834,7 +1834,7 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
     auto & model = require_model(body);
     auto request = build_speech_request(model, body);
     if (body.find("stream_format") != nullptr || bool_field(body, "stream", false)) {
-        return handle_speech_stream(model, request, body);
+        return handle_speech_stream(model, std::move(request), body);
     }
     const auto busy_timeout_ms = parse_busy_timeout_override(body);
     if (model_run_mode(model) == engine::runtime::RunMode::Streaming) {
@@ -1864,7 +1864,7 @@ HttpResponse ServerState::handle_speech(const std::string & body_text) {
 
 HttpResponse ServerState::handle_speech_stream(
     LoadedModel & model,
-    const engine::runtime::TaskRequest & request,
+    engine::runtime::TaskRequest request,
     const Value & body) {
     if (model_run_mode(model) != engine::runtime::RunMode::Streaming) {
         throw std::runtime_error("speech streaming requires a model configured with mode=streaming");
@@ -1880,44 +1880,44 @@ HttpResponse ServerState::handle_speech_stream(
 
     const auto busy_timeout_ms = parse_busy_timeout_override(body);
     LoadedModel * model_ptr = &model;
-    auto stream_body = [this, model_ptr, request, busy_timeout_ms](HttpStreamWriter & writer) {
-        bool wrote_audio = false;
-        const auto timed_result = run_streaming_model(
-            *model_ptr,
-            request,
-            [&](const engine::runtime::StreamEvent & event) {
-                std::vector<engine::runtime::AudioBuffer> buffers;
-                if (event.audio_output.has_value()) {
-                    buffers.push_back(*event.audio_output);
-                }
-                for (const auto & named : event.named_audio_outputs) {
-                    buffers.push_back(named.audio);
-                }
-                for (const auto & audio : buffers) {
-                    const auto pcm = encode_pcm16_samples(audio);
-                    write_sse(
-                        writer,
-                        "{\"type\":\"speech.audio.delta\",\"audio\":" +
-                            json_quote(base64_encode(pcm)) +
-                            "}");
-                    wrote_audio = true;
-                }
-            },
-            busy_timeout_ms);
-        if (!wrote_audio) {
-            throw std::runtime_error("streaming speech model produced no audio delta events");
-        }
-        write_sse(
-            writer,
-            "{\"type\":\"speech.audio.done\",\"timing\":" +
-                ttft_timing_json(require_ttft_ms(timed_result.ttft_ms)) +
-                "}");
-        write_sse_done(writer);
-    };
     if (stream_format == "sse") {
-        return sse_response(std::move(stream_body));
+        return sse_response(
+            [this, model_ptr, request = std::move(request), busy_timeout_ms](HttpStreamWriter & writer) {
+                bool wrote_audio = false;
+                const auto timed_result = run_streaming_model(
+                    *model_ptr,
+                    request,
+                    [&](const engine::runtime::StreamEvent & event) {
+                        std::vector<engine::runtime::AudioBuffer> buffers;
+                        if (event.audio_output.has_value()) {
+                            buffers.push_back(*event.audio_output);
+                        }
+                        for (const auto & named : event.named_audio_outputs) {
+                            buffers.push_back(named.audio);
+                        }
+                        for (const auto & audio : buffers) {
+                            const auto pcm = encode_pcm16_samples(audio);
+                            write_sse(
+                                writer,
+                                "{\"type\":\"speech.audio.delta\",\"audio\":" +
+                                    json_quote(base64_encode(pcm)) +
+                                    "}");
+                            wrote_audio = true;
+                        }
+                    },
+                    busy_timeout_ms);
+                if (!wrote_audio) {
+                    throw std::runtime_error("streaming speech model produced no audio delta events");
+                }
+                write_sse(
+                    writer,
+                    "{\"type\":\"speech.audio.done\",\"timing\":" +
+                        ttft_timing_json(require_ttft_ms(timed_result.ttft_ms)) +
+                        "}");
+                write_sse_done(writer);
+            });
     }
-    return chunked_audio_response([this, model_ptr, request, busy_timeout_ms](HttpStreamWriter & writer) {
+    return chunked_audio_response([this, model_ptr, request = std::move(request), busy_timeout_ms](HttpStreamWriter & writer) {
         bool wrote_audio = false;
         (void)run_streaming_model(
             *model_ptr,

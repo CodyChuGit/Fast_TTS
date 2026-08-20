@@ -1449,6 +1449,22 @@ add_executable(audiocpp_server
 
 target_link_libraries(audiocpp_server PRIVATE engine_runtime ggml)
 target_include_directories(audiocpp_server PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+if (ENGINE_ENABLE_CUDA AND NOT ENGINE_ENABLE_HIP)
+    target_sources(audiocpp_server PRIVATE app/server/cuda_keepalive.cu)
+    set_source_files_properties(
+        app/server/cuda_keepalive.cu
+        PROPERTIES
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+    )
+    if (CMAKE_CUDA_ARCHITECTURES)
+        set_target_properties(audiocpp_server PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+        set_target_properties(audiocpp_server PROPERTIES CUDA_ARCHITECTURES native)
+    endif()
+    target_compile_definitions(audiocpp_server PRIVATE AUDIOCPP_SERVER_HAS_CUDA_KEEPALIVE=1)
+    target_include_directories(audiocpp_server PRIVATE "${CUDAToolkit_INCLUDE_DIRS}")
+endif()
 if (WIN32)
     target_link_libraries(audiocpp_server PRIVATE ws2_32)
 endif()

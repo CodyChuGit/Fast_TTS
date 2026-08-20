@@ -181,6 +181,16 @@ The producer invokes the network sink synchronously, so a slow socket applies
 backpressure rather than growing an unbounded queue. A write failure/client
 disconnect unwinds generation immediately and leaves the loaded model reusable.
 
+The embedded WebUI uses the raw PCM transport when its selected Qwen3-TTS model
+is configured with `mode=streaming`. It schedules each received 24 kHz mono PCM
+chunk through the browser audio context immediately, then wraps the accumulated
+PCM in a WAV only after generation so the result can still be replayed or saved.
+For configured quick-start voices, selecting a voice and pausing briefly while
+editing text sends a two-frame warmup. This keeps the selected CUDA graph and
+exact text prefill hot before Generate is pressed and prepares a deterministic
+160 ms PCM prefix; the real request still uses the configured model, full
+reference, sampling options, and decoder context unchanged.
+
 ## Latency tuning
 
 | `chunk_frames` | Tradeoff |
@@ -192,6 +202,49 @@ disconnect unwinds generation immediately and leaves the loaded model reusable.
 
 `decoder_context_frames=25` matches the established offline decoder's left
 context. Lower values are accepted but can reduce boundary quality.
+
+### Quality-preserving low-latency launch on Windows
+
+After building the `windows-cuda-release` preset and installing the 1.7B Base
+Q8 model, run:
+
+```powershell
+scripts\start_qwen3_tts_low_latency.ps1 -Restart
+```
+
+The launcher keeps the 1.7B model resident, loads all bundled voice WAVs and
+UTF-8 transcripts once at startup, caches converted host projection weights,
+uses all configured CPU threads for bit-identical prompt projection, retains
+four voice prompts and four prompt-shape graphs, uses the full 25-frame
+speech-decoder context, and warms the CUDA streaming path for all four embedded
+demo voices. It finishes with `demo_1_man` active; choosing another WebUI voice
+prewarms that voice in the background. For a fixed seed, the WebUI also prepares
+and retains the exact first two codec frames for the current text. Generate can
+schedule that verified 160 ms PCM prefix immediately while the identical full
+request catches up, then byte-check and remove the duplicate prefix from live
+playback. The saved WAV still comes entirely from the full server response. It
+defaults to one codec frame per PCM event and raw PCM transport; these change
+delivery latency without changing the model, reference conditioning, sampling
+settings, or emitted waveform. The companion `.cmd` file starts or reuses the
+server and opens the WebUI.
+
+On WDDM, the launcher also enables a low-priority CUDA heartbeat on one SM
+(`20 ms` work / `1 ms` rest by default). This prevents the RTX 3090 from
+dropping to its P8 idle clock between requests, which otherwise adds a large
+wake-up penalty to the first CUDA pass. It does not touch model tensors or the
+generation stream, but it intentionally increases idle GPU power. Use
+`-CudaKeepaliveMs 0` to disable it, or tune `-CudaKeepaliveWorkMs` and
+`-CudaKeepaliveMs` for a different latency/power tradeoff.
+
+For another resident deployment, set matching session options in `server.json`:
+
+```json
+{
+  "qwen3_tts.mem_saver": "false",
+  "qwen3_tts.voice_prompt_cache_slots": "4",
+  "qwen3_tts.prefill_graph_cache_slots": "4"
+}
+```
 
 ## Tests and benchmark
 

@@ -4,6 +4,230 @@ function writeAscii(view: DataView, offset: number, text: string) {
   }
 }
 
+// Qwen3-TTS emits one 80 ms codec frame at a time in the lowest-latency mode.
+// A 64 ms lead is the smallest practical safety margin that remained continuous
+// across the warmed RTX 3090 voice matrix (one codec frame is 80 ms). If
+// playback ever drains, the same lead is restored before resuming so late
+// chunks do not click.
+const INITIAL_PLAYBACK_LEAD_SECONDS = 0.064;
+const CONTINUATION_LEAD_SECONDS = 0.01;
+
+// Keep one interactive output context alive for the page lifetime. Creating,
+// resuming, and closing a context around every request adds work directly on
+// the click-to-audio path and can force the browser to reopen the device.
+let sharedPlaybackContext: AudioContext | null = null;
+
+export async function primePcm16Playback(): Promise<AudioContext> {
+  if (!sharedPlaybackContext || sharedPlaybackContext.state === 'closed') {
+    sharedPlaybackContext = new AudioContext({ latencyHint: 'interactive' });
+  }
+  if (sharedPlaybackContext.state !== 'running') await sharedPlaybackContext.resume();
+  return sharedPlaybackContext;
+}
+
+export async function closePcm16Playback(): Promise<void> {
+  const context = sharedPlaybackContext;
+  sharedPlaybackContext = null;
+  if (context && context.state !== 'closed') await context.close();
+}
+
+function pcm16WavHeader(dataBytes: number, sampleRate: number, channels: number): ArrayBuffer {
+  const bytes = new ArrayBuffer(44);
+  const view = new DataView(bytes);
+  writeAscii(view, 0, 'RIFF');
+  view.setUint32(4, 36 + dataBytes, true);
+  writeAscii(view, 8, 'WAVE');
+  writeAscii(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * channels * 2, true);
+  view.setUint16(32, channels * 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(view, 36, 'data');
+  view.setUint32(40, dataBytes, true);
+  return bytes;
+}
+
+export function encodePcm16BytesWav(
+  chunks: Uint8Array[],
+  sampleRate: number,
+  channels: number
+): Blob {
+  if (!Number.isInteger(sampleRate) || sampleRate <= 0) {
+    throw new Error('PCM stream sample rate must be a positive integer.');
+  }
+  if (!Number.isInteger(channels) || channels <= 0) {
+    throw new Error('PCM stream channel count must be a positive integer.');
+  }
+  const frameBytes = channels * 2;
+  const receivedBytes = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const dataBytes = receivedBytes - (receivedBytes % frameBytes);
+  const parts: BlobPart[] = [pcm16WavHeader(dataBytes, sampleRate, channels)];
+  let remaining = dataBytes;
+  for (const chunk of chunks) {
+    if (remaining <= 0) break;
+    const length = Math.min(remaining, chunk.byteLength);
+    const copy = new Uint8Array(length);
+    copy.set(chunk.subarray(0, length));
+    parts.push(copy.buffer as ArrayBuffer);
+    remaining -= length;
+  }
+  return new Blob(parts, { type: 'audio/wav' });
+}
+
+export class Pcm16StreamPlayer {
+  private readonly sampleRate: number;
+  private readonly channels: number;
+  private context: AudioContext | null = null;
+  private nextStartTime = 0;
+  private carry = new Uint8Array(0);
+  private sources = new Set<AudioBufferSourceNode>();
+  private drainResolver: (() => void) | null = null;
+  private stopped = false;
+  private initialPlaybackLeadSeconds = INITIAL_PLAYBACK_LEAD_SECONDS;
+  private hasScheduledAudio = false;
+
+  constructor(sampleRate: number, channels = 1) {
+    this.sampleRate = sampleRate;
+    this.channels = channels;
+  }
+
+  async start(): Promise<void> {
+    if (this.context) return;
+    this.context = await primePcm16Playback();
+    this.nextStartTime = this.context.currentTime;
+  }
+
+  setInitialPlaybackLeadSeconds(seconds: number): void {
+    if (!Number.isFinite(seconds) || seconds < 0) {
+      throw new Error('Initial PCM playback lead must be a non-negative finite number.');
+    }
+    if (this.sources.size || this.nextStartTime > (this.context?.currentTime || 0)) {
+      throw new Error('Initial PCM playback lead must be set before the first audio chunk.');
+    }
+    this.initialPlaybackLeadSeconds = seconds;
+  }
+
+  push(chunk: Uint8Array): void {
+    if (!chunk.byteLength || this.stopped) return;
+    if (!this.context) throw new Error('PCM stream player has not been started.');
+
+    let bytes = chunk;
+    if (this.carry.byteLength) {
+      bytes = new Uint8Array(this.carry.byteLength + chunk.byteLength);
+      bytes.set(this.carry, 0);
+      bytes.set(chunk, this.carry.byteLength);
+    }
+
+    const frameBytes = this.channels * 2;
+    const completeBytes = bytes.byteLength - (bytes.byteLength % frameBytes);
+    this.carry = completeBytes < bytes.byteLength ? bytes.slice(completeBytes) : new Uint8Array(0);
+    if (!completeBytes) return;
+
+    const frames = completeBytes / frameBytes;
+    const audio = this.context.createBuffer(this.channels, frames, this.sampleRate);
+    const view = new DataView(bytes.buffer, bytes.byteOffset, completeBytes);
+    for (let channel = 0; channel < this.channels; channel += 1) {
+      const samples = audio.getChannelData(channel);
+      for (let frame = 0; frame < frames; frame += 1) {
+        samples[frame] = view.getInt16((frame * this.channels + channel) * 2, true) / 32768;
+      }
+    }
+
+    const source = this.context.createBufferSource();
+    source.buffer = audio;
+    source.connect(this.context.destination);
+    source.onended = () => {
+      this.sources.delete(source);
+      if (!this.sources.size && this.drainResolver) {
+        const resolve = this.drainResolver;
+        this.drainResolver = null;
+        resolve();
+      }
+    };
+    this.sources.add(source);
+
+    const streamNeedsBuffer = this.nextStartTime <= this.context.currentTime;
+    const leadTime = streamNeedsBuffer
+      ? (this.hasScheduledAudio ? INITIAL_PLAYBACK_LEAD_SECONDS : this.initialPlaybackLeadSeconds)
+      : CONTINUATION_LEAD_SECONDS;
+    const startAt = Math.max(this.nextStartTime, this.context.currentTime + leadTime);
+    source.start(startAt);
+    this.nextStartTime = startAt + frames / this.sampleRate;
+    this.hasScheduledAudio = true;
+  }
+
+  async finish(): Promise<void> {
+    if (!this.context || this.stopped) return;
+    this.carry = new Uint8Array(0);
+    if (this.sources.size) {
+      await new Promise<void>((resolve) => {
+        this.drainResolver = resolve;
+      });
+    }
+    this.releaseContext();
+  }
+
+  async stop(): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.carry = new Uint8Array(0);
+    for (const source of this.sources) {
+      try {
+        source.stop();
+      } catch {
+        // The source may already have ended between cancellation and cleanup.
+      }
+    }
+    this.sources.clear();
+    if (this.drainResolver) {
+      const resolve = this.drainResolver;
+      this.drainResolver = null;
+      resolve();
+    }
+    this.releaseContext();
+  }
+
+  private releaseContext(): void {
+    this.context = null;
+    this.stopped = true;
+  }
+}
+
+// Removes an already-played deterministic prefix from the live response while
+// checking every byte. Network reads may split the prefix at arbitrary points.
+export class VerifiedPcmPrefixSkipper {
+  private offset = 0;
+  private readonly prefix: Uint8Array;
+
+  constructor(prefix: Uint8Array) {
+    if (!prefix.byteLength) throw new Error('PCM playback prefix must not be empty.');
+    this.prefix = prefix;
+  }
+
+  consume(chunk: Uint8Array): Uint8Array {
+    if (!chunk.byteLength || this.complete) return chunk;
+    const count = Math.min(chunk.byteLength, this.prefix.byteLength - this.offset);
+    for (let index = 0; index < count; index += 1) {
+      if (chunk[index] !== this.prefix[this.offset + index]) {
+        throw new Error('Prepared PCM prefix differs from the live deterministic stream.');
+      }
+    }
+    this.offset += count;
+    return chunk.subarray(count);
+  }
+
+  get complete(): boolean {
+    return this.offset === this.prefix.byteLength;
+  }
+
+  get consumedBytes(): number {
+    return this.offset;
+  }
+}
+
 export function encodePcm16Wav(buffer: AudioBuffer): Blob {
   const channels = buffer.numberOfChannels;
   const frames = buffer.length;

@@ -12,6 +12,7 @@
 #include "engine/framework/modules/structural_modules.h"
 #include "engine/framework/modules/weight_binding.h"
 #include "engine/framework/runtime/kv_cache.h"
+#include "engine/framework/runtime/cache_slots.h"
 #include "engine/framework/sampling/torch_random.h"
 
 #include "engine/framework/core/constant_tensor_cache.h"
@@ -68,6 +69,12 @@ struct GgmlContextDeleter {
 struct LinearTensorWeights {
     assets::TensorData weight;
     std::optional<assets::TensorData> bias;
+    // Host prompt construction uses these projection layers on every request.
+    // Converting the (potentially quantized) tensors to f32 is substantially
+    // more expensive than projecting a short prompt, so keep the exact
+    // converted values for the lifetime of the resident model.
+    std::vector<float> host_weight_values;
+    std::vector<float> host_bias_values;
 };
 
 struct GraphLinearTensorWeights {
@@ -295,20 +302,32 @@ std::vector<float> linear_host(
         throw std::runtime_error("Qwen3 talker host linear weight shape mismatch");
     }
     const int64_t out_features = weights.weight.shape.dims[0];
-    const auto weight_values = assets::tensor_data_to_f32("Qwen3 talker host linear weight", weights.weight);
-    const auto bias_values = weights.bias.has_value()
-        ? assets::tensor_data_to_f32("Qwen3 talker host linear bias", *weights.bias)
-        : std::vector<float>{};
+    if (weights.host_weight_values.size() != static_cast<size_t>(out_features * in_features)) {
+        throw std::runtime_error("Qwen3 talker host linear weight cache shape mismatch");
+    }
+    if (weights.bias.has_value() && weights.host_bias_values.size() != static_cast<size_t>(out_features)) {
+        throw std::runtime_error("Qwen3 talker host linear bias cache shape mismatch");
+    }
+    const auto & weight_values = weights.host_weight_values;
+    const auto & bias_values = weights.host_bias_values;
     std::vector<float> output(static_cast<size_t>(rows * out_features), 0.0F);
-    for (int64_t row = 0; row < rows; ++row) {
-        for (int64_t out = 0; out < out_features; ++out) {
-            float sum = weights.bias.has_value() ? bias_values[static_cast<size_t>(out)] : 0.0F;
-            for (int64_t in = 0; in < in_features; ++in) {
-                sum += weight_values[static_cast<size_t>(out * in_features + in)] *
-                    input[static_cast<size_t>(row * in_features + in)];
-            }
-            output[static_cast<size_t>(row * out_features + out)] = sum;
+    const int64_t output_values = rows * out_features;
+    // Each output value is independent. Parallelizing this outer loop keeps
+    // the inner accumulation order unchanged, preserving the exact numerical
+    // result while using the CPU threads that would otherwise sit idle during
+    // host-side prompt construction.
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int64_t index = 0; index < output_values; ++index) {
+        const int64_t row = index / out_features;
+        const int64_t out = index % out_features;
+        float sum = weights.bias.has_value() ? bias_values[static_cast<size_t>(out)] : 0.0F;
+        for (int64_t in = 0; in < in_features; ++in) {
+            sum += weight_values[static_cast<size_t>(out * in_features + in)] *
+                input[static_cast<size_t>(row * in_features + in)];
         }
+        output[static_cast<size_t>(index)] = sum;
     }
     return output;
 }
@@ -671,6 +690,16 @@ Qwen3TalkerWeights load_talker_weights(
             assets::TensorStorageType::F32,
             {config.hidden_size}),
     };
+    for (auto * projection : {&weights.text_projection_fc1, &weights.text_projection_fc2}) {
+        projection->host_weight_values = assets::tensor_data_to_f32(
+            "Qwen3 talker host linear weight",
+            projection->weight);
+        if (projection->bias.has_value()) {
+            projection->host_bias_values = assets::tensor_data_to_f32(
+                "Qwen3 talker host linear bias",
+                *projection->bias);
+        }
+    }
     weights.layers.reserve(static_cast<size_t>(config.num_hidden_layers));
     const int64_t dim = attention_head_dim(config);
     for (int64_t layer = 0; layer < config.num_hidden_layers; ++layer) {
@@ -1669,15 +1698,20 @@ public:
     Impl(
         std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
         int64_t prompt_capacity,
-        int64_t generation_capacity)
+        int64_t generation_capacity,
+        size_t prefill_graph_cache_slots)
         : weights_(std::move(weights)),
           prompt_capacity_(prompt_capacity),
-          generation_capacity_(generation_capacity) {
+          generation_capacity_(generation_capacity),
+          prefill_graphs_(prefill_graph_cache_slots) {
         if (weights_ == nullptr) {
             throw std::runtime_error("Qwen3 talker step runtime requires weights runtime");
         }
         if (prompt_capacity_ <= 0 || generation_capacity_ <= 0) {
             throw std::runtime_error("Qwen3 talker step runtime requires positive capacities");
+        }
+        if (prefill_graph_cache_slots == 0) {
+            throw std::runtime_error("Qwen3 talker step runtime requires at least one prefill graph cache slot");
         }
     }
 
@@ -1895,21 +1929,32 @@ private:
             throw std::runtime_error("Qwen3 talker prompt exceeds step runtime capacity");
         }
         double graph_build_ms = 0.0;
-        const bool graph_cache_hit = graph_ != nullptr && graph_->matches(*weights_, prompt_steps);
+        auto * graph = prefill_graphs_.find(prompt_steps);
+        const bool graph_cache_hit =
+            graph != nullptr && *graph != nullptr && (*graph)->matches(*weights_, prompt_steps);
         if (!graph_cache_hit) {
             const auto build_start = Clock::now();
-            graph_.reset();
-            graph_ = std::make_unique<TalkerPrefillGraph>(weights_, prompt_steps);
+            prefill_graphs_.put(
+                prompt_steps,
+                std::make_unique<TalkerPrefillGraph>(weights_, prompt_steps));
+            graph = prefill_graphs_.find(prompt_steps);
             graph_build_ms = engine::debug::elapsed_ms(build_start, Clock::now());
         }
+        if (graph == nullptr || *graph == nullptr) {
+            throw std::runtime_error("Qwen3 talker prefill graph cache insertion failed");
+        }
         debug::timing_log_scalar("qwen3_tts.talker.prefill.graph.build_ms", graph_build_ms);
-        return graph_->run_with_state(embeddings);
+        debug::timing_log_scalar("qwen3_tts.talker.prefill.graph.cache_hit", graph_cache_hit);
+        debug::timing_log_scalar(
+            "qwen3_tts.talker.prefill.graph.cache_entries",
+            static_cast<int64_t>(prefill_graphs_.size()));
+        return (*graph)->run_with_state(embeddings);
     }
 
     std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights_;
     int64_t prompt_capacity_ = 0;
     int64_t generation_capacity_ = 0;
-    std::unique_ptr<TalkerPrefillGraph> graph_;
+    runtime::CacheSlots<int64_t, std::unique_ptr<TalkerPrefillGraph>> prefill_graphs_;
     std::unique_ptr<TalkerCachedStepGraph> cached_step_graph_;
     std::unique_ptr<CodePredictorGraph> code_predictor_graph_;
     std::optional<Qwen3TalkerPrefill> cached_prompt_prefill_;
@@ -1979,9 +2024,14 @@ std::shared_ptr<const Qwen3TalkerWeightsRuntime> Qwen3Talker::create_weights_run
 std::shared_ptr<Qwen3TalkerStepRuntime> Qwen3Talker::create_step_runtime(
     std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights,
     int64_t prompt_capacity,
-    int64_t generation_capacity) const {
+    int64_t generation_capacity,
+    size_t prefill_graph_cache_slots) const {
     return std::make_shared<Qwen3TalkerStepRuntime>(
-        std::make_unique<Qwen3TalkerStepRuntime::Impl>(std::move(weights), prompt_capacity, generation_capacity));
+        std::make_unique<Qwen3TalkerStepRuntime::Impl>(
+            std::move(weights),
+            prompt_capacity,
+            generation_capacity,
+            prefill_graph_cache_slots));
 }
 
 }  // namespace engine::models::qwen3_tts

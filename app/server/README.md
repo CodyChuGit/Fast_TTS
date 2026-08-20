@@ -74,6 +74,13 @@ the per-model value takes precedence. The equivalent command-line option is
 
 Set top-level `"backend"` to `"cuda"`, `"cpu"`, `"vulkan"`, or `"metal"`. CUDA is the optimized path for audio.cpp; CPU, Vulkan, and Metal are intended for portability and testing when the binary is built with that backend, but performance and model coverage may be lower. The server prints this expectation-setting message when a non-CUDA backend is selected.
 
+CUDA builds accept `--cuda-keepalive-ms <rest-ms>` together with
+`--cuda-keepalive-work-ms <work-ms>`. When the rest interval is nonzero, one
+low-priority SM heartbeat prevents aggressive idle downclocking between
+latency-critical requests. The feature is off by default in the general server
+and increases idle GPU power; the Qwen3-TTS low-latency launcher enables and
+tunes it. Set `--cuda-keepalive-ms 0` to disable it.
+
 Set top-level `"lazy_load": true` to register all configured model ids at startup but defer each model's framework load and session creation until its first request. A model can override the default with `"lazy": true` or `"lazy": false`.
 
 > [!WARNING]

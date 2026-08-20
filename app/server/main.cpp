@@ -2,6 +2,10 @@
 #include "http.h"
 #include "runtime.h"
 
+#ifdef AUDIOCPP_SERVER_HAS_CUDA_KEEPALIVE
+#include "cuda_keepalive.h"
+#endif
+
 #include "engine/framework/debug/trace.h"
 
 #include <csignal>
@@ -61,6 +65,7 @@ void print_help() {
     std::cout
         << "audiocpp_server [--config <server.json>] [--ui] [--host <ip>] [--port <port>] [--backend <backend>]\n"
         << "                [--device <id>] [--threads <n>] [--busy-timeout-ms <ms>]\n"
+        << "                [--cuda-keepalive-ms <ms>] [--cuda-keepalive-work-ms <ms>]\n"
         << "                [--model-spec-override <json-or-directory>] [--voice-dir <directory>]\n"
         << "                [--log] [--log-file <path>]\n"
         << "                [--cors-origins <origins>]\n"
@@ -71,6 +76,9 @@ void print_help() {
         << "  --backend cpu|cuda|hip|rocm|vulkan|metal  default cuda (rocm is an alias for hip)\n"
         << "  --busy-timeout-ms <ms>           fail a request with 503 when the model has been\n"
         << "                                   busy this long; default 300000, 0 disables\n"
+        << "  --cuda-keepalive-ms <ms>         submit a tiny low-priority CUDA operation at this\n"
+        << "                                   interval to prevent idle downclocking; 0 disables\n"
+        << "  --cuda-keepalive-work-ms <ms>    heartbeat kernel duration; default 50\n"
         << "  --voice-dir <directory>          override the shared reference voice library directory\n"
         << "  --cors-origins \"*\"              experimental; disabled by default. Allows browser\n"
         << "                                   requests from any origin for trusted local demos only\n"
@@ -167,6 +175,14 @@ int main(int argc, char ** argv) {
         if (const auto busy_timeout = arg_value(argc, argv, "--busy-timeout-ms")) {
             config.busy_timeout_ms = std::stoi(*busy_timeout);
         }
+        int cuda_keepalive_ms = 0;
+        if (const auto cuda_keepalive = arg_value(argc, argv, "--cuda-keepalive-ms")) {
+            cuda_keepalive_ms = std::stoi(*cuda_keepalive);
+        }
+        int cuda_keepalive_work_ms = 50;
+        if (const auto cuda_keepalive_work = arg_value(argc, argv, "--cuda-keepalive-work-ms")) {
+            cuda_keepalive_work_ms = std::stoi(*cuda_keepalive_work);
+        }
         if (const auto model_spec = arg_value(argc, argv, "--model-spec-override")) {
             config.model_spec_override = std::filesystem::path(*model_spec);
         }
@@ -182,12 +198,31 @@ int main(int argc, char ** argv) {
         if (config.busy_timeout_ms < 0) {
             throw std::runtime_error("--busy-timeout-ms must be >= 0 (0 disables the guard)");
         }
+        if (cuda_keepalive_ms < 0) {
+            throw std::runtime_error("--cuda-keepalive-ms must be >= 0 (0 disables)");
+        }
+        if (cuda_keepalive_work_ms <= 0) {
+            throw std::runtime_error("--cuda-keepalive-work-ms must be positive");
+        }
+        if (cuda_keepalive_ms > 0 && config.backend != engine::core::BackendType::Cuda) {
+            throw std::runtime_error("--cuda-keepalive-ms requires --backend cuda");
+        }
 
         const auto ui_resource_anchor = executable_directory(argc > 0 ? argv[0] : nullptr);
         minitts::server::ServerState state(
             config,
             std::filesystem::current_path(),
             ui_resource_anchor);
+#ifdef AUDIOCPP_SERVER_HAS_CUDA_KEEPALIVE
+        auto cuda_keepalive = minitts::server::start_cuda_keepalive(
+            config.device,
+            cuda_keepalive_ms,
+            cuda_keepalive_work_ms);
+#else
+        if (cuda_keepalive_ms > 0) {
+            throw std::runtime_error("--cuda-keepalive-ms requires a CUDA-enabled server build");
+        }
+#endif
         minitts::server::serve_http(config.host, config.port, state, shutdown_requested, config.max_request_body_bytes);
         return 0;
     } catch (const std::exception & ex) {

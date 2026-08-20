@@ -13,5 +13,13 @@ build/bin/qwen3_tts_stream_latency \
   --model models/Qwen3-TTS-12Hz-1.7B-Base-GGUF/qwen3-tts-12hz-1.7b-base-q8_0_v2.gguf \
   --reference-audio reference.wav \
   --reference-text "The exact reference transcript." \
-  --backend cuda
+  --backend cuda \
+  --max-tokens 512 \
+  --timing-file build/qwen3_tts_stream_latency.timing.log
 ```
+
+`--max-tokens` defaults to 512 so deterministic greedy runs remain bounded even
+when the model does not emit an early end-of-speech token. Result rows are
+flushed after each chunk-size case completes. `--timing-file` is optional and
+records the internal prompt, prefill, codec, decoder, and streaming phases for
+bottleneck analysis.

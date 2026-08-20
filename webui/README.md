@@ -39,6 +39,9 @@ generation, conversion, separation, VAD, diarization, alignment, and voice desig
   precision selection, and package deletion;
 - on-demand model loading with automatic unloading when switching model or precision;
 - sentence-aware long-text synthesis with browser-side WAV merging;
+- true incremental Qwen3-TTS PCM playback when the loaded model uses `mode=streaming`, while retaining a completed WAV for replay and download;
+- background two-frame prewarming for configured Qwen3-TTS quick-start voices and the current editor text; the exact 160 ms PCM prefix can start immediately, is byte-verified against the live request before duplicate network PCM is skipped, and never replaces audio in the saved WAV;
+- one page-lifetime interactive audio context, primed by the voice/text gesture, so repeated requests do not reopen the browser audio device on the click-to-audio path;
 - microphone capture and near-live input for streaming-capable ASR models;
 - embedded demo voices with matching transcripts;
 - a saved voice library stored in browser IndexedDB;

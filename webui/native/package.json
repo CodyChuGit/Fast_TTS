@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json"
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test:stream": "node --experimental-strip-types --test tests/audio_stream.test.mjs"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.9",
