@@ -162,6 +162,10 @@ private:
     // The single model MCP speak and the character apply to: the first
     // configured TTS model.
     LoadedModel * find_speech_model();
+    // require_model, except a body naming no model resolves to the unambiguous
+    // configured (TTS) model -- the Speak page and MCP callers do not know
+    // model ids.
+    LoadedModel & require_speech_model(const engine::io::json::Value & body);
     std::string character_name() const;
 
     // MCP endpoint: JSON-RPC over streamable HTTP with one speak tool.

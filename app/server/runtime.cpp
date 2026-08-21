@@ -1861,7 +1861,7 @@ ServerState::TimedTaskResult ServerState::run_streaming_model_from(
 
 HttpResponse ServerState::handle_speech(const std::string & body_text) {
     const auto body = engine::io::json::parse(body_text);
-    auto & model = require_model(body);
+    auto & model = require_speech_model(body);
     auto request = build_speech_request(model, body);
     if (body.find("stream_format") != nullptr || bool_field(body, "stream", false)) {
         return handle_speech_stream(model, std::move(request), body);
@@ -2276,6 +2276,36 @@ HttpResponse ServerState::handle_transcription_live(const HttpRequest & request)
                     "}");
             write_sse_done(writer);
         });
+}
+
+ServerState::LoadedModel & ServerState::require_speech_model(const Value & body) {
+    if (body.find("model") != nullptr) {
+        return require_model(body);
+    }
+    // This app's clients -- the Speak page and MCP callers -- talk to one
+    // character on one model and do not know model ids. A speech request that
+    // names no model gets the unambiguous one, matching what /v1/audio/voices
+    // already does; only a config with several TTS models still requires the
+    // field.
+    std::lock_guard<std::mutex> state_lock(models_mutex_);
+    if (models_.size() == 1) {
+        return *models_.front();
+    }
+    LoadedModel * only_tts = nullptr;
+    for (const auto & model : models_) {
+        if (model->config.task != "tts") {
+            continue;
+        }
+        if (only_tts != nullptr) {
+            throw std::runtime_error(
+                "missing required json key: model (several TTS models are configured)");
+        }
+        only_tts = model.get();
+    }
+    if (only_tts == nullptr) {
+        throw std::runtime_error("missing required json key: model");
+    }
+    return *only_tts;
 }
 
 ServerState::LoadedModel * ServerState::find_speech_model() {
