@@ -16,6 +16,7 @@
     type LlmSettings,
     character as fetchCharacter,
     chatSpeak,
+    prewarmChat,
     deleteCharacter,
     health,
     listCharacters,
@@ -408,9 +409,36 @@
     }
   }
 
+  // While the user types, the server prefills the draft into the LLM's
+  // prompt cache on a debounce, so send finds the prompt already resident
+  // and the first token is one decode step away.
+  let chatPrewarmTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastPrewarmedDraft = '';
+
+  function queueChatPrewarm() {
+    if (chatPrewarmTimer !== null) clearTimeout(chatPrewarmTimer);
+    chatPrewarmTimer = setTimeout(() => {
+      chatPrewarmTimer = null;
+      const draft = chatInput.trim();
+      if (!draft || chatBusy || draft === lastPrewarmedDraft) return;
+      lastPrewarmedDraft = draft;
+      // Mirrors sendChat's history exactly; any divergence would break the
+      // cached prefix instead of extending it.
+      const messages = [...chatMessages, { role: 'user' as const, content: draft }]
+        .slice(-24)
+        .map(({ role, content }) => ({ role, content }));
+      prewarmChat(messages);
+    }, 300);
+  }
+
   async function sendChat() {
     const content = chatInput.trim();
     if (!content || chatBusy) return;
+    if (chatPrewarmTimer !== null) {
+      clearTimeout(chatPrewarmTimer);
+      chatPrewarmTimer = null;
+    }
+    lastPrewarmedDraft = '';
     chatBusy = true;
     chatError = '';
     chatStats = null;
@@ -623,7 +651,12 @@
         {/each}
       </div>
       <form class="chat-input" on:submit|preventDefault={sendChat}>
-        <input bind:value={chatInput} disabled={chatBusy} placeholder="Say something…" />
+        <input
+          bind:value={chatInput}
+          on:input={queueChatPrewarm}
+          disabled={chatBusy}
+          placeholder="Say something…"
+        />
         {#if chatBusy}
           <button class="danger" type="button" on:click={stopChat}>Stop</button>
         {:else}

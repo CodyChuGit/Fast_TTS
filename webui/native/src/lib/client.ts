@@ -299,3 +299,14 @@ export function resetLlmSettings(): Promise<LlmSettings> {
     body: JSON.stringify({ reset: true })
   });
 }
+
+// Prefills the LLM's prompt cache with the message the user is still typing,
+// so hitting send finds the whole prompt already resident and the first token
+// is one decode step away. Fire-and-forget; failures are irrelevant.
+export function prewarmChat(messages: ChatMessage[]): void {
+  fetch('/v1/chat/speak', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages, prewarm: true })
+  }).catch(() => {});
+}

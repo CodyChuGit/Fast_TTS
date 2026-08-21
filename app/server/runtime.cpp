@@ -2213,6 +2213,17 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
         : ramped_max_tokens(settings, assistant_turns);
     const int64_t llm_seed = engine::io::json::optional_i64(body, "seed", -1);
     const int64_t tts_seed = engine::io::json::optional_i64(body, "tts_seed", -1);
+    // A prewarm request is the same conversation the client is ABOUT to send:
+    // the draft the user is still typing rides as the newest message, and the
+    // sidecar prefills it in the background. Each successive prewarm extends
+    // the cached prefix by only the newly typed characters, so when the real
+    // message arrives its prompt is already resident and the first token is
+    // one decode step away. The small-batch tail prefill this hides runs at
+    // decode speed on CPU experts -- several hundred milliseconds per turn.
+    const bool prewarm = [&] {
+        const auto * flag = body.find("prewarm");
+        return flag != nullptr && flag->is_bool() && flag->as_bool();
+    }();
 
     // The system prompt is deliberately STATIC across turns (master prompt,
     // the bracketed-note contract, and the ramp-tier guidance): per-turn
@@ -2254,7 +2265,8 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     // new. The stop strings end generation at role leakage (even Peach's
     // habit of continuing the dialogue as the user) and at the blank line
     // where a drifting model starts re-answering old turns.
-    std::string llama_body = "{\"stream\":true,\"cache_prompt\":true";
+    std::string llama_body = std::string("{\"stream\":") +
+        (prewarm ? "false" : "true") + ",\"cache_prompt\":true";
     llama_body += ",\"stop\":[\"<|im_end|>\",\"<|im_start|>\",\"\\n\\n\"]";
     // The DRY sampler stops the model from recycling whole sentences it wrote
     // dozens of turns ago (goodnight sign-offs were coming back verbatim);
@@ -2264,7 +2276,7 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     llama_body += ",\"temperature\":" + std::to_string(temperature);
     llama_body += ",\"top_p\":" + std::to_string(top_p);
     llama_body += ",\"repeat_penalty\":" + std::to_string(repeat_penalty);
-    llama_body += ",\"max_tokens\":" + std::to_string(max_tokens);
+    llama_body += ",\"max_tokens\":" + std::to_string(prewarm ? 1 : max_tokens);
     if (llm_seed >= 0) {
         llama_body += ",\"seed\":" + std::to_string(llm_seed);
     }
@@ -2308,6 +2320,17 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
         first_message = false;
     }
     llama_body += "]}";
+
+    if (prewarm) {
+        // Fire-and-forget: the client debounces these while the user types.
+        // On llama's single slot they queue behind each other cheaply (each
+        // one extends the cached prefix incrementally).
+        std::thread([host = config_.llm_host, port = config_.llm_port, llama_body] {
+            std::string response;
+            llm::http_post_status(host, port, "/v1/chat/completions", llama_body, response);
+        }).detach();
+        return json_response("{\"status\":\"warming\"}");
+    }
 
     LoadedModel * model_ptr = model;
     return sse_response([this, model_ptr, llama_body, warm_prefix, tts_seed](HttpStreamWriter & writer) {
