@@ -267,6 +267,8 @@ export interface LlmSettings {
   top_p: number;
   repeat_penalty: number;
   max_tokens: number;
+  // Grow replies over the conversation toward the max_tokens ceiling.
+  length_ramp: boolean;
 }
 
 export function getLlmSettings(): Promise<LlmSettings> {

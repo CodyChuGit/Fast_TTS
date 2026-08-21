@@ -128,6 +128,7 @@ LlmSettings default_llm_settings() {
     // slightly for expressiveness.
     settings.master_prompt =
         "You are {name}. {persona}\n"
+        "Always reply in the same language the user writes in; if unsure, use English. "
         "Stay fully in character as {name} at all times. Speak in the first person, as if "
         "talking out loud. Keep every reply to one to three short sentences that sound "
         "natural when spoken. Never use asterisks, stage directions, emoji, lists, or "
@@ -174,6 +175,9 @@ LlmSettings load_llm_settings(const std::filesystem::path & directory) {
     settings.top_p = engine::io::json::optional_f32(value, "top_p", static_cast<float>(settings.top_p));
     settings.repeat_penalty = engine::io::json::optional_f32(value, "repeat_penalty", static_cast<float>(settings.repeat_penalty));
     settings.max_tokens = engine::io::json::optional_i64(value, "max_tokens", settings.max_tokens);
+    if (const auto * ramp = value.find("length_ramp"); ramp != nullptr && ramp->is_bool()) {
+        settings.length_ramp = ramp->as_bool();
+    }
     validate_llm_settings(settings);
     return settings;
 }
@@ -187,6 +191,7 @@ void save_llm_settings(const std::filesystem::path & directory, const LlmSetting
         << ",\"top_p\":" << settings.top_p
         << ",\"repeat_penalty\":" << settings.repeat_penalty
         << ",\"max_tokens\":" << settings.max_tokens
+        << ",\"length_ramp\":" << (settings.length_ramp ? "true" : "false")
         << "}";
     const auto path = directory / "llm.json";
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
@@ -197,6 +202,29 @@ void save_llm_settings(const std::filesystem::path & directory, const LlmSetting
     if (!file) {
         throw std::runtime_error("could not write LLM settings: " + path.string());
     }
+}
+
+int64_t ramped_max_tokens(const LlmSettings & settings, int64_t assistant_turns) {
+    if (!settings.length_ramp) {
+        return settings.max_tokens;
+    }
+    // Opener ~72 tokens (two spoken sentences), +40 per completed turn.
+    const int64_t ramped = 72 + 40 * std::max<int64_t>(0, assistant_turns);
+    return std::min<int64_t>(settings.max_tokens, ramped);
+}
+
+std::string length_guidance(const LlmSettings & settings, int64_t assistant_turns) {
+    if (!settings.length_ramp) {
+        return {};
+    }
+    if (assistant_turns <= 0) {
+        return "\nThis is the opening exchange: reply with one or two short sentences.";
+    }
+    if (assistant_turns <= 2) {
+        return "\nReply with two or three sentences.";
+    }
+    return "\nThe conversation is flowing now; you may use up to four or five "
+           "sentences when it serves the scene, but never pad.";
 }
 
 std::string render_master_prompt(

@@ -755,6 +755,15 @@
           </div>
         </div>
 
+        <label class="choice ramp-choice">
+          <input type="checkbox" bind:checked={llm.length_ramp} />
+          <span>
+            <strong>Grow replies over the conversation</strong>
+            <small>The opener stays snappy — first audio waits on it — then each turn earns more
+            room, up to the max tokens ceiling.</small>
+          </span>
+        </label>
+
         <div class="speak-actions">
           <button class="primary" on:click={saveLlmSettings} disabled={llmSaving}>
             {llmSaving ? 'Saving…' : 'Save roleplay settings'}

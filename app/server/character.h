@@ -77,6 +77,10 @@ struct LlmSettings {
     double top_p = 0.75;
     double repeat_penalty = 1.1;
     int64_t max_tokens = 140;
+    // Grow replies over the conversation: the opener stays snappy because
+    // first audio depends on it, then later turns get more room -- max_tokens
+    // is the ceiling the ramp grows toward.
+    bool length_ramp = true;
 };
 
 // The shipped roleplay-tuned defaults.
@@ -89,6 +93,16 @@ LlmSettings load_llm_settings(const std::filesystem::path & directory);
 // Writes `llm.json`, creating the directory if needed. Values are validated --
 // out-of-range sampling is refused rather than silently clamped.
 void save_llm_settings(const std::filesystem::path & directory, const LlmSettings & settings);
+
+// The reply-length budget for a turn: ramps from a short opener toward the
+// configured max_tokens ceiling as the conversation accumulates assistant
+// turns. With the ramp disabled, the ceiling applies from turn one.
+int64_t ramped_max_tokens(const LlmSettings & settings, int64_t assistant_turns);
+
+// A per-turn sentence-count hint appended to the system prompt. Token ceilings
+// truncate mid-sentence -- awful when spoken -- so the model is asked for the
+// length; the ceiling only backstops it. Empty when the ramp is disabled.
+std::string length_guidance(const LlmSettings & settings, int64_t assistant_turns);
 
 // The master prompt with {name} and {persona} substituted.
 std::string render_master_prompt(

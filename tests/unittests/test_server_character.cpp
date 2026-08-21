@@ -12,6 +12,8 @@ using minitts::server::CharacterConfig;
 using minitts::server::LlmSettings;
 using minitts::server::default_llm_settings;
 using minitts::server::load_llm_settings;
+using minitts::server::length_guidance;
+using minitts::server::ramped_max_tokens;
 using minitts::server::render_master_prompt;
 using minitts::server::save_llm_settings;
 using minitts::server::character_slug;
@@ -222,6 +224,25 @@ void test_master_prompt_substitution() {
     require(empty_persona.find("{persona}") == std::string::npos, "an empty persona leaves no placeholder");
 }
 
+void test_reply_length_ramps_across_turns() {
+    LlmSettings settings;
+    settings.max_tokens = 140;
+    settings.length_ramp = true;
+    require(ramped_max_tokens(settings, 0) == 72, "the opener is short");
+    require(ramped_max_tokens(settings, 1) == 112, "the second turn grows");
+    require(ramped_max_tokens(settings, 2) == 140, "the ramp caps at the ceiling");
+    require(ramped_max_tokens(settings, 9) == 140, "and stays there");
+
+    require(length_guidance(settings, 0).find("one or two") != std::string::npos,
+        "the opener asks for one or two sentences");
+    require(length_guidance(settings, 5).find("four or five") != std::string::npos,
+        "later turns are allowed more");
+
+    settings.length_ramp = false;
+    require(ramped_max_tokens(settings, 0) == 140, "disabling the ramp restores the flat ceiling");
+    require(length_guidance(settings, 0).empty(), "and drops the per-turn hint");
+}
+
 }  // namespace
 
 int main() {
@@ -236,6 +257,7 @@ int main() {
         test_library_lists_saved_characters_and_skips_broken_ones();
         test_llm_settings_roundtrip_and_validation();
         test_master_prompt_substitution();
+        test_reply_length_ramps_across_turns();
     } catch (const std::exception & error) {
         std::cerr << error.what() << '\n';
         return 1;

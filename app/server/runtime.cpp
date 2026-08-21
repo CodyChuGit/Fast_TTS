@@ -1934,6 +1934,7 @@ std::string ServerState::llm_settings_json() const {
         << ",\"top_p\":" << settings.top_p
         << ",\"repeat_penalty\":" << settings.repeat_penalty
         << ",\"max_tokens\":" << settings.max_tokens
+        << ",\"length_ramp\":" << (settings.length_ramp ? "true" : "false")
         << "}";
     return out.str();
 }
@@ -1966,6 +1967,9 @@ HttpResponse ServerState::handle_llm_settings_set(const std::string & body_text)
         }
         if (const auto * value = body.find("max_tokens"); value != nullptr && value->is_number()) {
             settings.max_tokens = value->as_i64();
+        }
+        if (const auto * value = body.find("length_ramp"); value != nullptr && value->is_bool()) {
+            settings.length_ramp = value->as_bool();
         }
     }
     try {
@@ -2013,12 +2017,27 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
         body, "top_p", static_cast<float>(settings.top_p));
     const double repeat_penalty = engine::io::json::optional_f32(
         body, "repeat_penalty", static_cast<float>(settings.repeat_penalty));
-    const int64_t max_tokens = engine::io::json::optional_i64(body, "max_tokens", settings.max_tokens);
+    // The opener stays short because first audio waits on it; once replies are
+    // playing there is time for more, so the budget grows with each completed
+    // assistant turn toward the configured ceiling. An explicit max_tokens in
+    // the request bypasses the ramp entirely.
+    int64_t assistant_turns = 0;
+    for (const auto & message : messages->as_array()) {
+        if (const auto * role = message.find("role");
+            role != nullptr && role->is_string() && role->as_string() == "assistant") {
+            ++assistant_turns;
+        }
+    }
+    const auto * explicit_max = body.find("max_tokens");
+    const int64_t max_tokens = explicit_max != nullptr && explicit_max->is_number()
+        ? explicit_max->as_i64()
+        : ramped_max_tokens(settings, assistant_turns);
     const int64_t llm_seed = engine::io::json::optional_i64(body, "seed", -1);
     const int64_t tts_seed = engine::io::json::optional_i64(body, "tts_seed", -1);
 
     const std::string system_prompt =
-        render_master_prompt(settings, character.name, character.persona);
+        render_master_prompt(settings, character.name, character.persona) +
+        length_guidance(settings, assistant_turns);
 
     // Build the llama.cpp request by hand: cache_prompt keeps the chat prefix
     // KV resident across turns, so each turn's prefill covers only what is new.
