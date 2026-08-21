@@ -56,10 +56,21 @@
   let recording = false;
   let library: SavedCharacterEntry[] = [];
   let switching = '';
+  let sampleSeconds: number | null = null;
+  let voiceRev = 0;
+  let testing = false;
 
   // MCP panel.
   let endpoint = '';
   let copied = false;
+
+  $: sampleNote = sampleSeconds === null
+    ? ''
+    : sampleSeconds > 20
+      ? `This sample is ${Math.round(sampleSeconds)} s long. Cloning copies everything in the reference — length, pauses, background noise — so 5–15 s of clean, music-free speech clones far better.`
+      : sampleSeconds < 3
+        ? 'This sample is very short; 5–15 s of clean speech clones better.'
+        : '';
 
   function populateForm(from: Character | null) {
     editName = from?.name || '';
@@ -96,6 +107,7 @@
     try {
       active = await activateCharacter(entry.id);
       populateForm(active);
+      voiceRev += 1;
       library = (await listCharacters()).characters;
       settingsStatus = `Now speaking as ${entry.name}.`;
     } catch (error) {
@@ -184,7 +196,7 @@
       };
       recorder.onstop = () => {
         const blob = new Blob(chunks, { type: recorder?.mimeType || mimeType || 'audio/webm' });
-        customFile = new File([blob], 'recording.webm', { type: blob.type });
+        probeSample(new File([blob], 'recording.webm', { type: blob.type }));
         recordingStream?.getTracks().forEach((track) => track.stop());
         recordingStream = null;
         recorder = null;
@@ -206,6 +218,53 @@
 
   function stopRecording() {
     if (recorder?.state === 'recording') recorder.stop();
+  }
+
+  // Measures a chosen or recorded sample so quality problems are visible
+  // before saving: cloning copies everything in the reference, so length and
+  // background noise matter more than people expect.
+  function probeSample(file: File | null) {
+    customFile = file;
+    sampleSeconds = null;
+    if (!file) return;
+    const url = URL.createObjectURL(file);
+    const probe = new Audio();
+    probe.preload = 'metadata';
+    probe.onloadedmetadata = () => {
+      sampleSeconds = Number.isFinite(probe.duration) ? probe.duration : null;
+      URL.revokeObjectURL(url);
+    };
+    probe.onerror = () => URL.revokeObjectURL(url);
+    probe.src = url;
+  }
+
+  async function testVoice() {
+    if (speaking || testing) return;
+    testing = true;
+    settingsError = '';
+    settingsStatus = 'Speaking a test line with the active voice…';
+    aborter = new AbortController();
+    try {
+      await primePcm16Playback();
+      player = new Pcm16StreamPlayer(24000, 1);
+      await player.start();
+      await speakStream(
+        'Here is how the active character sounds right now. If this does not match the reference, try a shorter, cleaner sample.',
+        null,
+        (chunk) => player?.push(chunk),
+        aborter.signal
+      );
+      await player.finish();
+      settingsStatus = '';
+    } catch (error) {
+      settingsError = error instanceof Error ? error.message : String(error);
+      settingsStatus = '';
+    } finally {
+      await player?.stop();
+      player = null;
+      testing = false;
+      aborter = null;
+    }
   }
 
   async function saveCharacter() {
@@ -231,6 +290,7 @@
         throw new Error('Choose or record a voice sample.');
       }
       populateForm(active);
+      voiceRev += 1;
       try {
         library = (await listCharacters()).characters;
       } catch {
@@ -433,7 +493,7 @@
         </label>
         {#if voiceSource === 'custom'}
           <input id="char-voice" class="file-native" type="file" accept="audio/*"
-            on:change={(event) => (customFile = event.currentTarget.files?.[0] || null)} />
+            on:change={(event) => probeSample(event.currentTarget.files?.[0] || null)} />
           <label class="file-picker" for="char-voice">
             <strong>Choose file</strong>
             <span>{customFile?.name || (active?.source === 'custom' ? 'Keeping the saved recording' : 'No file selected')}</span>
@@ -445,15 +505,29 @@
               <button class="ghost" type="button" on:click={startRecording}>Record microphone</button>
             {/if}
           </div>
+          {#if sampleNote}
+            <p class="status warn">{sampleNote}</p>
+          {/if}
           <label for="char-transcript">Transcript of the recording</label>
           <textarea id="char-transcript" rows="2" bind:value={customTranscript}
             placeholder="Exactly what the sample says…"></textarea>
         {/if}
       </fieldset>
 
+      {#if active?.source === 'custom'}
+        <label for="active-reference">Active character's reference recording</label>
+        <audio id="active-reference" class="reference-audio" controls
+          src={`/v1/character/voice?v=${voiceRev}`}></audio>
+        <p class="status">This is what the clone is conditioned on — if it has background music or
+          noise, the spoken output will drift from the voice.</p>
+      {/if}
+
       <div class="speak-actions">
         <button class="primary" on:click={saveCharacter} disabled={saving}>
           {saving ? 'Saving…' : 'Save character'}
+        </button>
+        <button class="ghost" on:click={testVoice} disabled={testing || speaking}>
+          {testing ? 'Speaking…' : 'Test voice'}
         </button>
         <button class="ghost" on:click={() => (view = 'speak')}>Back</button>
       </div>

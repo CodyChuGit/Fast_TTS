@@ -974,6 +974,9 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
     else if (request.method == "GET" && request.path == "/v1/characters") {
         response = handle_characters_list();
     }
+    else if (request.method == "GET" && request.path == "/v1/character/voice") {
+        response = handle_character_voice();
+    }
     else if (request.method == "POST" && request.path == "/v1/characters/activate") {
         response = handle_character_activate(request.body);
     }
@@ -2491,6 +2494,31 @@ void ServerState::store_character_in_library(const CharacterConfig & character) 
     } else {
         save_character(entry_dir, character);
     }
+}
+
+HttpResponse ServerState::handle_character_voice() {
+    CharacterConfig current;
+    {
+        std::lock_guard<std::mutex> lock(character_mutex_);
+        current = character_;
+    }
+    if (!current.is_custom()) {
+        return error_response(404, "the active character uses a bundled voice preset", "not_found");
+    }
+    std::ifstream in(character_dir_ / current.voice_file, std::ios::binary);
+    if (!in) {
+        return error_response(404, "the character recording is missing", "not_found");
+    }
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    HttpResponse response;
+    response.status = 200;
+    response.content_type = "audio/wav";
+    response.body = buffer.str();
+    // The file changes whenever the character does; never let a browser cache
+    // yesterday's voice.
+    response.headers["Cache-Control"] = "no-store";
+    return response;
 }
 
 HttpResponse ServerState::handle_characters_list() {

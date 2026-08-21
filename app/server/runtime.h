@@ -159,6 +159,9 @@ private:
     // The saved-character library: every save lands here under an id derived
     // from the name, so any saved character can be re-activated in one click.
     HttpResponse handle_characters_list();
+    // The active character's reference recording, for auditioning what the
+    // clone is conditioned on.
+    HttpResponse handle_character_voice();
     HttpResponse handle_character_activate(const std::string & body_text);
     HttpResponse handle_character_delete(const std::string & body_text);
     // Copies the active character into library/<slug>, recording included.

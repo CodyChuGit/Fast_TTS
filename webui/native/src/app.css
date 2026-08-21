@@ -149,3 +149,6 @@ footer {
   color: #07101f; background: linear-gradient(135deg, var(--cyan), var(--blue));
 }
 button.slim { min-height: 32px; padding: 4px 10px; font-size: 12px; }
+
+.status.warn { color: #f0c274; }
+.reference-audio { width: 100%; height: 36px; margin-top: 4px; }
