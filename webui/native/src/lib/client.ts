@@ -258,3 +258,31 @@ export async function chatSpeak(
     reader.releaseLock();
   }
 }
+// The roleplay engine: the master prompt every character plays through, and
+// the sampling that shapes delivery. {name} and {persona} in the master prompt
+// are filled from the active character.
+export interface LlmSettings {
+  master_prompt: string;
+  temperature: number;
+  top_p: number;
+  repeat_penalty: number;
+  max_tokens: number;
+}
+
+export function getLlmSettings(): Promise<LlmSettings> {
+  return json<LlmSettings>('/v1/llm-settings');
+}
+
+export function setLlmSettings(settings: Partial<LlmSettings>): Promise<LlmSettings> {
+  return json<LlmSettings>('/v1/llm-settings', {
+    method: 'POST',
+    body: JSON.stringify(settings)
+  });
+}
+
+export function resetLlmSettings(): Promise<LlmSettings> {
+  return json<LlmSettings>('/v1/llm-settings', {
+    method: 'POST',
+    body: JSON.stringify({ reset: true })
+  });
+}

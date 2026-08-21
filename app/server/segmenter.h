@@ -20,8 +20,14 @@ class SentenceSegmenter {
 public:
     struct Options {
         // Once the pending first segment reaches this many bytes, a clause
-        // boundary (comma, semicolon, dash) is good enough to cut at.
-        size_t first_segment_min_chars = 60;
+        // boundary (comma, semicolon, dash) is good enough to cut at. At
+        // ~40 ms per LLM token, every 4 characters waited is roughly another
+        // 10 ms of silence before the first sound.
+        size_t first_segment_min_chars = 28;
+        // If the opening sentence offers no clause boundary either, cut the
+        // first segment at a word boundary once this much has streamed --
+        // bounding time-to-first-audio even against a run-on opener.
+        size_t first_segment_word_cut_chars = 40;
         // Safety valve: a run-on with no boundaries at all is force-split at
         // the last space past this size rather than buffered forever.
         size_t max_segment_chars = 300;

@@ -10,6 +10,7 @@
 #include "../streaming/pcm_source.h"
 #include "../streaming/streaming.h"
 
+#include "engine/framework/audio/conversion.h"
 #include "engine/framework/debug/trace.h"
 #include "engine/framework/io/json.h"
 #include "engine/framework/model_spec/metadata.h"
@@ -757,6 +758,26 @@ std::string stream_event_json(const engine::runtime::StreamEvent & event) {
     return out.str();
 }
 
+// Converts a voice reference to the mono 24 kHz form the Qwen3 encoders use
+// internally, once, at load time. Every request otherwise carries, copies, and
+// hashes the raw upload -- a stereo 44.1 kHz recording is nearly 4x the bytes
+// for the same conditioning.
+engine::runtime::AudioBuffer normalize_voice_reference(const engine::runtime::AudioBuffer & audio) {
+    constexpr int kTargetRate = 24000;
+    if (audio.sample_rate == kTargetRate && audio.channels == 1) {
+        return audio;
+    }
+    engine::runtime::AudioBuffer out;
+    out.sample_rate = kTargetRate;
+    out.channels = 1;
+    out.samples = engine::audio::convert_interleaved_audio_to_mono_linear_resampled(
+        audio.samples,
+        audio.sample_rate,
+        audio.channels,
+        kTargetRate);
+    return out;
+}
+
 const engine::runtime::AudioBuffer & select_audio_output(const engine::runtime::TaskResult & result) {
     if (result.audio_output.has_value()) {
         return *result.audio_output;
@@ -866,6 +887,12 @@ ServerState::ServerState(
         std::cerr << "character store ignored (" << ex.what() << "); using the default character\n";
         character_ = default_character();
     }
+    try {
+        llm_settings_ = load_llm_settings(character_dir_);
+    } catch (const std::exception & ex) {
+        std::cerr << "LLM settings ignored (" << ex.what() << "); using roleplay defaults\n";
+        llm_settings_ = default_llm_settings();
+    }
     if (auto * model = find_speech_model()) {
         try {
             apply_character(*model, character_);
@@ -953,6 +980,12 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
     else if (request.method == "POST" && request.path == "/v1/chat/speak") {
         response = handle_chat_speak(request.body);
     }
+    else if (request.method == "GET" && request.path == "/v1/llm-settings") {
+        response = handle_llm_settings_get();
+    }
+    else if (request.method == "POST" && request.path == "/v1/llm-settings") {
+        response = handle_llm_settings_set(request.body);
+    }
     else if (request.method == "POST" && request.path == "/v1/audio/speech") {
         response = handle_speech(request.body);
     }
@@ -1031,7 +1064,7 @@ ServerState::LoadedModel::RuntimeVoicePreset ServerState::load_runtime_voice_pre
     out.voice_id = preset.voice_id;
     out.reference_text = preset.reference_text;
     if (preset.voice_ref.has_value()) {
-        out.audio = minitts::cli::read_audio_buffer(*preset.voice_ref);
+        out.audio = normalize_voice_reference(minitts::cli::read_audio_buffer(*preset.voice_ref));
     }
     return out;
 }
@@ -1562,7 +1595,8 @@ void ServerState::apply_character(LoadedModel & model, const CharacterConfig & c
     LoadedModel::RuntimeVoicePreset preset;
     if (character.is_custom()) {
         // Read outside the metadata lock; only the assignment needs it.
-        preset.audio = minitts::cli::read_audio_buffer(character_dir_ / character.voice_file);
+        preset.audio = normalize_voice_reference(
+            minitts::cli::read_audio_buffer(character_dir_ / character.voice_file));
         if (!character.transcript.empty()) {
             preset.reference_text = character.transcript;
         }
@@ -1888,6 +1922,64 @@ HttpResponse ServerState::handle_mcp(const HttpRequest & request) {
     return response;
 }
 
+std::string ServerState::llm_settings_json() const {
+    LlmSettings settings;
+    {
+        std::lock_guard<std::mutex> lock(character_mutex_);
+        settings = llm_settings_;
+    }
+    std::ostringstream out;
+    out << "{\"master_prompt\":" << json_quote(settings.master_prompt)
+        << ",\"temperature\":" << settings.temperature
+        << ",\"top_p\":" << settings.top_p
+        << ",\"repeat_penalty\":" << settings.repeat_penalty
+        << ",\"max_tokens\":" << settings.max_tokens
+        << "}";
+    return out.str();
+}
+
+HttpResponse ServerState::handle_llm_settings_get() {
+    return json_response(llm_settings_json());
+}
+
+HttpResponse ServerState::handle_llm_settings_set(const std::string & body_text) {
+    const auto body = engine::io::json::parse(body_text);
+    LlmSettings settings;
+    if (const auto * reset = body.find("reset"); reset != nullptr && reset->is_bool() && reset->as_bool()) {
+        settings = default_llm_settings();
+    } else {
+        {
+            std::lock_guard<std::mutex> lock(character_mutex_);
+            settings = llm_settings_;
+        }
+        if (const auto * value = body.find("master_prompt"); value != nullptr && value->is_string()) {
+            settings.master_prompt = value->as_string();
+        }
+        if (const auto * value = body.find("temperature"); value != nullptr && value->is_number()) {
+            settings.temperature = value->as_number();
+        }
+        if (const auto * value = body.find("top_p"); value != nullptr && value->is_number()) {
+            settings.top_p = value->as_number();
+        }
+        if (const auto * value = body.find("repeat_penalty"); value != nullptr && value->is_number()) {
+            settings.repeat_penalty = value->as_number();
+        }
+        if (const auto * value = body.find("max_tokens"); value != nullptr && value->is_number()) {
+            settings.max_tokens = value->as_i64();
+        }
+    }
+    try {
+        save_llm_settings(character_dir_, settings);
+    } catch (const std::exception & ex) {
+        return error_response(400, ex.what(), "invalid_request_error");
+    }
+    {
+        std::lock_guard<std::mutex> lock(character_mutex_);
+        llm_settings_ = settings;
+    }
+    return json_response(llm_settings_json());
+}
+
 HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     if (config_.llm_port <= 0) {
         return error_response(
@@ -1906,34 +1998,34 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
         return error_response(400, "chat requires a non-empty 'messages' array", "invalid_request_error");
     }
 
-    // Sampling defaults follow the Peach-9B-8k-Roleplay model card, which
-    // recommends low temperature and top_p against hallucination.
-    const double temperature = engine::io::json::optional_f32(body, "temperature", 0.3F);
-    const double top_p = engine::io::json::optional_f32(body, "top_p", 0.5F);
-    // Voice-first ceiling: 512 (the card default) writes minute-long
-    // monologues; ~160 tokens is a handful of spoken sentences. Callers can
-    // still raise it per request.
-    const int64_t max_tokens = engine::io::json::optional_i64(body, "max_tokens", 160);
-    const int64_t llm_seed = engine::io::json::optional_i64(body, "seed", -1);
-    const int64_t tts_seed = engine::io::json::optional_i64(body, "tts_seed", -1);
-
     CharacterConfig character;
+    LlmSettings settings;
     {
         std::lock_guard<std::mutex> lock(character_mutex_);
         character = character_;
+        settings = llm_settings_;
     }
-    const std::string system_prompt = !character.persona.empty()
-        ? character.persona
-        : ("You are " + character.name + ". Stay in character. Speak in the first person with "
-           "short, natural replies of one to three sentences. Do not narrate actions, do not "
-           "use asterisks or markdown, and do not describe yourself from the outside -- just talk.");
+    // Stored roleplay settings are the defaults; a request may still override
+    // any of them per call.
+    const double temperature = engine::io::json::optional_f32(
+        body, "temperature", static_cast<float>(settings.temperature));
+    const double top_p = engine::io::json::optional_f32(
+        body, "top_p", static_cast<float>(settings.top_p));
+    const double repeat_penalty = engine::io::json::optional_f32(
+        body, "repeat_penalty", static_cast<float>(settings.repeat_penalty));
+    const int64_t max_tokens = engine::io::json::optional_i64(body, "max_tokens", settings.max_tokens);
+    const int64_t llm_seed = engine::io::json::optional_i64(body, "seed", -1);
+    const int64_t tts_seed = engine::io::json::optional_i64(body, "tts_seed", -1);
+
+    const std::string system_prompt =
+        render_master_prompt(settings, character.name, character.persona);
 
     // Build the llama.cpp request by hand: cache_prompt keeps the chat prefix
     // KV resident across turns, so each turn's prefill covers only what is new.
     std::string llama_body = "{\"stream\":true,\"cache_prompt\":true";
     llama_body += ",\"temperature\":" + std::to_string(temperature);
     llama_body += ",\"top_p\":" + std::to_string(top_p);
-    llama_body += ",\"repeat_penalty\":1.1";
+    llama_body += ",\"repeat_penalty\":" + std::to_string(repeat_penalty);
     llama_body += ",\"max_tokens\":" + std::to_string(max_tokens);
     if (llm_seed >= 0) {
         llama_body += ",\"seed\":" + std::to_string(llm_seed);
@@ -2022,6 +2114,7 @@ void ServerState::chat_orchestrate(
     const auto started = Clock::now();
     auto elapsed = [&] { return elapsed_ms(started); };
     double first_token_ms = -1.0;
+    double first_sentence_ms = -1.0;
     double first_audio_ms = -1.0;
     size_t audio_bytes = 0;
     bool llm_finished = false;
@@ -2070,6 +2163,9 @@ void ServerState::chat_orchestrate(
                 if (spoken.empty()) {
                     continue;
                 }
+                if (first_sentence_ms < 0) {
+                    first_sentence_ms = elapsed();
+                }
                 write_sse(writer, "{\"type\":\"sentence\",\"text\":" + json_quote(spoken) + "}");
                 Value::Object fields;
                 fields.emplace("input", Value::make_string(spoken));
@@ -2112,6 +2208,7 @@ void ServerState::chat_orchestrate(
         std::ostringstream done;
         done << "{\"type\":\"done\",\"stats\":{"
              << "\"first_token_ms\":" << first_token_ms
+             << ",\"first_sentence_ms\":" << first_sentence_ms
              << ",\"first_audio_ms\":" << first_audio_ms
              << ",\"wall_ms\":" << elapsed()
              << ",\"audio_seconds\":" << (static_cast<double>(audio_bytes) / 48000.0)

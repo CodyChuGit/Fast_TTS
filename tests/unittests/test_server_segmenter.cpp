@@ -42,11 +42,11 @@ void test_the_first_segment_cuts_early_at_a_clause() {
     // speakable clause before its period arrives.
     SentenceSegmenter segmenter;
     auto segments = feed_tokens(segmenter,
-        "When the storm finally cleared after three long days of waiting, "
-        "the villagers came out to see what was left of the harbor and the boats.");
+        "When the storm finally cleared, the villagers came out to see what "
+        "was left of the harbor and of the boats they had pulled ashore.");
     require(!segments.empty(), "an early segment was emitted");
     require(segments[0].back() == ',', "the early cut lands on the clause boundary");
-    require(segments[0].size() >= 24, "the early segment is a speakable clause, not a fragment");
+    require(segments[0].size() >= 14, "the early segment is a speakable clause, not a fragment");
     const auto rest = segmenter.flush();
     require(!rest.empty(), "the remainder is still pending at end of stream");
 }
@@ -94,6 +94,18 @@ void test_speech_markup_is_stripped_for_tts() {
         "an unbalanced action marker does not silence the speech");
 }
 
+void test_a_runon_opener_is_cut_at_a_word_boundary() {
+    // No clause boundary anywhere in the opener: time-to-first-audio must
+    // still be bounded, so a word-boundary cut fires once enough streamed.
+    SentenceSegmenter segmenter;
+    auto segments = feed_tokens(segmenter,
+        "Well now that is truly one of the most remarkable things anyone has ever walked in here and said to me");
+    require(!segments.empty(), "the run-on opener still produced an early segment");
+    require(segments[0].size() >= 14 && segments[0].size() <= 60,
+        "the word cut lands in the bounded window");
+    require(segments[0].find(' ') != std::string::npos, "the cut is at a word boundary, not mid-word");
+}
+
 }  // namespace
 
 int main() {
@@ -104,6 +116,7 @@ int main() {
         test_cjk_sentences_split_without_spaces();
         test_runons_are_force_split_at_a_space();
         test_speech_markup_is_stripped_for_tts();
+        test_a_runon_opener_is_cut_at_a_word_boundary();
     } catch (const std::exception & error) {
         std::cerr << error.what() << '\n';
         return 1;

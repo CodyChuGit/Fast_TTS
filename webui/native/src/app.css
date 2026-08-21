@@ -173,3 +173,7 @@ button.slim { min-height: 32px; padding: 4px 10px; font-size: 12px; }
 @keyframes caret-blink { 50% { opacity: 0; } }
 .chat-input { display: flex; gap: 8px; }
 .chat-input input { flex: 1; }
+
+.llm-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px 14px; margin-top: 4px; }
+.llm-grid small { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.35; }
+@media (max-width: 640px) { .llm-grid { grid-template-columns: 1fr; } }

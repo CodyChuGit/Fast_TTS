@@ -205,9 +205,17 @@ $effectiveConfig = [ordered]@{
             voice_presets = $voicePresets
             session_options = [ordered]@{
                 "qwen3_tts.mem_saver" = "false"
+                # Standard attention: measured on this 3090, flash_attention
+                # gave no warm speedup and nearly tripled the cost of a prefill
+                # graph capture, so the parity default is also the fast one.
                 "qwen3_tts.perf_mode" = "off"
-                "qwen3_tts.voice_prompt_cache_slots" = "$($WarmVoices.Count)"
-                "qwen3_tts.prefill_graph_cache_slots" = "$($WarmVoices.Count)"
+                # Chat speaks one sentence at a time, so text lengths vary far
+                # more than studio use did. Slots cover the bundled voices plus
+                # the active character, and enough prompt-shape graphs that a
+                # conversation stops paying capture spikes after its first
+                # exchanges.
+                "qwen3_tts.voice_prompt_cache_slots" = "6"
+                "qwen3_tts.prefill_graph_cache_slots" = "16"
             }
             default_request_options = [ordered]@{
                 chunk_frames = "1"

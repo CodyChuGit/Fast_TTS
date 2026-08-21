@@ -99,7 +99,7 @@ std::vector<std::string> SentenceSegmenter::take_ready() {
         // "...and so," and first audio a full sentence later. The largest
         // clause prefix available is used, with a floor so a bare "Hi," is not
         // synthesized alone.
-        constexpr size_t kMinClauseChars = 24;
+        constexpr size_t kMinClauseChars = 14;
         if (cut == std::string::npos && !first_segment_emitted_ &&
             pending_.size() >= options_.first_segment_min_chars) {
             for (size_t index = pending_.size(); index-- > kMinClauseChars;) {
@@ -108,6 +108,17 @@ std::vector<std::string> SentenceSegmenter::take_ready() {
                     cut = index + ((ch == ',' || ch == ';' || ch == ':') ? 1 : 3);
                     break;
                 }
+            }
+        }
+
+        // Still nothing and the opener keeps running: take a word boundary.
+        // A breath mid-clause costs less than another half second of silence
+        // before the character says anything at all.
+        if (cut == std::string::npos && !first_segment_emitted_ &&
+            pending_.size() >= options_.first_segment_word_cut_chars) {
+            const size_t space = pending_.rfind(' ');
+            if (space != std::string::npos && space >= kMinClauseChars) {
+                cut = space;
             }
         }
 

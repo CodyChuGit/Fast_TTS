@@ -10,6 +10,10 @@
   import {
     activateCharacter,
     base64ToBytes,
+    getLlmSettings,
+    resetLlmSettings,
+    setLlmSettings,
+    type LlmSettings,
     character as fetchCharacter,
     chatSpeak,
     deleteCharacter,
@@ -76,6 +80,12 @@
   let chatLog: HTMLElement | null = null;
   let chatScrollQueued = false;
 
+  // Roleplay engine settings.
+  let llm: LlmSettings | null = null;
+  let llmSaving = false;
+  let llmStatus = '';
+  let llmError = '';
+
   // MCP panel.
   let endpoint = '';
   let copied = false;
@@ -83,7 +93,7 @@
   $: sampleNote = sampleSeconds === null
     ? ''
     : sampleSeconds > 20
-      ? `This sample is ${Math.round(sampleSeconds)} s long. Cloning copies everything in the reference — length, pauses, background noise — so 5–15 s of clean, music-free speech clones far better.`
+      ? `This sample is ${Math.round(sampleSeconds)} s long. Every second of reference adds roughly 11 ms to EVERY reply's first audio, and cloning copies everything — length, pauses, background noise. 5–12 s of clean, music-free speech clones better and speaks sooner.`
       : sampleSeconds < 3
         ? 'This sample is very short; 5–15 s of clean speech clones better.'
         : '';
@@ -114,6 +124,43 @@
       library = (await listCharacters()).characters;
     } catch {
       library = [];
+    }
+    if (!llm && server?.llm) {
+      try {
+        llm = await getLlmSettings();
+      } catch {
+        llm = null;
+      }
+    }
+  }
+
+  async function saveLlmSettings() {
+    if (!llm || llmSaving) return;
+    llmSaving = true;
+    llmError = '';
+    llmStatus = 'Saving…';
+    try {
+      llm = await setLlmSettings(llm);
+      llmStatus = 'Roleplay settings saved.';
+    } catch (error) {
+      llmError = error instanceof Error ? error.message : String(error);
+      llmStatus = '';
+    } finally {
+      llmSaving = false;
+    }
+  }
+
+  async function restoreLlmDefaults() {
+    if (llmSaving) return;
+    llmSaving = true;
+    llmError = '';
+    try {
+      llm = await resetLlmSettings();
+      llmStatus = 'Roleplay defaults restored.';
+    } catch (error) {
+      llmError = error instanceof Error ? error.message : String(error);
+    } finally {
+      llmSaving = false;
     }
   }
 
@@ -675,6 +722,52 @@
         <p class="status">{settingsStatus}</p>
       {/if}
     </section>
+
+    {#if llm}
+      <section class="panel settings-panel">
+        <h2>Roleplay engine</h2>
+        <p class="mcp-hint">How every character is played. The master prompt wraps the persona;
+          <code>{'{name}'}</code> and <code>{'{persona}'}</code> are filled from the active character.</p>
+
+        <label for="llm-master">Master prompt</label>
+        <textarea id="llm-master" rows="6" bind:value={llm.master_prompt}></textarea>
+
+        <div class="llm-grid">
+          <div>
+            <label for="llm-temp">Temperature</label>
+            <input id="llm-temp" type="number" min="0" max="2" step="0.05" bind:value={llm.temperature} />
+            <small>Lower is steadier; Peach hallucinates above ~0.8.</small>
+          </div>
+          <div>
+            <label for="llm-topp">Top-p</label>
+            <input id="llm-topp" type="number" min="0.05" max="1" step="0.05" bind:value={llm.top_p} />
+            <small>Nucleus width; lower keeps replies on-script.</small>
+          </div>
+          <div>
+            <label for="llm-rep">Repetition penalty</label>
+            <input id="llm-rep" type="number" min="1" max="2" step="0.01" bind:value={llm.repeat_penalty} />
+            <small>Raise slightly if the character loops phrases.</small>
+          </div>
+          <div>
+            <label for="llm-max">Max tokens per reply</label>
+            <input id="llm-max" type="number" min="16" max="1024" step="8" bind:value={llm.max_tokens} />
+            <small>Reply length is the wall-clock of a voice chat.</small>
+          </div>
+        </div>
+
+        <div class="speak-actions">
+          <button class="primary" on:click={saveLlmSettings} disabled={llmSaving}>
+            {llmSaving ? 'Saving…' : 'Save roleplay settings'}
+          </button>
+          <button class="ghost" on:click={restoreLlmDefaults} disabled={llmSaving}>Reset to defaults</button>
+        </div>
+        {#if llmError}
+          <p class="status bad">{llmError}</p>
+        {:else if llmStatus}
+          <p class="status">{llmStatus}</p>
+        {/if}
+      </section>
+    {/if}
   {/if}
 </main>
 

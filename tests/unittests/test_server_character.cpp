@@ -9,6 +9,11 @@
 namespace {
 
 using minitts::server::CharacterConfig;
+using minitts::server::LlmSettings;
+using minitts::server::default_llm_settings;
+using minitts::server::load_llm_settings;
+using minitts::server::render_master_prompt;
+using minitts::server::save_llm_settings;
 using minitts::server::character_slug;
 using minitts::server::default_character;
 using minitts::server::is_valid_character_id;
@@ -182,6 +187,41 @@ void test_library_lists_saved_characters_and_skips_broken_ones() {
     require(list_character_library(dir.path / "nowhere").empty(), "a missing library is just empty");
 }
 
+void test_llm_settings_roundtrip_and_validation() {
+    ScratchDir dir("llm");
+    require(load_llm_settings(dir.path).master_prompt.find("{name}") != std::string::npos,
+        "defaults carry the substitutable master prompt");
+
+    LlmSettings settings = default_llm_settings();
+    settings.master_prompt = "Play {name}. {persona} Keep it short.";
+    settings.temperature = 0.7;
+    settings.max_tokens = 96;
+    save_llm_settings(dir.path, settings);
+    const auto loaded = load_llm_settings(dir.path);
+    require(loaded.master_prompt == settings.master_prompt, "master prompt roundtrips");
+    require(loaded.max_tokens == 96, "max_tokens roundtrips");
+
+    bool threw = false;
+    try {
+        LlmSettings bad = default_llm_settings();
+        bad.temperature = 5.0;
+        save_llm_settings(dir.path, bad);
+    } catch (const std::exception &) {
+        threw = true;
+    }
+    require(threw, "out-of-range sampling is refused, not clamped");
+}
+
+void test_master_prompt_substitution() {
+    LlmSettings settings;
+    settings.master_prompt = "You are {name}. {persona} Stay as {name}.";
+    const auto rendered = render_master_prompt(settings, "Mira", "A calm librarian.");
+    require(rendered == "You are Mira. A calm librarian. Stay as Mira.",
+        "every placeholder occurrence substitutes");
+    const auto empty_persona = render_master_prompt(settings, "Mira", "");
+    require(empty_persona.find("{persona}") == std::string::npos, "an empty persona leaves no placeholder");
+}
+
 }  // namespace
 
 int main() {
@@ -194,6 +234,8 @@ int main() {
         test_name_sanitization();
         test_slugs_are_safe_and_stable();
         test_library_lists_saved_characters_and_skips_broken_ones();
+        test_llm_settings_roundtrip_and_validation();
+        test_master_prompt_substitution();
     } catch (const std::exception & error) {
         std::cerr << error.what() << '\n';
         return 1;

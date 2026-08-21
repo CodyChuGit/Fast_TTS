@@ -103,13 +103,12 @@ uint64_t fnv1a_mix(uint64_t hash, const void * data, size_t size) {
 }
 
 uint64_t hash_audio_samples(const runtime::AudioBuffer & audio) {
+    // One pass over the contiguous sample bytes. FNV-1a is byte-sequential,
+    // so this produces exactly the hash the old per-sample loop did, without
+    // the per-float memcpy that cost hundreds of milliseconds on a long
+    // voice reference -- on the first-audio path of every request.
     uint64_t hash = 1469598103934665603ull;
-    for (const float sample : audio.samples) {
-        uint32_t bits = 0;
-        std::memcpy(&bits, &sample, sizeof(bits));
-        hash = fnv1a_mix(hash, &bits, sizeof(bits));
-    }
-    return hash;
+    return fnv1a_mix(hash, audio.samples.data(), audio.samples.size() * sizeof(float));
 }
 
 core::BackendConfig voice_prompt_backend_config(const runtime::SessionOptions & options) {

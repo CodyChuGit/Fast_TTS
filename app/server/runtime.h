@@ -142,6 +142,11 @@ private:
     // model ids.
     LoadedModel & require_speech_model(const engine::io::json::Value & body);
 
+    // The roleplay master prompt and sampling, persisted beside the character.
+    HttpResponse handle_llm_settings_get();
+    HttpResponse handle_llm_settings_set(const std::string & body_text);
+    std::string llm_settings_json() const;
+
     // MCP endpoint: JSON-RPC over streamable HTTP with one speak tool.
     HttpResponse handle_mcp(const HttpRequest & request);
 
@@ -169,6 +174,7 @@ private:
     // is guarded by that model's metadata_mutex.
     mutable std::mutex character_mutex_;
     CharacterConfig character_;
+    LlmSettings llm_settings_;
     std::filesystem::path character_dir_;
 };
 

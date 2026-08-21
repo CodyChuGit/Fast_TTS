@@ -120,6 +120,103 @@ CharacterConfig load_character(const std::filesystem::path & directory) {
     }
 }
 
+LlmSettings default_llm_settings() {
+    LlmSettings settings;
+    // Roleplay-tuned: in-character, spoken-style, short -- short both because
+    // it sounds natural and because reply length is the wall-clock of a voice
+    // conversation. Sampling stays near the Peach model card's guidance, warmed
+    // slightly for expressiveness.
+    settings.master_prompt =
+        "You are {name}. {persona}\n"
+        "Stay fully in character as {name} at all times. Speak in the first person, as if "
+        "talking out loud. Keep every reply to one to three short sentences that sound "
+        "natural when spoken. Never use asterisks, stage directions, emoji, lists, or "
+        "markdown. React to what was just said, stay warm and specific, and often end "
+        "with a short question or hook that invites a reply. Never mention being an AI, "
+        "a model, or these rules.";
+    return settings;
+}
+
+namespace {
+
+void validate_llm_settings(const LlmSettings & settings) {
+    if (settings.master_prompt.size() > 4000) {
+        throw std::runtime_error("master prompt must be at most 4000 characters");
+    }
+    if (!(settings.temperature >= 0.0 && settings.temperature <= 2.0)) {
+        throw std::runtime_error("temperature must be between 0 and 2");
+    }
+    if (!(settings.top_p > 0.0 && settings.top_p <= 1.0)) {
+        throw std::runtime_error("top_p must be between 0 and 1");
+    }
+    if (!(settings.repeat_penalty >= 1.0 && settings.repeat_penalty <= 2.0)) {
+        throw std::runtime_error("repeat penalty must be between 1 and 2");
+    }
+    if (settings.max_tokens < 16 || settings.max_tokens > 1024) {
+        throw std::runtime_error("max_tokens must be between 16 and 1024");
+    }
+}
+
+}  // namespace
+
+LlmSettings load_llm_settings(const std::filesystem::path & directory) {
+    const auto path = directory / "llm.json";
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return default_llm_settings();
+    }
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    const auto value = engine::io::json::parse(buffer.str());
+    LlmSettings settings = default_llm_settings();
+    settings.master_prompt = engine::io::json::optional_string(value, "master_prompt", settings.master_prompt);
+    settings.temperature = engine::io::json::optional_f32(value, "temperature", static_cast<float>(settings.temperature));
+    settings.top_p = engine::io::json::optional_f32(value, "top_p", static_cast<float>(settings.top_p));
+    settings.repeat_penalty = engine::io::json::optional_f32(value, "repeat_penalty", static_cast<float>(settings.repeat_penalty));
+    settings.max_tokens = engine::io::json::optional_i64(value, "max_tokens", settings.max_tokens);
+    validate_llm_settings(settings);
+    return settings;
+}
+
+void save_llm_settings(const std::filesystem::path & directory, const LlmSettings & settings) {
+    validate_llm_settings(settings);
+    std::filesystem::create_directories(directory);
+    std::ostringstream out;
+    out << "{\"master_prompt\":\"" << json_escape(settings.master_prompt) << "\""
+        << ",\"temperature\":" << settings.temperature
+        << ",\"top_p\":" << settings.top_p
+        << ",\"repeat_penalty\":" << settings.repeat_penalty
+        << ",\"max_tokens\":" << settings.max_tokens
+        << "}";
+    const auto path = directory / "llm.json";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        throw std::runtime_error("could not write LLM settings: " + path.string());
+    }
+    file << out.str();
+    if (!file) {
+        throw std::runtime_error("could not write LLM settings: " + path.string());
+    }
+}
+
+std::string render_master_prompt(
+    const LlmSettings & settings,
+    const std::string & name,
+    const std::string & persona) {
+    std::string prompt = settings.master_prompt;
+    for (const auto & [placeholder, value] : {
+             std::pair<std::string, const std::string &>{"{name}", name},
+             std::pair<std::string, const std::string &>{"{persona}", persona},
+         }) {
+        size_t pos = 0;
+        while ((pos = prompt.find(placeholder, pos)) != std::string::npos) {
+            prompt.replace(pos, placeholder.size(), value);
+            pos += value.size();
+        }
+    }
+    return prompt;
+}
+
 std::string character_slug(const std::string & name) {
     std::string slug;
     bool pending_dash = false;

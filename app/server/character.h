@@ -66,6 +66,36 @@ std::string character_slug(const std::string & name);
 // rejected outright.
 bool is_valid_character_id(const std::string & id);
 
+// How the roleplay LLM behaves: the master prompt every character is played
+// through, and the sampling that shapes delivery. App-level state, persisted
+// beside the character store, editable from Settings; chat requests may still
+// override the sampling per call.
+struct LlmSettings {
+    // {name} and {persona} are substituted from the active character.
+    std::string master_prompt;
+    double temperature = 0.55;
+    double top_p = 0.75;
+    double repeat_penalty = 1.1;
+    int64_t max_tokens = 140;
+};
+
+// The shipped roleplay-tuned defaults.
+LlmSettings default_llm_settings();
+
+// Reads `llm.json` from the directory; defaults when missing. Throws on a file
+// that exists but cannot be parsed.
+LlmSettings load_llm_settings(const std::filesystem::path & directory);
+
+// Writes `llm.json`, creating the directory if needed. Values are validated --
+// out-of-range sampling is refused rather than silently clamped.
+void save_llm_settings(const std::filesystem::path & directory, const LlmSettings & settings);
+
+// The master prompt with {name} and {persona} substituted.
+std::string render_master_prompt(
+    const LlmSettings & settings,
+    const std::string & name,
+    const std::string & persona);
+
 // Every saved character under `<root>/library`, sorted by name. Entries that
 // fail to load (broken JSON, missing recording) are skipped: one damaged entry
 // must not hide the rest of the library.
