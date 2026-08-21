@@ -88,16 +88,24 @@ bool LlmManager::start(const LlmModelSpec & spec, std::string & error) {
     std::wstring command_line;
     for (const auto & arg : args) {
         std::wstring wide(arg.begin(), arg.end());
-        const bool needs_quotes = arg.find(' ') != std::string::npos;
+        // Quote when the argument has spaces or quotes; embedded quotes are
+        // backslash-escaped so JSON arguments (--chat-template-kwargs) arrive
+        // intact through CommandLineToArgvW.
+        const bool needs_quotes = arg.find_first_of(" \"") != std::string::npos;
         if (!command_line.empty()) {
             command_line += L' ';
         }
         if (needs_quotes) {
             command_line += L'"';
-        }
-        command_line += wide;
-        if (needs_quotes) {
+            for (const wchar_t ch : wide) {
+                if (ch == L'"') {
+                    command_line += L'\\';
+                }
+                command_line += ch;
+            }
             command_line += L'"';
+        } else {
+            command_line += wide;
         }
     }
 

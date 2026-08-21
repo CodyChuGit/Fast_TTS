@@ -221,6 +221,22 @@ if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
         extra_args = @("--n-cpu-moe", "9", "-ub", "1024", "--reasoning-budget", "0")
     }
 }
+$huihuiModelPath = Join-Path $repoRoot "models\Huihui-Qwen3.8-27B-abliterated-GGUF\Huihui-Qwen3.8-27B-abliterated.Q4_K_M.gguf"
+if (Test-Path -LiteralPath $huihuiModelPath -PathType Leaf) {
+    # A DENSE 27B: there is no expert-offload trick, so fitting beside the
+    # TTS model means putting whole layers on the CPU, and measured decode is
+    # ~4 t/s -- slower than the speech itself. Registered because it is asked
+    # for, but not suited to live voice at this quant; a ~Q3 quant that fits
+    # fully on the GPU would run ~35 t/s. Its template ignores
+    # --reasoning-budget, so thinking is disabled through the template kwarg.
+    $llmModels += , [ordered]@{
+        id = "huihui-qwen"
+        name = "Qwen3.8 27B heretic (slow)"
+        path = ($huihuiModelPath -replace "\\", "/")
+        extra_args = @("-ngl", "46", "-ub", "1024",
+            "--chat-template-kwargs", '{"enable_thinking":false}')
+    }
+}
 $llmAvailable = $false
 if (-not $SkipLlm) {
     if (-not (Test-Path -LiteralPath $llmExe -PathType Leaf)) {
