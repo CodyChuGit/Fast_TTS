@@ -63,56 +63,27 @@ std::filesystem::path executable_directory(const char * argv0) {
 
 void print_help() {
     std::cout
-        << "audiocpp_server [--config <server.json>] [--ui] [--host <ip>] [--port <port>] [--backend <backend>]\n"
-        << "                [--device <id>] [--threads <n>] [--busy-timeout-ms <ms>]\n"
-        << "                [--cuda-keepalive-ms <ms>] [--cuda-keepalive-work-ms <ms>]\n"
-        << "                [--model-spec-override <json-or-directory>] [--voice-dir <directory>]\n"
-        << "                [--log] [--log-file <path>]\n"
-        << "                [--cors-origins <origins>]\n"
-        << "  --ui                             serve the embedded WebUI; without --config, start\n"
-        << "                                   as a native model-management host\n"
-        << "  --no-ui                          disable the embedded WebUI\n"
-        << "  --ui-management                  allow WebUI model load/unload and temporary uploads\n"
-        << "  --backend cpu|cuda|hip|rocm|vulkan|metal  default cuda (rocm is an alias for hip)\n"
-        << "  --busy-timeout-ms <ms>           fail a request with 503 when the model has been\n"
-        << "                                   busy this long; default 300000, 0 disables\n"
-        << "  --cuda-keepalive-ms <ms>         submit a tiny low-priority CUDA operation at this\n"
-        << "                                   interval to prevent idle downclocking; 0 disables\n"
-        << "  --cuda-keepalive-work-ms <ms>    heartbeat kernel duration; default 50\n"
-        << "  --voice-dir <directory>          override the shared reference voice library directory\n"
-        << "  --character-dir <directory>      where the active character voice is persisted\n"
-        << "  --cors-origins \"*\"              experimental; disabled by default. Allows browser\n"
-        << "                                   requests from any origin for trusted local demos only\n"
+        << "audiocpp_server --config <server.json> [--host <ip>] [--port <port>]\n"
+        << "                [--llm-host <ip>] [--llm-port <port>] [--character-dir <dir>]\n"
+        << "                [--voice-dir <dir>] [--cuda-keepalive-ms <ms>] [--busy-timeout-ms <ms>]\n"
+        << "                [--log] [--log-file <path>] [--cors-origins <origins>]\n"
+        << "\n"
+        << "The Super Fast TTS character-voice server: Qwen3-TTS speech plus a\n"
+        << "llama.cpp chat sidecar, one character, streamed end to end.\n"
         << "\n"
         << "Endpoints:\n"
-        << "  GET  /                           embedded WebUI (enabled by default with a config)\n"
-        << "  GET  /health\n"
-        << "  GET  /v1/models\n"
-        << "  POST /v1/models/load             available with --ui-management\n"
-        << "  POST /v1/models/unload           available with --ui-management\n"
-        << "  POST /v1/ui/upload               temporary browser upload for WebUI requests\n"
-        << "  POST /v1/ui/models/install       background package download/preparation\n"
-        << "  POST /v1/ui/models/install/stop  stop one active package download\n"
-        << "  POST /v1/ui/models/clean-partial remove abandoned package staging files\n"
-        << "  POST /v1/ui/models/delete        remove one installed package precision\n"
-        << "  GET  /v1/ui/models-root          current and binary-local default models folders\n"
-        << "  POST /v1/ui/models-root          select a models folder (empty path restores default)\n"
-        << "  POST /v1/ui/browse-directories   list local folders for the native folder picker\n"
-        << "  GET  /v1/ui/models/install-status[?id=<package>]\n"
-        << "  GET  /v1/ui/models/package-sizes package sizes from metadata-only checks\n"
-        << "  GET  /v1/audio/voices?model=<id>\n"
-        << "  POST /v1/audio/speech\n"
-        << "  GET  /v1/character               the active character (name + voice)\n"
-        << "  POST /v1/character               replace the character: JSON {name, preset} or\n"
-        << "                                   multipart name/transcript/file for a custom voice\n"
-        << "  POST /mcp                        Model Context Protocol endpoint (streamable HTTP)\n"
-        << "                                   with a speak tool that returns WAV audio\n"
-        << "  POST /v1/audio/transcriptions\n"
-        << "       fields: file, model, language, prompt, stream\n"
-        << "       OpenAI-style streaming: speech stream_format=sse|audio, transcription stream=true\n"
-        << "  POST /v1/audio/transcriptions/live?model=<id>\n"
-        << "       raw PCM in a chunked body, transcript deltas as SSE on the same connection\n"
-        << "  POST /v1/tasks/run\n";
+        << "  GET  /                     the app (Speak, Chat, Settings)\n"
+        << "  GET  /health               liveness, backend, LLM sidecar state\n"
+        << "  GET  /v1/models            configured model state\n"
+        << "  POST /v1/audio/speech      OpenAI-compatible TTS; no voice field -> the character\n"
+        << "  POST /v1/chat/speak        SSE: LLM tokens + interleaved character audio\n"
+        << "  GET  /v1/character         the active character\n"
+        << "  POST /v1/character         replace it: JSON {name, preset, persona} or\n"
+        << "                             multipart name/transcript/persona/file\n"
+        << "  GET  /v1/character/voice   the active custom recording\n"
+        << "  GET  /v1/characters        the saved-character library\n"
+        << "  POST /v1/characters/activate | /v1/characters/delete   {id}\n"
+        << "  POST /mcp                  Model Context Protocol (streamable HTTP), speak tool\n";
 }
 
 }  // namespace
@@ -197,6 +168,12 @@ int main(int argc, char ** argv) {
         }
         if (const auto character_dir = arg_value(argc, argv, "--character-dir")) {
             config.character_dir = std::filesystem::path(*character_dir);
+        }
+        if (const auto llm_host = arg_value(argc, argv, "--llm-host")) {
+            config.llm_host = *llm_host;
+        }
+        if (const auto llm_port = arg_value(argc, argv, "--llm-port")) {
+            config.llm_port = std::stoi(*llm_port);
         }
         if (!(config.cors_origins == "*" || config.cors_origins == "")) {
             throw std::runtime_error("--cors-origins must be '*' (allow all origins) or '' (disabled)");

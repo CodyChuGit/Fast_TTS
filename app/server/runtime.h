@@ -5,7 +5,6 @@
 #include "config.h"
 #include "http.h"
 #include "mcp.h"
-#include "model_installer.h"
 
 #include "../streaming/streaming.h"
 
@@ -79,20 +78,6 @@ private:
 
     void load_models();
     std::unique_ptr<LoadedModel> make_model(ServerModelConfig config);
-    std::filesystem::path resolve_ui_model_path(const std::filesystem::path & path) const;
-    HttpResponse handle_model_load(const std::string & body_text);
-    HttpResponse handle_model_unload(const std::string & body_text);
-    HttpResponse handle_path_status(const std::string & body_text) const;
-    HttpResponse handle_ui_upload(const HttpRequest & request);
-    HttpResponse handle_model_install(const std::string & body_text);
-    HttpResponse handle_model_install_stop(const std::string & body_text);
-    HttpResponse handle_model_clean_partial(const std::string & body_text);
-    HttpResponse handle_model_remove(const std::string & body_text);
-    HttpResponse handle_model_install_status(const HttpRequest & request) const;
-    HttpResponse handle_model_package_sizes();
-    HttpResponse handle_models_root_get() const;
-    HttpResponse handle_models_root_set(const std::string & body_text);
-    HttpResponse handle_directory_browser(const std::string & body_text) const;
     HttpResponse handle_ui_asset() const;
     LoadedModel::RuntimeVoicePreset load_runtime_voice_preset(const ServerModelConfig::VoicePreset & preset) const;
     void load_voice_presets(LoadedModel & model) const;
@@ -127,31 +112,11 @@ private:
         const minitts::app::AudioChunkStream * audio,
         const std::function<void(const engine::runtime::StreamEvent &)> & event_sink,
         std::optional<int> busy_timeout_ms);
-    // Same as run_streaming_model, but pulls audio from `audio` instead of
-    // `request.audio_input`, so the samples are never fully materialized.
-    TimedTaskResult run_streaming_model_from(
-        LoadedModel & model,
-        const engine::runtime::TaskRequest & request,
-        const minitts::app::AudioChunkStream & audio,
-        const std::function<void(const engine::runtime::StreamEvent &)> & event_sink = {},
-        std::optional<int> busy_timeout_ms = std::nullopt);
     HttpResponse handle_speech(const std::string & body_text);
     HttpResponse handle_speech_stream(
         LoadedModel & model,
         engine::runtime::TaskRequest request,
         const engine::io::json::Value & body);
-    HttpResponse handle_transcription(const HttpRequest & request);
-    HttpResponse handle_transcription_json(const std::string & body_text);
-    HttpResponse handle_transcription_multipart(const std::string & body_text, const std::string & boundary);
-    HttpResponse run_transcription(
-        LoadedModel & model,
-        const engine::runtime::TaskRequest & request,
-        std::optional<int> busy_timeout_ms = std::nullopt);
-    HttpResponse run_transcription_stream(
-        LoadedModel & model,
-        const engine::runtime::TaskRequest & request,
-        std::optional<int> busy_timeout_ms = std::nullopt);
-    HttpResponse handle_transcription_live(const HttpRequest & request);
     // The active character: the display name plus default voice used whenever a
     // request names no voice, shared by the WebUI and MCP callers.
     HttpResponse handle_character_get();
@@ -179,13 +144,19 @@ private:
 
     // MCP endpoint: JSON-RPC over streamable HTTP with one speak tool.
     HttpResponse handle_mcp(const HttpRequest & request);
+
+    // Chat with the character: streams the llama.cpp sidecar's reply as token
+    // events while completed sentences are synthesized and interleaved as
+    // audio events on the same SSE stream. The LLM keeps generating while the
+    // TTS model speaks, so text runs ahead and audio catches up.
+    HttpResponse handle_chat_speak(const std::string & body_text);
+    void chat_orchestrate(
+        LoadedModel & model,
+        const std::string & llama_body,
+        long long tts_seed,
+        HttpStreamWriter & writer);
     mcp::SpeakOutcome run_mcp_speak(const std::string & text, long long seed);
 
-    HttpResponse handle_generic_run(const std::string & body_text);
-    HttpResponse handle_generic_stream(const std::string & body_text);
-    HttpResponse handle_voices(const HttpRequest & request) const;
-    HttpResponse handle_unload_models(const std::string & body_text);
-    HttpResponse handle_unload_all_models();
     std::string models_json() const;
     std::string get_allowed_origin(const HttpRequest & request) const;
 
@@ -194,13 +165,6 @@ private:
     std::vector<std::unique_ptr<LoadedModel>> models_;
     std::unordered_map<std::string, size_t> model_index_;
     mutable std::mutex models_mutex_;
-    std::filesystem::path upload_root_;
-    std::filesystem::path repository_root_;
-    std::filesystem::path default_models_root_;
-    std::filesystem::path models_root_;
-    mutable std::mutex model_installer_mutex_;
-    std::unique_ptr<ModelInstaller> model_installer_;
-    std::atomic<uint64_t> next_upload_id_{1};
     // Guards character_; the voice preset it resolves to lives on the model and
     // is guarded by that model's metadata_mutex.
     mutable std::mutex character_mutex_;

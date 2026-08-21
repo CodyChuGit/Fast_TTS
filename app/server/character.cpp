@@ -89,6 +89,7 @@ CharacterConfig read_character_file(const std::filesystem::path & directory) {
     character.preset = engine::io::json::optional_string(value, "preset", "");
     character.voice_file = engine::io::json::optional_string(value, "voice_file", "");
     character.transcript = engine::io::json::optional_string(value, "transcript", "");
+    character.persona = engine::io::json::optional_string(value, "persona", "");
     if (character.preset.empty() && character.voice_file.empty()) {
         throw std::runtime_error(
             "character store " + path.string() + " names neither a preset nor a voice_file");
@@ -202,6 +203,9 @@ void save_character(const std::filesystem::path & directory, const CharacterConf
     }
     if (!character.transcript.empty()) {
         out << ",\"transcript\":\"" << json_escape(character.transcript) << "\"";
+    }
+    if (!character.persona.empty()) {
+        out << ",\"persona\":\"" << json_escape(character.persona) << "\"";
     }
     out << "}";
 

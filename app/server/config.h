@@ -94,6 +94,10 @@ struct ServerConfig {
     // Where the active character (name + voice) is persisted. Defaults to
     // `character/` under the server's working directory.
     std::optional<std::filesystem::path> character_dir;
+    // The llama.cpp sidecar serving /v1/chat/completions. Port 0 means no LLM
+    // is attached and the chat endpoint reports itself unavailable.
+    std::string llm_host = "127.0.0.1";
+    int llm_port = 0;
     std::vector<ServerModelConfig> models;
 };
 

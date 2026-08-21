@@ -1438,8 +1438,9 @@ add_executable(audiocpp_server
     app/server/character.cpp
     app/server/config.cpp
     app/server/http.cpp
+    app/server/llm_client.cpp
     app/server/mcp.cpp
-    app/server/model_installer.cpp
+    app/server/segmenter.cpp
     app/server/multipart.cpp
     app/server/runtime.cpp
     app/server/ui_assets.cpp
@@ -2219,6 +2220,32 @@ if (ENGINE_BUILD_TESTS)
         COMMAND server_multipart_test
     )
 
+    add_executable(server_segmenter_test
+        tests/unittests/test_server_segmenter.cpp
+        app/server/segmenter.cpp
+    )
+    target_include_directories(server_segmenter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/app/server)
+
+    add_test(
+        NAME server_segmenter_test
+        COMMAND server_segmenter_test
+    )
+
+    add_executable(server_llm_client_test
+        tests/unittests/test_server_llm_client.cpp
+        app/server/llm_client.cpp
+    )
+    target_include_directories(server_llm_client_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/app/server)
+    target_link_libraries(server_llm_client_test PRIVATE engine_runtime ggml)
+    if(WIN32)
+        target_link_libraries(server_llm_client_test PRIVATE ws2_32)
+    endif()
+
+    add_test(
+        NAME server_llm_client_test
+        COMMAND server_llm_client_test
+    )
+
     add_executable(server_mcp_test
         tests/unittests/test_server_mcp.cpp
         app/server/mcp.cpp
@@ -2331,8 +2358,7 @@ if (ENGINE_BUILD_TESTS)
 
     add_executable(server_model_installer_test
         tests/unittests/test_server_model_installer.cpp
-        app/server/model_installer.cpp
-    )
+        )
     target_include_directories(server_model_installer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/app/server)
     target_link_libraries(server_model_installer_test PRIVATE Threads::Threads)
 

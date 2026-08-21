@@ -152,3 +152,24 @@ button.slim { min-height: 32px; padding: 4px 10px; font-size: 12px; }
 
 .status.warn { color: #f0c274; }
 .reference-audio { width: 100%; height: 36px; margin-top: 4px; }
+
+/* Chat */
+.chat-panel { display: flex; flex-direction: column; gap: 10px; }
+.chat-log {
+  min-height: 280px; max-height: 52vh; overflow-y: auto; display: flex; flex-direction: column;
+  gap: 8px; padding: 6px 2px;
+}
+.chat-message { display: flex; }
+.chat-message.user { justify-content: flex-end; }
+.chat-message .bubble {
+  max-width: 80%; padding: 9px 13px; border-radius: 13px; font-size: 14px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word; border: 1px solid var(--line); background: #081426;
+}
+.chat-message.user .bubble { background: #16304e; border-color: #2c4a74; }
+.caret {
+  display: inline-block; width: 7px; height: 15px; margin-left: 3px; vertical-align: text-bottom;
+  background: var(--cyan); animation: caret-blink 1s steps(1) infinite;
+}
+@keyframes caret-blink { 50% { opacity: 0; } }
+.chat-input { display: flex; gap: 8px; }
+.chat-input input { flex: 1; }

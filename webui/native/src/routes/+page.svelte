@@ -9,7 +9,9 @@
   } from '$lib/audio';
   import {
     activateCharacter,
+    base64ToBytes,
     character as fetchCharacter,
+    chatSpeak,
     deleteCharacter,
     health,
     listCharacters,
@@ -19,13 +21,15 @@
     speakStream,
     updateCharacter,
     type Character,
+    type ChatMessage,
+    type ChatStats,
     type SavedCharacterEntry,
     type ServerHealth,
     type SpeakStats
   } from '$lib/client';
   import '../app.css';
 
-  let view: 'speak' | 'settings' = 'speak';
+  let view: 'speak' | 'chat' | 'settings' = 'speak';
   let server: ServerHealth | null = null;
   let active: Character | null = null;
 
@@ -46,6 +50,7 @@
   let editName = '';
   let voiceSource: 'preset' | 'custom' = 'preset';
   let editPreset = '';
+  let editPersona = '';
   let customFile: File | null = null;
   let customTranscript = '';
   let saving = false;
@@ -59,6 +64,16 @@
   let sampleSeconds: number | null = null;
   let voiceRev = 0;
   let testing = false;
+
+  // Chat view.
+  let chatMessages: Array<ChatMessage & { speaking?: boolean }> = [];
+  let chatInput = '';
+  let chatBusy = false;
+  let chatError = '';
+  let chatStats: ChatStats | null = null;
+  let chatAborter: AbortController | null = null;
+  let chatPlayer: Pcm16StreamPlayer | null = null;
+  let chatLog: HTMLElement | null = null;
 
   // MCP panel.
   let endpoint = '';
@@ -76,6 +91,7 @@
     editName = from?.name || '';
     voiceSource = from?.source === 'custom' ? 'custom' : 'preset';
     editPreset = from?.preset || from?.available_presets?.[0] || '';
+    editPersona = from?.persona || '';
     customTranscript = from?.transcript || '';
     customFile = null;
     formReady = true;
@@ -275,17 +291,17 @@
     try {
       if (voiceSource === 'preset') {
         if (!editPreset) throw new Error('Choose a bundled voice.');
-        active = await setCharacterPreset(editName, editPreset);
+        active = await setCharacterPreset(editName, editPreset, editPersona.trim());
       } else if (customFile) {
         // A new recording replaces the voice.
         if (!customTranscript.trim()) {
           throw new Error('Enter the transcript of what the sample says — cloning quality depends on it.');
         }
         const wav = await browserDecodeToWav(customFile);
-        active = await setCharacterCustom(editName, customTranscript.trim(), wav);
+        active = await setCharacterCustom(editName, customTranscript.trim(), wav, editPersona.trim());
       } else if (active?.source === 'custom') {
         // No new recording: keep the saved voice, update name and transcript.
-        active = await updateCharacter(editName, customTranscript.trim() || undefined);
+        active = await updateCharacter(editName, customTranscript.trim() || undefined, editPersona.trim());
       } else {
         throw new Error('Choose or record a voice sample.');
       }
@@ -313,6 +329,72 @@
     } catch {
       // Clipboard can be unavailable; the URL is visible and selectable anyway.
     }
+  }
+
+  async function sendChat() {
+    const content = chatInput.trim();
+    if (!content || chatBusy) return;
+    chatBusy = true;
+    chatError = '';
+    chatStats = null;
+    chatInput = '';
+    chatMessages = [...chatMessages, { role: 'user', content }, { role: 'assistant', content: '', speaking: true }];
+    chatAborter = new AbortController();
+    try {
+      await primePcm16Playback();
+      chatPlayer = new Pcm16StreamPlayer(24000, 1);
+      await chatPlayer.start();
+      // The full visible history goes up each turn; the sidecar's prompt cache
+      // makes re-sending the prefix nearly free.
+      const history = chatMessages
+        .slice(0, -1)
+        .slice(-24)
+        .map(({ role, content: text }) => ({ role, content: text }));
+      await chatSpeak(history, (event) => {
+        if (event.type === 'token') {
+          const last = chatMessages[chatMessages.length - 1];
+          last.content += event.text;
+          chatMessages = chatMessages;
+          queueMicrotask(() => chatLog?.scrollTo({ top: chatLog.scrollHeight }));
+        } else if (event.type === 'audio') {
+          chatPlayer?.push(base64ToBytes(event.audio));
+        } else if (event.type === 'error') {
+          chatError = event.message;
+        } else if (event.type === 'done') {
+          chatStats = event.stats;
+        }
+      }, chatAborter.signal);
+      await chatPlayer.finish();
+    } catch (error) {
+      if ((error as Error)?.name !== 'AbortError') {
+        chatError = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      await chatPlayer?.stop();
+      chatPlayer = null;
+      const last = chatMessages[chatMessages.length - 1];
+      if (last) {
+        last.speaking = false;
+        if (!last.content) {
+          chatMessages = chatMessages.slice(0, -1);
+        } else {
+          chatMessages = chatMessages;
+        }
+      }
+      chatBusy = false;
+      chatAborter = null;
+    }
+  }
+
+  function stopChat() {
+    chatAborter?.abort();
+  }
+
+  function clearChat() {
+    if (chatBusy) return;
+    chatMessages = [];
+    chatStats = null;
+    chatError = '';
   }
 
   onMount(() => {
@@ -345,6 +427,9 @@
   </div>
   <nav>
     <button class:active={view === 'speak'} on:click={() => (view = 'speak')}>Speak</button>
+    {#if server?.llm}
+      <button class:active={view === 'chat'} on:click={() => (view = 'chat')}>Chat</button>
+    {/if}
     <button class:active={view === 'settings'} on:click={() => (view = 'settings')}>Settings</button>
   </nav>
   <div class="server-pill" class:online={server?.status === 'ok'}>
@@ -422,6 +507,48 @@
         </p>
       </details>
     </section>
+  {:else if view === 'chat'}
+    <section class="hero">
+      <p class="eyebrow">TALK TO THE CHARACTER</p>
+      <h1>Chat</h1>
+      <p>
+        The reply streams as text while completed sentences are spoken in the character's voice —
+        the model keeps writing while earlier sentences play, and the audio catches up.
+      </p>
+    </section>
+
+    <section class="panel chat-panel">
+      <div class="chat-log" bind:this={chatLog}>
+        {#if !chatMessages.length}
+          <p class="status">Say something to start. The active character replies in voice.</p>
+        {/if}
+        {#each chatMessages as message, index (index)}
+          <div class="chat-message {message.role}">
+            <div class="bubble">
+              {message.content}{#if message.speaking}<span class="caret"></span>{/if}
+            </div>
+          </div>
+        {/each}
+      </div>
+      <form class="chat-input" on:submit|preventDefault={sendChat}>
+        <input bind:value={chatInput} disabled={chatBusy} placeholder="Say something…" />
+        {#if chatBusy}
+          <button class="danger" type="button" on:click={stopChat}>Stop</button>
+        {:else}
+          <button class="primary" type="submit" disabled={!chatInput.trim()}>Send</button>
+        {/if}
+        <button class="ghost" type="button" on:click={clearChat} disabled={chatBusy}>Clear</button>
+      </form>
+      {#if chatError}
+        <p class="status bad">{chatError}</p>
+      {:else if chatStats}
+        <p class="status">
+          First token {chatStats.first_token_ms < 0 ? '—' : `${chatStats.first_token_ms.toFixed(0)} ms`}
+          · first audio {chatStats.first_audio_ms < 0 ? '—' : `${chatStats.first_audio_ms.toFixed(0)} ms`}
+          · {chatStats.audio_seconds.toFixed(1)} s spoken in {(chatStats.wall_ms / 1000).toFixed(1)} s
+        </p>
+      {/if}
+    </section>
   {:else}
     <section class="hero">
       <p class="eyebrow">SETTINGS</p>
@@ -465,6 +592,10 @@
         name adds a new character; the same name replaces it.</p>
       <label for="char-name">Character name</label>
       <input id="char-name" bind:value={editName} maxlength="64" placeholder="Name this character" />
+
+      <label for="char-persona">Persona <span style="font-weight:400">— who they are in chat</span></label>
+      <textarea id="char-persona" rows="3" bind:value={editPersona}
+        placeholder="Describe the character for the roleplay model: personality, backstory, how they talk…"></textarea>
 
       <fieldset>
         <legend>Voice</legend>

@@ -22,6 +22,11 @@ struct CharacterConfig {
     // Transcript of the custom recording, injected as reference_text for
     // cloning quality.
     std::string transcript;
+    // Who the character IS, not just how they sound: used as the LLM system
+    // prompt in chat, so the roleplay model plays this character while the TTS
+    // model voices them. Empty means a generic in-character prompt is built
+    // from the name.
+    std::string persona;
 
     bool is_custom() const { return !voice_file.empty(); }
 };
