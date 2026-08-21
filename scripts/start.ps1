@@ -20,13 +20,11 @@ param(
         "demo_1_man"
     ),
     [switch]$SkipWarmup,
-    # The llama.cpp chat sidecar. The default model is Peach-9B-8k-Roleplay
-    # Q8_0; -SkipLlm starts speech-only.
+    # The llama.cpp chat sidecar. The speech server owns the process and can
+    # switch between the registered models from Settings; -LlmModelPath
+    # overrides where Peach 2.0 lives, -SkipLlm starts speech-only.
     [string]$LlmModelPath = "",
     [int]$LlmPort = 18081,
-    [int]$LlmGpuLayers = 99,
-    [int]$LlmContext = 8192,
-    [int]$LlmThreads = 6,
     [switch]$SkipLlm,
     [switch]$Restart,
     [switch]$OpenBrowser
@@ -185,6 +183,53 @@ if (Test-Path -LiteralPath $promptTextPath -PathType Leaf) {
     }
 }
 
+# ---- llama.cpp chat sidecar registry ----------------------------------------
+# The speech server spawns and owns llama-server (kill-on-close job object), so
+# the launcher only decides which models are on the menu. Settings can switch
+# between every entry whose GGUF is on disk.
+$llmExe = Join-Path $repoRoot "build\llama-cpp\llama-server.exe"
+if ([string]::IsNullOrWhiteSpace($LlmModelPath)) {
+    $LlmModelPath = Join-Path $repoRoot "models\Peach-2.0-9B-8k-Roleplay-GGUF\Peach-2.0-9B-8k-Roleplay.Q8_0.gguf"
+}
+if (-not [System.IO.Path]::IsPathRooted($LlmModelPath)) {
+    $LlmModelPath = Join-Path $repoRoot $LlmModelPath
+}
+$LlmModelPath = [System.IO.Path]::GetFullPath($LlmModelPath)
+$gemmaModelPath = Join-Path $repoRoot "models\gemma-4-26B-A4B-heretic-GGUF\gemma-4-26B-A4B-it-uncensored-heretic-Q4_K_M.gguf"
+
+$llmModels = @()
+if (Test-Path -LiteralPath $LlmModelPath -PathType Leaf) {
+    $llmModels += , [ordered]@{
+        id = "peach"
+        name = "Peach 2.0"
+        path = ($LlmModelPath -replace "\\", "/")
+    }
+}
+if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
+    # 16.8 GB of Q4_K_M cannot sit beside the resident TTS model on a 24 GB
+    # card, so the MoE expert tensors stay in system RAM; attention and the
+    # dense layers still run on the GPU. Gemma 4 is a reasoning model, and a
+    # voice conversation cannot wait through a hidden think phase -- a zero
+    # reasoning budget makes it answer directly.
+    $llmModels += , [ordered]@{
+        id = "gemma"
+        name = "Gemma 4 26B heretic"
+        path = ($gemmaModelPath -replace "\\", "/")
+        extra_args = @("--n-cpu-moe", "99", "--reasoning-budget", "0")
+    }
+}
+$llmAvailable = $false
+if (-not $SkipLlm) {
+    if (-not (Test-Path -LiteralPath $llmExe -PathType Leaf)) {
+        Write-Warning "llama-server not found at $llmExe; starting speech-only."
+    } elseif ($llmModels.Count -eq 0) {
+        Write-Warning "No chat model files found under models\; starting speech-only."
+    } else {
+        $llmAvailable = $true
+    }
+}
+# ------------------------------------------------------------------------------
+
 $effectiveConfig = [ordered]@{
     host = "127.0.0.1"
     port = $Port
@@ -225,6 +270,14 @@ $effectiveConfig = [ordered]@{
         }
     )
 }
+if ($llmAvailable) {
+    $effectiveConfig["llm_host"] = "127.0.0.1"
+    $effectiveConfig["llm_port"] = $LlmPort
+    $effectiveConfig["llm_server_exe"] = (([System.IO.Path]::GetFullPath($llmExe)) -replace "\\", "/")
+    $effectiveConfig["llm_default"] = [string]$llmModels[0].id
+    $effectiveConfig["llm_log_dir"] = ($buildRoot -replace "\\", "/")
+    $effectiveConfig["llm_models"] = $llmModels
+}
 $configJson = $effectiveConfig | ConvertTo-Json -Depth 8
 [System.IO.Directory]::CreateDirectory($buildRoot) | Out-Null
 [System.IO.File]::WriteAllText(
@@ -255,80 +308,6 @@ if ($freeVram -ge 0 -and -not ($ttsRunning -and $llmRunning) -and -not $Restart)
     Write-Host "VRAM preflight: $freeVram MiB free on device $Device (need ~$needed MiB)."
 }
 
-# ---- llama.cpp chat sidecar -------------------------------------------------
-# Started before the speech server so the 9.4 GB weight load overlaps the TTS
-# warmup instead of following it.
-$llmExe = Join-Path $repoRoot "build\llama-cpp\llama-server.exe"
-if ([string]::IsNullOrWhiteSpace($LlmModelPath)) {
-    $LlmModelPath = Join-Path $repoRoot "models\Peach-2.0-9B-8k-Roleplay-GGUF\Peach-2.0-9B-8k-Roleplay.Q8_0.gguf"
-}
-if (-not [System.IO.Path]::IsPathRooted($LlmModelPath)) {
-    $LlmModelPath = Join-Path $repoRoot $LlmModelPath
-}
-$LlmModelPath = [System.IO.Path]::GetFullPath($LlmModelPath)
-$llmAvailable = $false
-if (-not $SkipLlm) {
-    if (-not (Test-Path -LiteralPath $llmExe -PathType Leaf)) {
-        Write-Warning "llama-server not found at $llmExe; starting speech-only."
-    } elseif (-not (Test-Path -LiteralPath $LlmModelPath -PathType Leaf)) {
-        Write-Warning "LLM model not found at $LlmModelPath; starting speech-only."
-    } else {
-        $llmAvailable = $true
-    }
-}
-
-$llmPid = 0
-if ($llmAvailable) {
-    $llmPid = Get-ListeningProcessId -LocalPort $LlmPort
-    if ($llmPid -ne 0 -and $null -eq (Get-Process -Id $llmPid -ErrorAction SilentlyContinue)) {
-        $llmPid = 0
-    }
-    if ($llmPid -ne 0 -and $Restart) {
-        $llmProcess = Get-Process -Id $llmPid -ErrorAction Stop
-        if ($llmProcess.ProcessName -ne "llama-server") {
-            throw "Port $LlmPort belongs to PID $llmPid ($($llmProcess.ProcessName)); it was not stopped."
-        }
-        Write-Host "Stopping the existing llama-server on port $LlmPort..."
-        Stop-Process -Id $llmPid
-        $llmProcess.WaitForExit(10000) | Out-Null
-        $llmPid = 0
-    }
-    if ($llmPid -eq 0) {
-        Write-Host "Starting llama-server (Peach) on port $LlmPort..."
-        # -ngl 99: every layer on the GPU. --jinja: apply the chat template
-        # embedded in the GGUF. Flash attention defaults to auto (on for CUDA).
-        # One parallel slot keeps the whole KV budget on this conversation,
-        # which is what makes cache_prompt reuse effective turn over turn.
-        $llmStart = @{
-            FilePath = $llmExe
-            ArgumentList = @(
-                "-m", $LlmModelPath,
-                "--host", "127.0.0.1",
-                "--port", [string]$LlmPort,
-                "-ngl", [string]$LlmGpuLayers,
-                "-c", [string]$LlmContext,
-                "--jinja",
-                "--no-webui",
-                "--cache-reuse", "256",
-                "--parallel", "1",
-                "-t", [string]$LlmThreads)
-            WorkingDirectory = (Split-Path -Parent $llmExe)
-            PassThru = $true
-            WindowStyle = "Hidden"
-            RedirectStandardOutput = (Join-Path $buildRoot "llama_server.stdout.log")
-            RedirectStandardError = (Join-Path $buildRoot "llama_server.stderr.log")
-        }
-        $llmProcess = Start-Process @llmStart
-        $llmPid = $llmProcess.Id
-        try { $llmProcess.PriorityClass = "High" } catch {
-            Write-Warning "Could not raise the llama-server priority: $($_.Exception.Message)"
-        }
-    } else {
-        Write-Host "Reusing the llama-server already listening on port $LlmPort."
-    }
-}
-# -----------------------------------------------------------------------------
-
 $listenerPid = Get-ListeningProcessId -LocalPort $Port
 if ($listenerPid -ne 0 -and $Restart) {
     $listener = Get-Process -Id $listenerPid -ErrorAction Stop
@@ -341,6 +320,24 @@ if ($listenerPid -ne 0 -and $Restart) {
     Stop-Process -Id $listenerPid
     $listener.WaitForExit(10000) | Out-Null
     $listenerPid = 0
+}
+
+# The speech server spawns its own llama-server child; anything already bound
+# to the LLM port when a fresh server is about to start is a leftover (an old
+# launcher-owned sidecar, or the job object still tearing down) and would block
+# the child's bind.
+if ($llmAvailable -and $listenerPid -eq 0) {
+    $stalePid = Get-ListeningProcessId -LocalPort $LlmPort
+    if ($stalePid -ne 0) {
+        $stale = Get-Process -Id $stalePid -ErrorAction SilentlyContinue
+        if ($null -ne $stale -and $stale.ProcessName -eq "llama-server") {
+            Write-Host "Stopping a leftover llama-server on port $LlmPort..."
+            Stop-Process -Id $stalePid
+            $stale.WaitForExit(10000) | Out-Null
+        } elseif ($null -ne $stale) {
+            throw "Port $LlmPort belongs to PID $stalePid ($($stale.ProcessName)); it was not stopped."
+        }
+    }
 }
 
 $serverProcess = $null
@@ -447,7 +444,9 @@ if ($loaded.Count -ne 1) {
 
 if ($llmAvailable) {
     $llmReady = $false
-    $llmDeadline = (Get-Date).AddSeconds(180)
+    # The 26B MoE takes a while to read from disk and stage into system RAM;
+    # give the child real time before declaring chat unavailable.
+    $llmDeadline = (Get-Date).AddSeconds(300)
     while ((Get-Date) -lt $llmDeadline) {
         try {
             $llmHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$LlmPort/health" -TimeoutSec 2
@@ -459,7 +458,13 @@ if ($llmAvailable) {
         Write-Warning "llama-server did not become healthy; chat will report unavailable. See $(Join-Path $buildRoot 'llama_server.stderr.log')"
         $llmAvailable = $false
     } else {
-        Write-Host "llama-server is ready (Peach loaded)."
+        $llmName = "chat model"
+        try {
+            $llmSettings = Invoke-RestMethod -Uri "$baseUrl/v1/llm-settings" -TimeoutSec 5
+            $active = @($llmSettings.models) | Where-Object { $_.id -eq $llmSettings.model }
+            if (@($active).Count -ge 1) { $llmName = @($active)[0].name }
+        } catch {}
+        Write-Host "llama-server is ready ($llmName loaded)."
     }
 }
 
@@ -507,8 +512,11 @@ if (-not $SkipWarmup -and $WarmVoices.Count -gt 0) {
     }
 }
 
+# The sidecar is the server's child, so its PID is discovered from the port it
+# serves; stop.ps1 uses the file as a hint and name-sweeps regardless.
+$llmPid = if ($llmAvailable) { Get-ListeningProcessId -LocalPort $LlmPort } else { 0 }
 $pidFile = Join-Path $buildRoot "app.pids"
-@("tts=$listenerPid", "llm=$(if ($llmAvailable) { $llmPid } else { 0 })") |
+@("tts=$listenerPid", "llm=$llmPid") |
     Set-Content -LiteralPath $pidFile -Encoding ascii
 
 $llmSummary = if ($llmAvailable) { "chat LLM on port $LlmPort" } else { "chat disabled" }

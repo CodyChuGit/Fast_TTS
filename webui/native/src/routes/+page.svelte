@@ -85,6 +85,11 @@
   let llmSaving = false;
   let llmStatus = '';
   let llmError = '';
+  // The dropdown's selection, kept apart from llm.model so picking a model
+  // does nothing until "Switch model" — a switch restarts the sidecar and can
+  // take minutes for a big file.
+  let llmModelChoice = '';
+  let llmSwitching = false;
 
   // MCP panel.
   let endpoint = '';
@@ -128,6 +133,7 @@
     if (!llm && server?.llm) {
       try {
         llm = await getLlmSettings();
+        llmModelChoice = llm.model;
       } catch {
         llm = null;
       }
@@ -140,7 +146,11 @@
     llmError = '';
     llmStatus = 'Saving…';
     try {
-      llm = await setLlmSettings(llm);
+      // Send only the editable fields: including `model` here would restart
+      // the sidecar as a side effect of saving a prompt tweak.
+      const { model, models, ...editable } = llm;
+      llm = await setLlmSettings(editable);
+      llmModelChoice = llm.model;
       llmStatus = 'Roleplay settings saved.';
     } catch (error) {
       llmError = error instanceof Error ? error.message : String(error);
@@ -156,11 +166,30 @@
     llmError = '';
     try {
       llm = await resetLlmSettings();
+      llmModelChoice = llm.model;
       llmStatus = 'Roleplay defaults restored.';
     } catch (error) {
       llmError = error instanceof Error ? error.message : String(error);
     } finally {
       llmSaving = false;
+    }
+  }
+
+  async function switchLlmModel() {
+    if (!llm || llmSwitching || !llmModelChoice || llmModelChoice === llm.model) return;
+    llmSwitching = true;
+    llmError = '';
+    llmStatus = '';
+    try {
+      const next = await setLlmSettings({ model: llmModelChoice });
+      llm = next;
+      llmModelChoice = next.model;
+      const name = next.models.find((option) => option.id === next.model)?.name ?? next.model;
+      llmStatus = `${name} is loaded and ready to chat.`;
+    } catch (error) {
+      llmError = error instanceof Error ? error.message : String(error);
+    } finally {
+      llmSwitching = false;
     }
   }
 
@@ -729,6 +758,32 @@
         <p class="mcp-hint">How every character is played. The master prompt wraps the persona;
           <code>{'{name}'}</code> and <code>{'{persona}'}</code> are filled from the active character.</p>
 
+        {#if llm.models.length > 0}
+          <div class="llm-model-row">
+            <div>
+              <label for="llm-model">Chat model</label>
+              <select id="llm-model" bind:value={llmModelChoice} disabled={llmSwitching}>
+                {#each llm.models as option (option.id)}
+                  <option value={option.id} disabled={!option.installed}>
+                    {option.name}{option.installed ? '' : ' — not installed'}
+                  </option>
+                {/each}
+              </select>
+            </div>
+            <button
+              class="primary"
+              on:click={switchLlmModel}
+              disabled={llmSwitching || llmModelChoice === llm.model}
+            >
+              {llmSwitching ? 'Loading…' : 'Switch model'}
+            </button>
+          </div>
+          {#if llmSwitching}
+            <p class="status">Loading the model — a large one can take a minute or two. Chat stays
+              offline until it finishes.</p>
+          {/if}
+        {/if}
+
         <label for="llm-master">Master prompt</label>
         <textarea id="llm-master" rows="6" bind:value={llm.master_prompt}></textarea>
 
@@ -736,7 +791,7 @@
           <div>
             <label for="llm-temp">Temperature</label>
             <input id="llm-temp" type="number" min="0" max="2" step="0.05" bind:value={llm.temperature} />
-            <small>Lower is steadier; Peach hallucinates above ~0.8.</small>
+            <small>Lower is steadier; roleplay models drift above ~0.8.</small>
           </div>
           <div>
             <label for="llm-topp">Top-p</label>

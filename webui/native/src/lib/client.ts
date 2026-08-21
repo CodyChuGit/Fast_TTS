@@ -261,6 +261,13 @@ export async function chatSpeak(
 // The roleplay engine: the master prompt every character plays through, and
 // the sampling that shapes delivery. {name} and {persona} in the master prompt
 // are filled from the active character.
+export interface LlmModelOption {
+  id: string;
+  name: string;
+  // False while the model's GGUF has not been downloaded yet.
+  installed: boolean;
+}
+
 export interface LlmSettings {
   master_prompt: string;
   temperature: number;
@@ -269,6 +276,10 @@ export interface LlmSettings {
   max_tokens: number;
   // Grow replies over the conversation toward the max_tokens ceiling.
   length_ramp: boolean;
+  // The chat model running now (a registry id), and everything on the menu.
+  // Empty model + empty models means the server does not manage the sidecar.
+  model: string;
+  models: LlmModelOption[];
 }
 
 export function getLlmSettings(): Promise<LlmSettings> {

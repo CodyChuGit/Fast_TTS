@@ -178,6 +178,7 @@ LlmSettings load_llm_settings(const std::filesystem::path & directory) {
     if (const auto * ramp = value.find("length_ramp"); ramp != nullptr && ramp->is_bool()) {
         settings.length_ramp = ramp->as_bool();
     }
+    settings.model = engine::io::json::optional_string(value, "model", settings.model);
     validate_llm_settings(settings);
     return settings;
 }
@@ -191,8 +192,11 @@ void save_llm_settings(const std::filesystem::path & directory, const LlmSetting
         << ",\"top_p\":" << settings.top_p
         << ",\"repeat_penalty\":" << settings.repeat_penalty
         << ",\"max_tokens\":" << settings.max_tokens
-        << ",\"length_ramp\":" << (settings.length_ramp ? "true" : "false")
-        << "}";
+        << ",\"length_ramp\":" << (settings.length_ramp ? "true" : "false");
+    if (!settings.model.empty()) {
+        out << ",\"model\":\"" << json_escape(settings.model) << "\"";
+    }
+    out << "}";
     const auto path = directory / "llm.json";
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     if (!file) {

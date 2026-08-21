@@ -31,6 +31,16 @@ LiveIngestLimits resolve_live_ingest_limits(
     const LiveIngestLimits & base,
     const LiveIngestOverrides & overrides);
 
+// One switchable chat model: a display name and the GGUF that backs it, plus
+// any llama-server arguments this model specifically needs (a MoE too big for
+// the card runs its experts on the CPU, for example).
+struct LlmModelSpec {
+    std::string id;
+    std::string name;
+    std::filesystem::path path;
+    std::vector<std::string> extra_args;
+};
+
 struct ServerModelConfig {
     struct VoicePreset {
         std::optional<std::string> voice_id;
@@ -98,6 +108,15 @@ struct ServerConfig {
     // is attached and the chat endpoint reports itself unavailable.
     std::string llm_host = "127.0.0.1";
     int llm_port = 0;
+    // The llama-server binary and the models it can run. When the registry is
+    // non-empty the speech server owns the sidecar process: it spawns the
+    // chosen model at startup and can switch models from Settings.
+    std::filesystem::path llm_server_exe;
+    std::vector<LlmModelSpec> llm_models;
+    std::string llm_default;
+    // Where the sidecar's stdout/stderr logs land; empty means the server's
+    // working directory.
+    std::filesystem::path llm_log_dir;
     std::vector<ServerModelConfig> models;
 };
 

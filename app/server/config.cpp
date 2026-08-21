@@ -240,6 +240,38 @@ ServerConfig load_server_config(const std::filesystem::path & path) {
     if (const auto * value = root.find("model_spec_override")) {
         config.model_spec_override = resolve_path(base, value->as_string());
     }
+    if (const auto * value = root.find("llm_port")) {
+        config.llm_port = static_cast<int>(value->as_i64());
+    }
+    if (const auto * value = root.find("llm_host")) {
+        config.llm_host = value->as_string();
+    }
+    if (const auto * value = root.find("llm_server_exe")) {
+        config.llm_server_exe = resolve_path(base, value->as_string());
+    }
+    if (const auto * value = root.find("llm_default")) {
+        config.llm_default = value->as_string();
+    }
+    if (const auto * value = root.find("llm_log_dir")) {
+        config.llm_log_dir = resolve_path(base, value->as_string());
+    }
+    if (const auto * value = root.find("llm_models")) {
+        if (!value->is_array()) {
+            throw std::runtime_error("server llm_models must be an array");
+        }
+        for (const auto & entry : value->as_array()) {
+            LlmModelSpec spec;
+            spec.id = engine::io::json::require_string(entry, "id");
+            spec.name = engine::io::json::require_string(entry, "name");
+            spec.path = resolve_path(base, engine::io::json::require_string(entry, "path"));
+            if (const auto * extra = entry.find("extra_args"); extra != nullptr && extra->is_array()) {
+                for (const auto & arg : extra->as_array()) {
+                    spec.extra_args.push_back(arg.as_string());
+                }
+            }
+            config.llm_models.push_back(std::move(spec));
+        }
+    }
     if (const auto * value = root.find("voice_dir")) {
         if (!value->is_string()) {
             throw std::runtime_error("server voice_dir must be a string");

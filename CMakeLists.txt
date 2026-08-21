@@ -1439,6 +1439,7 @@ add_executable(audiocpp_server
     app/server/config.cpp
     app/server/http.cpp
     app/server/llm_client.cpp
+    app/server/llm_manager.cpp
     app/server/mcp.cpp
     app/server/segmenter.cpp
     app/server/multipart.cpp

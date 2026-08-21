@@ -48,6 +48,14 @@ struct ChatResult {
     std::string finish_reason;
 };
 
+// Plain HTTP GET against the sidecar (health polls). Returns the status code,
+// or -1 when the server is unreachable; `body` receives up to a few KB.
+int http_get_status(
+    const std::string & host,
+    int port,
+    const std::string & path,
+    std::string & body);
+
 // Streams a chat completion from a llama.cpp server on the loopback,
 // invoking `on_delta` once per content token. Returning false from the
 // callback aborts the generation by closing the connection -- llama-server

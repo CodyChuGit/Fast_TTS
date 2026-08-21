@@ -209,6 +209,59 @@ std::vector<SseDeltaParser::Event> SseDeltaParser::feed(const std::string & byte
     return events;
 }
 
+int http_get_status(
+    const std::string & host,
+    int port,
+    const std::string & path,
+    std::string & body) {
+    body.clear();
+    SocketGuard guard;
+    guard.handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (guard.handle == kInvalidSocket) {
+        return -1;
+    }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(static_cast<unsigned short>(port));
+    if (inet_pton(AF_INET, host.c_str(), &address.sin_addr) != 1 ||
+        ::connect(guard.handle, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+        return -1;
+    }
+    {
+#ifdef _WIN32
+        DWORD timeout = 5000;
+        setsockopt(guard.handle, SOL_SOCKET, SO_RCVTIMEO,
+            reinterpret_cast<const char *>(&timeout), sizeof(timeout));
+#else
+        timeval timeout{5, 0};
+        setsockopt(guard.handle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
+    }
+    const std::string request =
+        "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n\r\n";
+    if (!send_all(guard.handle, request)) {
+        return -1;
+    }
+    char buffer[8192];
+    std::string response;
+    while (response.size() < 64 * 1024) {
+        const int received = ::recv(guard.handle, buffer, sizeof(buffer), 0);
+        if (received <= 0) {
+            break;
+        }
+        response.append(buffer, static_cast<size_t>(received));
+    }
+    if (response.size() < 12 || response.compare(0, 5, "HTTP/") != 0) {
+        return -1;
+    }
+    const int status = std::atoi(response.c_str() + 9);
+    const auto header_end = response.find("\r\n\r\n");
+    if (header_end != std::string::npos) {
+        body = response.substr(header_end + 4, 4096);
+    }
+    return status;
+}
+
 ChatResult stream_chat(
     const std::string & host,
     int port,

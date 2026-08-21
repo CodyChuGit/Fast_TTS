@@ -4,6 +4,7 @@
 #include "character.h"
 #include "config.h"
 #include "http.h"
+#include "llm_manager.h"
 #include "mcp.h"
 
 #include "../streaming/streaming.h"
@@ -147,6 +148,14 @@ private:
     HttpResponse handle_llm_settings_set(const std::string & body_text);
     std::string llm_settings_json() const;
 
+    // The registered chat model matching `id`, or null. Registry is immutable
+    // after construction, so no lock is needed.
+    const LlmModelSpec * find_llm_spec(const std::string & id) const;
+    // Stops the running sidecar, starts `spec`, and blocks until its /health
+    // reports the model loaded. On failure the previous model is restarted.
+    // Serialized by llm_switch_mutex_.
+    void switch_llm_model(const LlmModelSpec & spec);
+
     // MCP endpoint: JSON-RPC over streamable HTTP with one speak tool.
     HttpResponse handle_mcp(const HttpRequest & request);
 
@@ -176,6 +185,12 @@ private:
     CharacterConfig character_;
     LlmSettings llm_settings_;
     std::filesystem::path character_dir_;
+    // Owns the llama.cpp sidecar when the config carries a model registry;
+    // null when the launcher (or nobody) runs the LLM. Model switches are
+    // serialized by llm_switch_mutex_ -- a switch stops and restarts the
+    // sidecar, and two interleaved switches would race the port.
+    std::unique_ptr<LlmManager> llm_manager_;
+    std::mutex llm_switch_mutex_;
 };
 
 }  // namespace minitts::server

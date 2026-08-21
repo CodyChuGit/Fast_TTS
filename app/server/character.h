@@ -81,6 +81,8 @@ struct LlmSettings {
     // first audio depends on it, then later turns get more room -- max_tokens
     // is the ceiling the ramp grows toward.
     bool length_ramp = true;
+    // Which registered chat model to run; empty means the server default.
+    std::string model;
 };
 
 // The shipped roleplay-tuned defaults.

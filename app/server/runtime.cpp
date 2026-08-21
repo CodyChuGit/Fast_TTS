@@ -893,6 +893,29 @@ ServerState::ServerState(
         std::cerr << "LLM settings ignored (" << ex.what() << "); using roleplay defaults\n";
         llm_settings_ = default_llm_settings();
     }
+
+    // With a model registry in the config, this server owns the sidecar: spawn
+    // the persisted choice (falling back to the configured default, then the
+    // first entry) and let the launcher's health poll cover the load time.
+    if (!config_.llm_models.empty() && config_.llm_port > 0 && !config_.llm_server_exe.empty()) {
+        const LlmModelSpec * spec = find_llm_spec(llm_settings_.model);
+        if (spec == nullptr) {
+            spec = find_llm_spec(config_.llm_default);
+        }
+        if (spec == nullptr) {
+            spec = &config_.llm_models.front();
+        }
+        llm_manager_ = std::make_unique<LlmManager>(
+            config_.llm_host, config_.llm_port, config_.llm_server_exe,
+            config_.llm_log_dir.empty() ? request_base_ : config_.llm_log_dir);
+        std::string llm_error;
+        if (!llm_manager_->start(*spec, llm_error)) {
+            std::cerr << "LLM sidecar not started (" << llm_error << "); chat will be unavailable\n";
+            llm_manager_.reset();
+        } else {
+            std::cerr << "LLM sidecar starting: " << spec->name << "\n";
+        }
+    }
     if (auto * model = find_speech_model()) {
         try {
             apply_character(*model, character_);
@@ -1934,9 +1957,63 @@ std::string ServerState::llm_settings_json() const {
         << ",\"top_p\":" << settings.top_p
         << ",\"repeat_penalty\":" << settings.repeat_penalty
         << ",\"max_tokens\":" << settings.max_tokens
-        << ",\"length_ramp\":" << (settings.length_ramp ? "true" : "false")
-        << "}";
+        << ",\"length_ramp\":" << (settings.length_ramp ? "true" : "false");
+    // The switchable-model registry: which model is running now and what else
+    // could be. Empty registry (launcher-owned sidecar) reports no models and
+    // the UI hides the picker.
+    std::string current = llm_manager_ ? llm_manager_->current_model_id() : std::string();
+    out << ",\"model\":" << json_quote(current) << ",\"models\":[";
+    bool first = true;
+    for (const auto & spec : config_.llm_models) {
+        if (!first) {
+            out << ",";
+        }
+        first = false;
+        out << "{\"id\":" << json_quote(spec.id)
+            << ",\"name\":" << json_quote(spec.name)
+            << ",\"installed\":"
+            << (std::filesystem::exists(spec.path) ? "true" : "false") << "}";
+    }
+    out << "]}";
     return out.str();
+}
+
+const LlmModelSpec * ServerState::find_llm_spec(const std::string & id) const {
+    if (id.empty()) {
+        return nullptr;
+    }
+    for (const auto & spec : config_.llm_models) {
+        if (spec.id == id) {
+            return &spec;
+        }
+    }
+    return nullptr;
+}
+
+void ServerState::switch_llm_model(const LlmModelSpec & spec) {
+    std::lock_guard<std::mutex> lock(llm_switch_mutex_);
+    if (llm_manager_ == nullptr) {
+        throw std::runtime_error("this server does not manage the LLM sidecar");
+    }
+    const std::string previous = llm_manager_->current_model_id();
+    if (previous == spec.id && llm_manager_->process_running()) {
+        return;
+    }
+    llm_manager_->stop();
+    std::string error;
+    if (llm_manager_->start(spec, error) && llm_manager_->wait_ready(300, error)) {
+        return;
+    }
+    // The requested model failed; a dead sidecar helps nobody, so put the
+    // previous one back before reporting what went wrong.
+    llm_manager_->stop();
+    if (const LlmModelSpec * fallback = find_llm_spec(previous)) {
+        std::string restore_error;
+        if (llm_manager_->start(*fallback, restore_error)) {
+            llm_manager_->wait_ready(300, restore_error);
+        }
+    }
+    throw std::runtime_error("could not switch to " + spec.name + ": " + error);
 }
 
 HttpResponse ServerState::handle_llm_settings_get() {
@@ -1972,6 +2049,33 @@ HttpResponse ServerState::handle_llm_settings_set(const std::string & body_text)
             settings.length_ramp = value->as_bool();
         }
     }
+
+    // A model change restarts the sidecar, which takes seconds to minutes; the
+    // request blocks until the new model answers /health so the client knows
+    // exactly when chat is live again. Validated before anything is persisted.
+    const LlmModelSpec * switch_to = nullptr;
+    if (const auto * value = body.find("model"); value != nullptr && value->is_string()) {
+        const std::string requested = value->as_string();
+        if (!requested.empty()) {
+            switch_to = find_llm_spec(requested);
+            if (switch_to == nullptr) {
+                return error_response(400, "unknown chat model: " + requested, "invalid_request_error");
+            }
+            if (!std::filesystem::exists(switch_to->path)) {
+                return error_response(
+                    400, switch_to->name + " is not installed yet", "invalid_request_error");
+            }
+            settings.model = switch_to->id;
+        }
+    }
+    if (switch_to != nullptr) {
+        try {
+            switch_llm_model(*switch_to);
+        } catch (const std::exception & ex) {
+            return error_response(500, ex.what(), "llm_unavailable");
+        }
+    }
+
     try {
         save_llm_settings(character_dir_, settings);
     } catch (const std::exception & ex) {
