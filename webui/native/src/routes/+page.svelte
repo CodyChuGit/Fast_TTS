@@ -419,7 +419,15 @@
     chatAborter = new AbortController();
     try {
       await primePcm16Playback();
-      chatPlayer = new Pcm16StreamPlayer(24000, 1);
+      // A chat reply starts while the LLM is still decoding on the same GPU,
+      // so TTS can run below real time for the first sentence or two. A
+      // deeper startup reserve and a patient deadline trade a few dozen
+      // milliseconds of extra wait for a start that does not stutter through
+      // that contention window.
+      chatPlayer = new Pcm16StreamPlayer(24000, 1, {
+        startBufferSeconds: 0.32,
+        startMaxWaitMs: 700
+      });
       await chatPlayer.start();
       // The full visible history goes up each turn; the sidecar's prompt cache
       // makes re-sending the prefix nearly free.

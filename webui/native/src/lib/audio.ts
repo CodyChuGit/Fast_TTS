@@ -18,8 +18,15 @@ const CONTINUATION_LEAD_SECONDS = 0.01;
 // chunks.
 const DEFAULT_START_BUFFER_SECONDS = 0.24;
 const DEFAULT_START_MAX_WAIT_MS = 350;
-// Ceiling for the re-arm lead after repeated mid-stream underruns.
-const MAX_UNDERRUN_LEAD_SECONDS = 0.32;
+// After a mid-stream underrun the stream re-arms by accumulating REAL audio,
+// not by waiting. With a producer below real time (the LLM decoding beside
+// the TTS at the start of a chat reply), a fixed wait gains almost nothing
+// and drains again at once, turning the first seconds into a chain of gaps.
+// The reserve target grows with every repeat; the deadline bounds the pause
+// when the producer trickles or the stream is about to end.
+const REBUFFER_STEP_SECONDS = 0.16;
+const MAX_REBUFFER_SECONDS = 0.48;
+const REBUFFER_MAX_WAIT_MS = 800;
 
 // Keep one interactive output context alive for the page lifetime. Creating,
 // resuming, and closing a context around every request adds work directly on
@@ -104,6 +111,8 @@ export class Pcm16StreamPlayer {
   private pendingSeconds = 0;
   private startTimer: ReturnType<typeof setTimeout> | null = null;
   private underruns = 0;
+  private rebuffering = false;
+  private rebufferTargetSeconds = 0;
 
   constructor(
     sampleRate: number,
@@ -158,36 +167,63 @@ export class Pcm16StreamPlayer {
       }
     }
 
-    // Startup jitter buffer. Generation runs faster than real time, but the
-    // FIRST chunks arrive unevenly (prefill tail, graph capture, event
-    // batching); starting on the very first 80 ms frame therefore stutters.
-    // Hold playback until a few frames are queued -- once that reserve exists,
-    // the faster-than-real-time producer only ever grows it. The deadline
-    // bounds added latency when a clip is shorter than the reserve.
-    if (!this.begun) {
+    // A real underrun: the scheduled tail already played out before this
+    // chunk arrived. Restarting on the lone chunk would drain again while
+    // the producer is slow, so fall back to accumulating a reserve instead.
+    if (
+      this.begun &&
+      !this.rebuffering &&
+      this.hasScheduledAudio &&
+      this.nextStartTime <= this.context.currentTime
+    ) {
+      this.underruns += 1;
+      this.rebuffering = true;
+      this.rebufferTargetSeconds = Math.min(
+        REBUFFER_STEP_SECONDS * this.underruns,
+        MAX_REBUFFER_SECONDS
+      );
+    }
+
+    // Jitter buffer, both at startup and after an underrun. Warm generation
+    // runs faster than real time, but the FIRST chunks arrive unevenly
+    // (prefill tail, graph capture, the LLM decoding on the same GPU);
+    // starting on the very first 80 ms frame therefore stutters. Hold
+    // playback until a reserve of audio is queued -- once it exists, a
+    // faster-than-real-time producer only ever grows it. The deadline bounds
+    // added latency when a clip is shorter than the reserve.
+    if (!this.begun || this.rebuffering) {
       this.pending.push(audio);
       this.pendingSeconds += frames / this.sampleRate;
-      if (this.pendingSeconds >= this.startBufferSeconds) {
-        this.beginPlayback();
+      const targetSeconds = this.begun ? this.rebufferTargetSeconds : this.startBufferSeconds;
+      const maxWaitMs = this.begun ? REBUFFER_MAX_WAIT_MS : this.startMaxWaitMs;
+      if (this.pendingSeconds >= targetSeconds) {
+        this.flushPending();
       } else if (this.startTimer === null) {
         this.startTimer = setTimeout(() => {
           this.startTimer = null;
-          if (!this.begun && !this.stopped) this.beginPlayback();
-        }, this.startMaxWaitMs);
+          if (!this.stopped) this.flushPending();
+        }, maxWaitMs);
       }
       return;
     }
     this.scheduleBuffer(audio);
   }
 
-  private beginPlayback(): void {
-    if (this.begun || !this.context) return;
-    this.begun = true;
+  private flushPending(): void {
+    if (!this.context) return;
     if (this.startTimer !== null) {
       clearTimeout(this.startTimer);
       this.startTimer = null;
     }
-    this.nextStartTime = this.context.currentTime + this.initialPlaybackLeadSeconds;
+    if (!this.begun) {
+      this.begun = true;
+      this.nextStartTime = this.context.currentTime + this.initialPlaybackLeadSeconds;
+    } else if (this.rebuffering) {
+      this.rebuffering = false;
+      if (this.nextStartTime <= this.context.currentTime) {
+        this.nextStartTime = this.context.currentTime + CONTINUATION_LEAD_SECONDS;
+      }
+    }
     const queued = this.pending;
     this.pending = [];
     this.pendingSeconds = 0;
@@ -212,18 +248,7 @@ export class Pcm16StreamPlayer {
     this.sources.add(source);
 
     const floorLead = this.hasScheduledAudio ? CONTINUATION_LEAD_SECONDS : 0;
-    let startAt = Math.max(this.nextStartTime, this.context.currentTime + floorLead);
-    if (this.hasScheduledAudio && this.nextStartTime <= this.context.currentTime) {
-      // A real underrun: the stream drained mid-playback. Re-arm with a lead
-      // that grows on every repeat, so persistent jitter converges on a buffer
-      // deep enough to absorb it instead of clicking at every chunk.
-      this.underruns += 1;
-      const lead = Math.min(
-        INITIAL_PLAYBACK_LEAD_SECONDS * (1 + this.underruns),
-        MAX_UNDERRUN_LEAD_SECONDS
-      );
-      startAt = this.context.currentTime + lead;
-    }
+    const startAt = Math.max(this.nextStartTime, this.context.currentTime + floorLead);
     source.start(startAt);
     this.nextStartTime = startAt + audio.length / this.sampleRate;
     this.hasScheduledAudio = true;
@@ -232,10 +257,11 @@ export class Pcm16StreamPlayer {
   async finish(): Promise<void> {
     if (!this.context || this.stopped) return;
     this.carry = new Uint8Array(0);
-    // A clip shorter than the startup reserve never crossed the threshold;
-    // play what was gathered.
-    if (!this.begun && this.pending.length) {
-      this.beginPlayback();
+    // A clip shorter than the startup reserve never crossed the threshold,
+    // and an underrun near the end may hold a final tail; play what was
+    // gathered either way.
+    if (this.pending.length) {
+      this.flushPending();
     }
     if (this.startTimer !== null) {
       clearTimeout(this.startTimer);
@@ -255,6 +281,7 @@ export class Pcm16StreamPlayer {
     this.carry = new Uint8Array(0);
     this.pending = [];
     this.pendingSeconds = 0;
+    this.rebuffering = false;
     if (this.startTimer !== null) {
       clearTimeout(this.startTimer);
       this.startTimer = null;

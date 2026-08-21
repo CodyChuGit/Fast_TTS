@@ -157,23 +157,32 @@ test('the startup deadline flushes a slow stream instead of waiting forever', as
   await player.finish();
 });
 
-test('repeated underruns grow the re-arm lead instead of clicking every chunk', async () => {
+test('an underrun rebuffers real audio, with a reserve that grows on repeats', async () => {
   const player = new Pcm16StreamPlayer(24000, 1, { startBufferSeconds: 0, startMaxWaitMs: 0 });
   await player.start();
   const context = FakeAudioContext.latest;
 
-  player.push(pcmFrames(1920));
-  const firstEnd = context.sources[0].startAt + 1920 / 24000;
+  player.push(pcmFrames(1920));                    // 80 ms, plays immediately
+  assert.equal(context.sources.length, 1);
 
-  context.currentTime = firstEnd + 0.05;           // the buffer drained
-  player.push(pcmFrames(1920));
-  const lead1 = context.sources[1].startAt - context.currentTime;
-  assert.ok(Math.abs(lead1 - 0.128) < 1e-6, `first re-arm doubles the lead (got ${lead1})`);
+  context.currentTime = context.sources[0].startAt + 1920 / 24000 + 0.05;  // drained
+  player.push(pcmFrames(1920));                    // 80 ms < the 160 ms reserve
+  assert.equal(context.sources.length, 1, 'a lone late chunk is held for the reserve');
 
-  context.currentTime = context.sources[1].startAt + 1920 / 24000 + 0.05;  // drained again
+  player.push(pcmFrames(1920));                    // 160 ms -> resume
+  assert.equal(context.sources.length, 3, 'the whole reserve schedules together');
+  const resumeAt = context.sources[1].startAt;
+  assert.ok(resumeAt >= context.currentTime + 0.01 - 1e-9, 'resume keeps a scheduling lead');
+  assert.equal(context.sources[2].startAt, resumeAt + 1920 / 24000);
+
+  // A second underrun demands a deeper reserve before resuming.
+  context.currentTime = context.sources[2].startAt + 1920 / 24000 + 0.05;
   player.push(pcmFrames(1920));
-  const lead2 = context.sources[2].startAt - context.currentTime;
-  assert.ok(Math.abs(lead2 - 0.192) < 1e-6, `second re-arm grows further (got ${lead2})`);
+  player.push(pcmFrames(1920));
+  player.push(pcmFrames(1920));                    // 240 ms < the 320 ms reserve
+  assert.equal(context.sources.length, 3, 'the deeper reserve is still accumulating');
+  player.push(pcmFrames(1920));                    // 320 ms -> resume
+  assert.equal(context.sources.length, 7);
   await player.finish();
 });
 
@@ -203,21 +212,19 @@ test('Pcm16StreamPlayer can schedule a prepared prefix without artificial lead',
   assert.equal(context.sources[0].startAt, 1);
 });
 
-test('Pcm16StreamPlayer restores a grown safety lead if prepared playback drains', async () => {
+test('Pcm16StreamPlayer plays a held underrun tail at finish, off the clock edge', async () => {
   const player = new Pcm16StreamPlayer(24000, 1, { startBufferSeconds: 0, startMaxWaitMs: 0 });
   await player.start();
   player.setInitialPlaybackLeadSeconds(0);
   player.push(new Uint8Array([0x00, 0x00]));
   const context = FakeAudioContext.latest;
   context.currentTime = 2;
-  player.push(new Uint8Array([0x00, 0x00]));
-  await player.finish();
+  player.push(new Uint8Array([0x00, 0x00]));   // held for the underrun reserve
+  assert.equal(context.sources.length, 1, 'the late tail waits for the reserve');
+  await player.finish();                       // ...but finish always plays it
 
-  // The first underrun re-arms with double the base lead (see the backoff
-  // test); what matters here is that a drained stream never resumes flush
-  // against the clock edge.
-  assert.ok(context.sources[1].startAt >= 2.064);
-  assert.ok(context.sources[1].startAt <= 2.32 + 1e-9);
+  assert.equal(context.sources.length, 2);
+  assert.ok(context.sources[1].startAt >= 2.01 - 1e-9, 'never resumes against the clock edge');
 });
 
 test('PCM stream players reuse a primed interactive AudioContext', async () => {
