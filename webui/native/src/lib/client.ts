@@ -51,6 +51,39 @@ export function setCharacterPreset(name: string, preset: string): Promise<Charac
   });
 }
 
+// The saved-character library. Every save lands in it, and any entry can be
+// re-activated in one click; the active entry is the voice the whole app uses.
+export interface SavedCharacterEntry {
+  id: string;
+  name: string;
+  source: 'preset' | 'custom';
+  preset?: string;
+  active: boolean;
+}
+
+export interface CharacterLibrary {
+  active_id: string;
+  characters: SavedCharacterEntry[];
+}
+
+export function listCharacters(): Promise<CharacterLibrary> {
+  return json<CharacterLibrary>('/v1/characters');
+}
+
+export function activateCharacter(id: string): Promise<Character> {
+  return json<Character>('/v1/characters/activate', {
+    method: 'POST',
+    body: JSON.stringify({ id })
+  });
+}
+
+export function deleteCharacter(id: string): Promise<CharacterLibrary> {
+  return json<CharacterLibrary>('/v1/characters/delete', {
+    method: 'POST',
+    body: JSON.stringify({ id })
+  });
+}
+
 // Edits the character while keeping its saved voice -- a rename (and, for a
 // custom character, a transcript touch-up) never demands the recording again.
 export function updateCharacter(name: string, transcript?: string): Promise<Character> {

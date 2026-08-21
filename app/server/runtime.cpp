@@ -903,6 +903,14 @@ ServerState::ServerState(
             character_ = default_character();
             apply_character(*model, character_);
         }
+        // Seed the library with the active character so a fresh install shows
+        // its default entry and switching away is always one click reversible.
+        try {
+            save_character(character_dir_, character_);
+            store_character_in_library(character_);
+        } catch (const std::exception & ex) {
+            std::cerr << "character library not seeded (" << ex.what() << ")" << std::endl;
+        }
     }
 }
 
@@ -962,6 +970,15 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
     }
     else if ((request.method == "POST" || request.method == "PUT") && request.path == "/v1/character") {
         response = handle_character_set(request);
+    }
+    else if (request.method == "GET" && request.path == "/v1/characters") {
+        response = handle_characters_list();
+    }
+    else if (request.method == "POST" && request.path == "/v1/characters/activate") {
+        response = handle_character_activate(request.body);
+    }
+    else if (request.method == "POST" && request.path == "/v1/characters/delete") {
+        response = handle_character_delete(request.body);
     }
     else if (request.path == "/mcp") {
         response = handle_mcp(request);
@@ -2450,11 +2467,112 @@ HttpResponse ServerState::handle_character_set(const HttpRequest & request) {
     }
 
     save_character(character_dir_, character);
+    store_character_in_library(character);
     {
         std::lock_guard<std::mutex> lock(character_mutex_);
         character_ = character;
     }
     return handle_character_get();
+}
+
+void ServerState::store_character_in_library(const CharacterConfig & character) {
+    const auto entry_dir = character_dir_ / "library" / character_slug(character.name);
+    std::filesystem::create_directories(entry_dir);
+    if (character.is_custom()) {
+        // The active slot holds the recording; the library entry gets its own
+        // copy so deleting or replacing the active character never orphans it.
+        std::filesystem::copy_file(
+            character_dir_ / character.voice_file,
+            entry_dir / "voice.wav",
+            std::filesystem::copy_options::overwrite_existing);
+        CharacterConfig stored = character;
+        stored.voice_file = "voice.wav";
+        save_character(entry_dir, stored);
+    } else {
+        save_character(entry_dir, character);
+    }
+}
+
+HttpResponse ServerState::handle_characters_list() {
+    CharacterConfig current;
+    {
+        std::lock_guard<std::mutex> lock(character_mutex_);
+        current = character_;
+    }
+    const auto active_id = character_slug(current.name);
+    std::string body = "{\"active_id\":" + json_quote(active_id) + ",\"characters\":[";
+    bool first = true;
+    for (const auto & entry : list_character_library(character_dir_)) {
+        if (!first) {
+            body += ",";
+        }
+        first = false;
+        body += "{\"id\":" + json_quote(entry.id) +
+            ",\"name\":" + json_quote(entry.config.name) +
+            ",\"source\":" + std::string(entry.config.is_custom() ? "\"custom\"" : "\"preset\"");
+        if (!entry.config.is_custom()) {
+            body += ",\"preset\":" + json_quote(entry.config.preset);
+        }
+        body += ",\"active\":" + std::string(entry.id == active_id ? "true" : "false") + "}";
+    }
+    body += "]}";
+    return json_response(body);
+}
+
+HttpResponse ServerState::handle_character_activate(const std::string & body_text) {
+    auto * model = find_speech_model();
+    if (model == nullptr) {
+        return error_response(400, "no TTS model is configured to give the character a voice", "invalid_request_error");
+    }
+    const auto body = engine::io::json::parse(body_text);
+    const auto id = engine::io::json::require_string(body, "id");
+    if (!is_valid_character_id(id)) {
+        return error_response(400, "invalid character id", "invalid_request_error");
+    }
+    const auto entry_dir = character_dir_ / "library" / id;
+    if (!std::filesystem::exists(entry_dir / "character.json")) {
+        return error_response(400, "no saved character with id '" + id + "'", "invalid_request_error");
+    }
+
+    CharacterConfig character;
+    try {
+        character = load_character(entry_dir);
+        if (character.is_custom()) {
+            // Copy the recording into the active slot so the active character
+            // stays self-contained even if the library entry is later deleted.
+            std::filesystem::copy_file(
+                entry_dir / character.voice_file,
+                character_dir_ / "voice.wav",
+                std::filesystem::copy_options::overwrite_existing);
+            character.voice_file = "voice.wav";
+        }
+        apply_character(*model, character);
+    } catch (const std::exception & ex) {
+        return error_response(400, ex.what(), "invalid_request_error");
+    }
+
+    save_character(character_dir_, character);
+    {
+        std::lock_guard<std::mutex> lock(character_mutex_);
+        character_ = character;
+    }
+    return handle_character_get();
+}
+
+HttpResponse ServerState::handle_character_delete(const std::string & body_text) {
+    const auto body = engine::io::json::parse(body_text);
+    const auto id = engine::io::json::require_string(body, "id");
+    if (!is_valid_character_id(id)) {
+        return error_response(400, "invalid character id", "invalid_request_error");
+    }
+    const auto entry_dir = character_dir_ / "library" / id;
+    if (!std::filesystem::exists(entry_dir)) {
+        return error_response(400, "no saved character with id '" + id + "'", "invalid_request_error");
+    }
+    // The active slot holds its own copy of everything, so deleting a library
+    // entry never silences the currently speaking character.
+    std::filesystem::remove_all(entry_dir);
+    return handle_characters_list();
 }
 
 mcp::SpeakOutcome ServerState::run_mcp_speak(const std::string & text, long long seed) {

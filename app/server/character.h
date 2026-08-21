@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace minitts::server {
 
@@ -41,5 +42,28 @@ CharacterConfig load_character(const std::filesystem::path & directory);
 
 // Writes `character.json`, creating the directory if needed.
 void save_character(const std::filesystem::path & directory, const CharacterConfig & character);
+
+// A library entry: the id is the directory name under `library/`, derived from
+// the character's name, so saving under the same name replaces the entry.
+struct SavedCharacter {
+    std::string id;
+    CharacterConfig config;
+};
+
+// Filesystem- and URL-safe id for a character name: lowercased ASCII
+// letters/digits with runs of everything else collapsed to single dashes. A
+// name with no usable ASCII (for example a fully non-Latin one) gets a stable
+// hash-based id instead, so distinct names do not all collapse onto one entry.
+std::string character_slug(const std::string & name);
+
+// True only for ids character_slug can produce. Ids arrive from clients and
+// become path components, so anything else -- separators, dots, empties -- is
+// rejected outright.
+bool is_valid_character_id(const std::string & id);
+
+// Every saved character under `<root>/library`, sorted by name. Entries that
+// fail to load (broken JSON, missing recording) are skipped: one damaged entry
+// must not hide the rest of the library.
+std::vector<SavedCharacter> list_character_library(const std::filesystem::path & root);
 
 }  // namespace minitts::server

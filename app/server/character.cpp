@@ -2,7 +2,10 @@
 
 #include "engine/framework/io/json.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -65,11 +68,17 @@ std::string sanitize_character_name(const std::string & name) {
     return trimmed;
 }
 
-CharacterConfig load_character(const std::filesystem::path & directory) {
+namespace {
+
+// Parses `character.json` in the directory. Throws on every problem, including
+// a custom recording the store names but the disk no longer has -- callers
+// decide whether that means "fall back" (the active slot) or "skip" (the
+// library).
+CharacterConfig read_character_file(const std::filesystem::path & directory) {
     const auto path = directory / kCharacterFile;
     std::ifstream in(path, std::ios::binary);
     if (!in) {
-        return default_character();
+        throw std::runtime_error("character store missing: " + path.string());
     }
     std::ostringstream buffer;
     buffer << in.rdbuf();
@@ -84,14 +93,101 @@ CharacterConfig load_character(const std::filesystem::path & directory) {
         throw std::runtime_error(
             "character store " + path.string() + " names neither a preset nor a voice_file");
     }
-    // A custom recording named by the store but missing from disk means the
-    // directory was partially copied or cleaned. Failing loudly here would brick
-    // startup over a cosmetic customization; the recorded intent is gone either
-    // way, so fall back to the default character.
     if (character.is_custom() && !std::filesystem::exists(directory / character.voice_file)) {
-        return default_character();
+        throw std::runtime_error(
+            "character recording missing: " + (directory / character.voice_file).string());
     }
     return character;
+}
+
+}  // namespace
+
+CharacterConfig load_character(const std::filesystem::path & directory) {
+    if (!std::filesystem::exists(directory / kCharacterFile)) {
+        return default_character();
+    }
+    try {
+        return read_character_file(directory);
+    } catch (const std::exception & ex) {
+        // A recording that vanished is a cosmetic loss; bricking startup over it
+        // would be worse, so the default character takes over. Anything else --
+        // corrupt JSON, missing keys -- stays loud.
+        if (std::string(ex.what()).find("recording missing") != std::string::npos) {
+            return default_character();
+        }
+        throw;
+    }
+}
+
+std::string character_slug(const std::string & name) {
+    std::string slug;
+    bool pending_dash = false;
+    for (const unsigned char ch : name) {
+        if (std::isalnum(ch) != 0 && ch < 0x80) {
+            if (pending_dash && !slug.empty()) {
+                slug += '-';
+            }
+            pending_dash = false;
+            slug += static_cast<char>(std::tolower(ch));
+        } else {
+            pending_dash = true;
+        }
+    }
+    if (!slug.empty()) {
+        return slug;
+    }
+    // No usable ASCII at all: derive a stable id from the bytes so two
+    // different non-Latin names keep two different entries.
+    uint64_t hash = 1469598103934665603ull;
+    for (const unsigned char ch : name) {
+        hash ^= ch;
+        hash *= 1099511628211ull;
+    }
+    char buffer[24];
+    std::snprintf(buffer, sizeof(buffer), "c-%08x", static_cast<unsigned>(hash & 0xffffffffu));
+    return buffer;
+}
+
+bool is_valid_character_id(const std::string & id) {
+    if (id.empty() || id.size() > 80) {
+        return false;
+    }
+    for (const unsigned char ch : id) {
+        if (std::isalnum(ch) == 0 && ch != '-') {
+            return false;
+        }
+        if (ch >= 0x80 || std::isupper(ch) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<SavedCharacter> list_character_library(const std::filesystem::path & root) {
+    std::vector<SavedCharacter> entries;
+    const auto library = root / "library";
+    std::error_code ec;
+    for (const auto & entry : std::filesystem::directory_iterator(library, ec)) {
+        if (!entry.is_directory()) {
+            continue;
+        }
+        const auto id = entry.path().filename().string();
+        if (!is_valid_character_id(id)) {
+            continue;
+        }
+        if (!std::filesystem::exists(entry.path() / kCharacterFile)) {
+            continue;
+        }
+        try {
+            entries.push_back({id, read_character_file(entry.path())});
+        } catch (const std::exception &) {
+            // One damaged entry must not hide the rest of the library.
+        }
+    }
+    std::sort(entries.begin(), entries.end(), [](const SavedCharacter & a, const SavedCharacter & b) {
+        return a.config.name < b.config.name;
+    });
+    return entries;
 }
 
 void save_character(const std::filesystem::path & directory, const CharacterConfig & character) {

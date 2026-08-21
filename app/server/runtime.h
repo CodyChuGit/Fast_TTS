@@ -156,6 +156,13 @@ private:
     // request names no voice, shared by the WebUI and MCP callers.
     HttpResponse handle_character_get();
     HttpResponse handle_character_set(const HttpRequest & request);
+    // The saved-character library: every save lands here under an id derived
+    // from the name, so any saved character can be re-activated in one click.
+    HttpResponse handle_characters_list();
+    HttpResponse handle_character_activate(const std::string & body_text);
+    HttpResponse handle_character_delete(const std::string & body_text);
+    // Copies the active character into library/<slug>, recording included.
+    void store_character_in_library(const CharacterConfig & character);
     // Resolves the stored character into a runtime voice preset and installs it
     // as the speech model's default under its metadata lock.
     void apply_character(LoadedModel & model, const CharacterConfig & character);

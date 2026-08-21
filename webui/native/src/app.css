@@ -133,3 +133,19 @@ footer {
   .brand span { display: none; }
   footer { flex-direction: column; }
 }
+
+/* Saved character library */
+.library-panel h2, .settings-panel h2 { margin: 0 0 4px; font-size: 16px; }
+.library { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 8px; }
+.library li {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border: 1px solid var(--line); border-radius: 9px; background: #081426;
+}
+.library-name { flex: 1; min-width: 0; }
+.library-name strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.library-name small { color: var(--muted); font-size: 11px; }
+.active-badge {
+  padding: 5px 11px; border-radius: 999px; font-size: 11px; font-weight: 800;
+  color: #07101f; background: linear-gradient(135deg, var(--cyan), var(--blue));
+}
+button.slim { min-height: 32px; padding: 4px 10px; font-size: 12px; }

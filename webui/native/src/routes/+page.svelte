@@ -8,14 +8,18 @@
     primePcm16Playback
   } from '$lib/audio';
   import {
+    activateCharacter,
     character as fetchCharacter,
+    deleteCharacter,
     health,
+    listCharacters,
     mcpEndpoint,
     setCharacterCustom,
     setCharacterPreset,
     speakStream,
     updateCharacter,
     type Character,
+    type SavedCharacterEntry,
     type ServerHealth,
     type SpeakStats
   } from '$lib/client';
@@ -50,6 +54,8 @@
   let recorder: MediaRecorder | null = null;
   let recordingStream: MediaStream | null = null;
   let recording = false;
+  let library: SavedCharacterEntry[] = [];
+  let switching = '';
 
   // MCP panel.
   let endpoint = '';
@@ -75,6 +81,41 @@
       if (!formReady) populateForm(active);
     } catch {
       active = null;
+    }
+    try {
+      library = (await listCharacters()).characters;
+    } catch {
+      library = [];
+    }
+  }
+
+  async function useCharacter(entry: SavedCharacterEntry) {
+    if (switching) return;
+    switching = entry.id;
+    settingsError = '';
+    try {
+      active = await activateCharacter(entry.id);
+      populateForm(active);
+      library = (await listCharacters()).characters;
+      settingsStatus = `Now speaking as ${entry.name}.`;
+    } catch (error) {
+      settingsError = error instanceof Error ? error.message : String(error);
+    } finally {
+      switching = '';
+    }
+  }
+
+  async function removeCharacter(entry: SavedCharacterEntry) {
+    if (switching) return;
+    switching = entry.id;
+    settingsError = '';
+    try {
+      library = (await deleteCharacter(entry.id)).characters;
+      settingsStatus = `Deleted ${entry.name}.`;
+    } catch (error) {
+      settingsError = error instanceof Error ? error.message : String(error);
+    } finally {
+      switching = '';
     }
   }
 
@@ -190,8 +231,12 @@
         throw new Error('Choose or record a voice sample.');
       }
       populateForm(active);
+      try {
+        library = (await listCharacters()).characters;
+      } catch {
+        // The save succeeded; a stale list corrects on the next poll.
+      }
       settingsStatus = 'Character saved.';
-      view = 'speak';
     } catch (error) {
       settingsError = error instanceof Error ? error.message : String(error);
       settingsStatus = '';
@@ -327,7 +372,37 @@
       </p>
     </section>
 
+    {#if library.length}
+      <section class="panel library-panel">
+        <h2>Saved characters</h2>
+        <p class="mcp-hint">One click switches the whole server — this page and every MCP call.</p>
+        <ul class="library">
+          {#each library as entry (entry.id)}
+            <li>
+              <div class="library-name">
+                <strong>{entry.name}</strong>
+                <small>{entry.source === 'custom' ? 'custom recording' : entry.preset}</small>
+              </div>
+              {#if entry.active}
+                <span class="active-badge">Active</span>
+              {:else}
+                <button class="ghost" disabled={Boolean(switching)}
+                  on:click={() => useCharacter(entry)}>
+                  {switching === entry.id ? 'Switching…' : 'Use'}
+                </button>
+              {/if}
+              <button class="danger slim" disabled={Boolean(switching)} title="Delete"
+                on:click={() => removeCharacter(entry)}>✕</button>
+            </li>
+          {/each}
+        </ul>
+      </section>
+    {/if}
+
     <section class="panel settings-panel">
+      <h2>{active ? 'Edit or add a character' : 'Add a character'}</h2>
+      <p class="mcp-hint">Saving stores it above and makes it the active voice. Saving under a new
+        name adds a new character; the same name replaces it.</p>
       <label for="char-name">Character name</label>
       <input id="char-name" bind:value={editName} maxlength="64" placeholder="Name this character" />
 
