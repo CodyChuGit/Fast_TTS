@@ -195,7 +195,7 @@ if (-not [System.IO.Path]::IsPathRooted($LlmModelPath)) {
     $LlmModelPath = Join-Path $repoRoot $LlmModelPath
 }
 $LlmModelPath = [System.IO.Path]::GetFullPath($LlmModelPath)
-$gemmaModelPath = Join-Path $repoRoot "models\gemma-4-26B-A4B-heretic-GGUF\gemma-4-26B-A4B-it-uncensored-heretic-Q4_K_M.gguf"
+$gemmaModelPath = Join-Path $repoRoot "models\gemma-4-26B-A4B-qat-heretic-GGUF\gemma-4-26B-A4B-it-qat-heretic-UD-Q4_K_XL.gguf"
 
 $llmModels = @()
 if (Test-Path -LiteralPath $LlmModelPath -PathType Leaf) {
@@ -218,7 +218,9 @@ if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
         id = "gemma"
         name = "Gemma 4 26B heretic"
         path = ($gemmaModelPath -replace "\\", "/")
-        extra_args = @("--n-cpu-moe", "9", "-ub", "1024", "--reasoning-budget", "0")
+        # Two expert layers deeper when the small TTS model frees the VRAM.
+        extra_args = @("--n-cpu-moe", $(if ($ModelPath -match '0\.6b') { "5" } else { "7" }),
+            "-ub", "1024", "--reasoning-budget", "0")
     }
 }
 $huihuiModelPath = Join-Path $repoRoot "models\Huihui-Qwen3.8-27B-abliterated-GGUF\Huihui-Qwen3.8-27B-abliterated.Q4_K_M.gguf"
