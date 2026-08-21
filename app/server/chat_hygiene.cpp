@@ -141,6 +141,30 @@ std::string recover_quoted_dialogue(const std::string & text) {
     return joined;
 }
 
+std::string first_word(const std::string & text) {
+    size_t index = 0;
+    while (index < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[index])) != 0) {
+        ++index;
+    }
+    std::string word;
+    size_t cjk_count = 0;
+    while (index < text.size()) {
+        const size_t at = index;
+        const uint32_t cp = decode_utf8(text, index);
+        if (is_ascii_letter(cp) || cp == '\'') {
+            if (cjk_count > 0) break;
+            word += text.substr(at, index - at);
+        } else if (is_cjk(cp)) {
+            word += text.substr(at, index - at);
+            if (++cjk_count >= 2) break;
+        } else {
+            break;
+        }
+    }
+    return word;
+}
+
 bool contains_ci(const std::string & haystack, const std::string & needle) {
     const auto it = std::search(
         haystack.begin(), haystack.end(), needle.begin(), needle.end(),
@@ -354,6 +378,83 @@ std::string turn_anchor(
     const std::string & latest_user,
     const std::vector<std::string> & recent_assistant) {
     const bool zh = mostly_cjk(latest_user);
+
+    // Gather everything this specific turn needs beyond the language pin.
+    std::vector<std::string> extras;
+    if (is_ai_probe(latest_user)) {
+        extras.push_back(
+            "They are teasing that you might be artificial: brush it off in"
+            " one short playful sentence WITHOUT using the words AI, bot, or"
+            " robot yourself, then change the subject.");
+    }
+    if (contains_ci(latest_user, "third person") ||
+        latest_user.find("\xe7\xac\xac\xe4\xb8\x89\xe4\xba\xba\xe7\xa7\xb0") != std::string::npos) {
+        extras.push_back(
+            "They asked for third person: playfully refuse and keep speaking as I.");
+    }
+    if (is_memory_check(latest_user)) {
+        extras.push_back(
+            "This is a memory check. Search the conversation above for what"
+            " THEY said and answer with their detail, speaking of it as"
+            " theirs; if it is not in the conversation any more, playfully"
+            " admit that you lost it -- never claim they did not tell you,"
+            " never guess.");
+    }
+    // At most three dynamic bans: a wall of bans gets quoted back instead of
+    // followed.
+    int bans = 0;
+    const size_t recent_count = std::min<size_t>(recent_assistant.size(), 4);
+    bool recent_filler = false;
+    for (size_t i = recent_assistant.size() - recent_count; i < recent_assistant.size(); ++i) {
+        recent_filler = recent_filler || has_filler(recent_assistant[i]);
+    }
+    if (recent_filler && bans < 3) {
+        extras.push_back("Do not use aiya or \xe5\x93\x8e\xe5\x91\x80 this turn.");
+        ++bans;
+    }
+    if (!recent_assistant.empty() && mentions_ai(recent_assistant.back()) && bans < 3) {
+        extras.push_back("Do not mention AI, bots, or robots this turn.");
+        ++bans;
+    }
+    if (recent_assistant.size() >= 2 && bans < 3 &&
+        ends_with_question(recent_assistant[recent_assistant.size() - 1]) &&
+        ends_with_question(recent_assistant[recent_assistant.size() - 2])) {
+        extras.push_back("End this reply with a warm statement, not a question.");
+        ++bans;
+    }
+    if (recent_assistant.size() >= 2 && bans < 3) {
+        // An opener streak: the last two replies started with the same word
+        // ("Wait, ..." / "Wait, ...") -- formula the listener hears fast.
+        const std::string last_opener = first_word(recent_assistant[recent_assistant.size() - 1]);
+        if (!last_opener.empty() &&
+            last_opener == first_word(recent_assistant[recent_assistant.size() - 2])) {
+            extras.push_back(
+                "Do not begin your reply with '" + last_opener + "'.");
+            ++bans;
+        }
+    }
+    for (const auto & gram : repeated_phrases(recent_assistant)) {
+        if (bans >= 3) break;
+        extras.push_back(
+            "Never say '" + gram + "' again; find fresh wording and fresh ideas.");
+        ++bans;
+    }
+    const bool switched = !zh && !recent_assistant.empty() &&
+        mostly_cjk(recent_assistant.back(), 0.5);
+
+    // A quiet turn gets only the short language pin: every extra token in the
+    // note is re-prefilled each turn and taxes first-token latency. The pin
+    // deliberately does not invite "flavor" words -- that wording produced
+    // tone-marked pinyin inside English sentences, which reads fine but
+    // sounds wrong when spoken.
+    if (extras.empty() && !switched) {
+        if (zh) {
+            // 这一轮必须用中文回答。
+            return "\xe8\xbf\x99\xe4\xb8\x80\xe8\xbd\xae\xe5\xbf\x85\xe9\xa1\xbb\xe7\x94\xa8\xe4\xb8\xad\xe6\x96\x87\xe5\x9b\x9e\xe7\xad\x94\xe3\x80\x82";
+        }
+        return "Reply in English sentences only, with no pinyin.";
+    }
+
     std::string snippet = utf8_prefix(latest_user, 160);
     std::replace(snippet.begin(), snippet.end(), '\n', ' ');
     std::replace(snippet.begin(), snippet.end(), '"', '\'');
@@ -367,62 +468,20 @@ std::string turn_anchor(
     } else {
         anchor << "Their newest message is: '" << snippet << "' -- answer exactly that.";
     }
-    if (is_ai_probe(latest_user)) {
-        anchor << " They are teasing that you might be artificial: brush it off"
-                  " in one short playful sentence WITHOUT using the words AI,"
-                  " bot, or robot yourself, then change the subject.";
-    }
-    if (contains_ci(latest_user, "third person") ||
-        latest_user.find("\xe7\xac\xac\xe4\xb8\x89\xe4\xba\xba\xe7\xa7\xb0") != std::string::npos) {
-        anchor << " They asked for third person: playfully refuse and keep"
-                  " speaking as I.";
-    }
-    if (is_memory_check(latest_user)) {
-        anchor << " This is a memory check. Search the conversation above for"
-                  " what THEY said and answer with their detail, speaking of it"
-                  " as theirs; if it is not in the conversation any more,"
-                  " playfully admit that you lost it -- never claim they did"
-                  " not tell you, never guess.";
-    }
-    // At most three dynamic bans: a wall of bans gets quoted back instead of
-    // followed.
-    int bans = 0;
-    const size_t recent_count = std::min<size_t>(recent_assistant.size(), 4);
-    bool recent_filler = false;
-    for (size_t i = recent_assistant.size() - recent_count; i < recent_assistant.size(); ++i) {
-        recent_filler = recent_filler || has_filler(recent_assistant[i]);
-    }
-    if (recent_filler && bans < 3) {
-        anchor << " Do not use aiya or \xe5\x93\x8e\xe5\x91\x80 this turn.";
-        ++bans;
-    }
-    if (!recent_assistant.empty() && mentions_ai(recent_assistant.back()) && bans < 3) {
-        anchor << " Do not mention AI, bots, or robots this turn.";
-        ++bans;
-    }
-    if (recent_assistant.size() >= 2 && bans < 3 &&
-        ends_with_question(recent_assistant[recent_assistant.size() - 1]) &&
-        ends_with_question(recent_assistant[recent_assistant.size() - 2])) {
-        anchor << " End this reply with a warm statement, not a question.";
-        ++bans;
-    }
-    for (const auto & gram : repeated_phrases(recent_assistant)) {
-        if (bans >= 3) break;
-        anchor << " Never say '" << gram << "' again; find fresh wording and"
-                  " fresh ideas.";
-        ++bans;
+    for (const auto & extra : extras) {
+        anchor << " " << extra;
     }
     if (zh) {
         // 这一轮必须用中文回答。
         anchor << " \xe8\xbf\x99\xe4\xb8\x80\xe8\xbd\xae\xe5\xbf\x85\xe9\xa1\xbb\xe7\x94\xa8\xe4\xb8\xad\xe6\x96\x87\xe5\x9b\x9e\xe7\xad\x94\xe3\x80\x82";
     } else {
-        if (!recent_assistant.empty() && mostly_cjk(recent_assistant.back(), 0.5)) {
+        if (switched) {
             anchor << " The conversation just switched: even though your last"
                       " reply was in Chinese, this message is in English --"
                       " switch back to English NOW.";
         }
         anchor << " This reply MUST be written in English sentences only -- no"
-                  " Chinese sentences (a single Chinese word as flavor is fine).";
+                  " Chinese sentences and no pinyin.";
     }
     return anchor.str();
 }

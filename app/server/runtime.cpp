@@ -917,6 +917,11 @@ ServerState::ServerState(
             std::cerr << "LLM sidecar starting: " << spec->name << "\n";
         }
     }
+    // Prime the sidecar's prompt cache with the active character's system
+    // prompt as soon as the model is up: the first message of the first
+    // conversation then pays only its own prefill. Harmless no-op when no
+    // LLM is configured; also covers a launcher-owned sidecar.
+    warm_llm_system_prompt();
     if (auto * model = find_speech_model()) {
         try {
             apply_character(*model, character_);
@@ -1766,6 +1771,9 @@ HttpResponse ServerState::handle_character_set(const HttpRequest & request) {
         std::lock_guard<std::mutex> lock(character_mutex_);
         character_ = character;
     }
+    // The system prompt just changed with the character; re-prime the
+    // sidecar's cache so the next fresh conversation starts fast.
+    warm_llm_system_prompt();
     return handle_character_get();
 }
 
@@ -1875,6 +1883,9 @@ HttpResponse ServerState::handle_character_activate(const std::string & body_tex
         std::lock_guard<std::mutex> lock(character_mutex_);
         character_ = character;
     }
+    // The system prompt just changed with the character; re-prime the
+    // sidecar's cache so the next fresh conversation starts fast.
+    warm_llm_system_prompt();
     return handle_character_get();
 }
 
@@ -1944,6 +1955,48 @@ HttpResponse ServerState::handle_mcp(const HttpRequest & request) {
     response.status = reply.status;
     response.body = reply.body;
     return response;
+}
+
+std::string ServerState::fresh_llm_warm_body() const {
+    CharacterConfig character;
+    LlmSettings settings;
+    {
+        std::lock_guard<std::mutex> lock(character_mutex_);
+        character = character_;
+        settings = llm_settings_;
+    }
+    const std::string system =
+        render_master_prompt(settings, character.name, character.persona) +
+        hygiene::kNoteRule +
+        length_guidance(settings, 0);
+    // The near-empty user turn keeps every chat template happy (Gemma folds
+    // the system text into the first user turn); the real first message
+    // shares the rendered system prefix and diverges only at its own text.
+    return "{\"stream\":false,\"cache_prompt\":true,\"max_tokens\":1,\"messages\":["
+           "{\"role\":\"system\",\"content\":" + json_quote(system) + "},"
+           "{\"role\":\"user\",\"content\":\" \"}]}";
+}
+
+void ServerState::warm_llm_system_prompt() {
+    if (config_.llm_port <= 0) {
+        return;
+    }
+    std::thread([host = config_.llm_host, port = config_.llm_port,
+                 body = fresh_llm_warm_body()] {
+        // The sidecar may still be loading its model (startup, or a switch in
+        // flight); wait for health quietly, then prime and go away.
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(300);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::string health;
+            if (llm::http_get_status(host, port, "/health", health) == 200) {
+                std::string response;
+                llm::http_post_status(host, port, "/v1/chat/completions", body, response);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }).detach();
 }
 
 std::string ServerState::llm_settings_json() const {
@@ -2086,6 +2139,9 @@ HttpResponse ServerState::handle_llm_settings_set(const std::string & body_text)
         std::lock_guard<std::mutex> lock(character_mutex_);
         llm_settings_ = settings;
     }
+    // The master prompt (or the sidecar itself) may just have changed;
+    // re-prime the cache for the next fresh conversation.
+    warm_llm_system_prompt();
     return json_response(llm_settings_json());
 }
 
@@ -2213,10 +2269,20 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
         llama_body += ",\"seed\":" + std::to_string(llm_seed);
     }
     llama_body += ",\"messages\":[";
+    // Built alongside: the canonical next-turn request (bare last user
+    // message, next ramp tier) that re-primes the prompt cache once the reply
+    // is known. See chat_orchestrate.
+    const std::string next_system =
+        render_master_prompt(settings, character.name, character.persona) +
+        hygiene::kNoteRule +
+        length_guidance(settings, assistant_turns + 1);
+    std::string warm_prefix =
+        "{\"stream\":false,\"cache_prompt\":true,\"max_tokens\":1,\"messages\":[";
     bool first_message = true;
     const bool client_has_system = list[0].find("role")->as_string() == "system";
     if (!client_has_system) {
         llama_body += "{\"role\":\"system\",\"content\":" + json_quote(system_prompt) + "}";
+        warm_prefix += "{\"role\":\"system\",\"content\":" + json_quote(next_system) + "}";
         first_message = false;
     }
     size_t assistant_seen = 0;
@@ -2227,11 +2293,16 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
             // The model's own past, cleaned: feeding it raw teaches it to
             // imitate its own markup and drift.
             content_text = assistant_history[assistant_seen++];
-        } else if (role_name == "user" && i == last_user_index) {
+        }
+        const std::string separator = first_message ? "" : ",";
+        warm_prefix += separator +
+            "{\"role\":" + json_quote(role_name) +
+            ",\"content\":" + json_quote(content_text) + "}";
+        if (role_name == "user" && i == last_user_index) {
             content_text += "\n[" +
                 hygiene::turn_anchor(content_text, assistant_history) + "]";
         }
-        llama_body += std::string(first_message ? "" : ",") +
+        llama_body += separator +
             "{\"role\":" + json_quote(role_name) +
             ",\"content\":" + json_quote(content_text) + "}";
         first_message = false;
@@ -2239,14 +2310,15 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     llama_body += "]}";
 
     LoadedModel * model_ptr = model;
-    return sse_response([this, model_ptr, llama_body, tts_seed](HttpStreamWriter & writer) {
-        chat_orchestrate(*model_ptr, llama_body, tts_seed, writer);
+    return sse_response([this, model_ptr, llama_body, warm_prefix, tts_seed](HttpStreamWriter & writer) {
+        chat_orchestrate(*model_ptr, llama_body, warm_prefix, tts_seed, writer);
     });
 }
 
 void ServerState::chat_orchestrate(
     LoadedModel & model,
     const std::string & llama_body,
+    const std::string & warm_body_prefix,
     long long tts_seed,
     HttpStreamWriter & writer) {
     // Producer/consumer: the LLM reader thread turns the sidecar's SSE stream
@@ -2320,10 +2392,13 @@ void ServerState::chat_orchestrate(
     bool llm_ok = true;
     std::string llm_error;
 
+    std::string reply_text;
+    bool completed = false;
     auto write_token = [&](const std::string & delta) {
         if (first_token_ms < 0) {
             first_token_ms = elapsed();
         }
+        reply_text += delta;
         write_sse(writer, "{\"type\":\"token\",\"text\":" + json_quote(delta) + "}");
     };
     // Called from inside the TTS sink so the transcript keeps streaming while a
@@ -2414,6 +2489,7 @@ void ServerState::chat_orchestrate(
              << "}}";
         write_sse(writer, done.str());
         write_sse_done(writer);
+        completed = true;
     } catch (...) {
         // The client went away or synthesis failed mid-stream; stop the LLM
         // and unwind. The connection is already unusable, so there is nothing
@@ -2422,6 +2498,21 @@ void ServerState::chat_orchestrate(
     }
     abort.store(true);
     llm_thread.join();
+
+    // The GPU is idle now while the user listens; spend that time re-priming
+    // the sidecar's prompt cache with the canonical form of this turn (the
+    // steering note the client never stores replaced by the finished reply),
+    // so the NEXT turn's prefill covers only the user's new message. Skipped
+    // for aborted streams: the client did not keep this reply.
+    if (completed && llm_ok && !warm_body_prefix.empty() && !reply_text.empty()) {
+        const std::string warm_body = warm_body_prefix +
+            ",{\"role\":\"assistant\",\"content\":" +
+            json_quote(hygiene::sanitize_assistant_text(reply_text)) + "}]}";
+        std::thread([host = config_.llm_host, port = config_.llm_port, warm_body] {
+            std::string response;
+            llm::http_post_status(host, port, "/v1/chat/completions", warm_body, response);
+        }).detach();
+    }
 }
 
 // Cached-voice discovery for the "voice"/cached_voice_id request field. Families that

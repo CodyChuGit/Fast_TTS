@@ -262,6 +262,65 @@ int http_get_status(
     return status;
 }
 
+int http_post_status(
+    const std::string & host,
+    int port,
+    const std::string & path,
+    const std::string & request_body,
+    std::string & response) {
+    response.clear();
+    SocketGuard guard;
+    guard.handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (guard.handle == kInvalidSocket) {
+        return -1;
+    }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(static_cast<unsigned short>(port));
+    if (inet_pton(AF_INET, host.c_str(), &address.sin_addr) != 1 ||
+        ::connect(guard.handle, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+        return -1;
+    }
+    {
+        // Cache-priming prefills of a long tail can take tens of seconds on a
+        // busy GPU; be patient, the caller runs on a background thread.
+#ifdef _WIN32
+        DWORD timeout = 60000;
+        setsockopt(guard.handle, SOL_SOCKET, SO_RCVTIMEO,
+            reinterpret_cast<const char *>(&timeout), sizeof(timeout));
+#else
+        timeval timeout{60, 0};
+        setsockopt(guard.handle, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+#endif
+    }
+    const std::string request =
+        "POST " + path + " HTTP/1.1\r\nHost: " + host +
+        "\r\nContent-Type: application/json\r\nContent-Length: " +
+        std::to_string(request_body.size()) + "\r\nConnection: close\r\n\r\n" +
+        request_body;
+    if (!send_all(guard.handle, request)) {
+        return -1;
+    }
+    char buffer[8192];
+    std::string raw;
+    while (raw.size() < 256 * 1024) {
+        const int received = ::recv(guard.handle, buffer, sizeof(buffer), 0);
+        if (received <= 0) {
+            break;
+        }
+        raw.append(buffer, static_cast<size_t>(received));
+    }
+    if (raw.size() < 12 || raw.compare(0, 5, "HTTP/") != 0) {
+        return -1;
+    }
+    const int status = std::atoi(raw.c_str() + 9);
+    const auto header_end = raw.find("\r\n\r\n");
+    if (header_end != std::string::npos) {
+        response = raw.substr(header_end + 4, 4096);
+    }
+    return status;
+}
+
 ChatResult stream_chat(
     const std::string & host,
     int port,

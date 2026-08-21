@@ -164,11 +164,24 @@ private:
     // audio events on the same SSE stream. The LLM keeps generating while the
     // TTS model speaks, so text runs ahead and audio catches up.
     HttpResponse handle_chat_speak(const std::string & body_text);
+    // `warm_body_prefix`, when non-empty, is the canonical next-turn request
+    // up to (not including) the reply message: once the reply is complete it
+    // is appended and the whole thing sent to the sidecar as a one-token
+    // priming request, so the next turn's prefill covers only the user's new
+    // message. Without it the per-turn steering note (which the client never
+    // stores) makes the prompt cache diverge a full turn early.
     void chat_orchestrate(
         LoadedModel & model,
         const std::string & llama_body,
+        const std::string & warm_body_prefix,
         long long tts_seed,
         HttpStreamWriter & writer);
+    // Primes the sidecar's prompt cache with the active character's rendered
+    // system prompt on a background thread, so the first message of a fresh
+    // conversation pays only its own prefill. Called at startup and whenever
+    // the system prompt changes (character or settings edits, model switch).
+    void warm_llm_system_prompt();
+    std::string fresh_llm_warm_body() const;
     mcp::SpeakOutcome run_mcp_speak(const std::string & text, long long seed);
 
     std::string models_json() const;

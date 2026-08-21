@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Preset = "windows-cuda-release",
     [string]$ModelPath = "",
@@ -207,17 +207,18 @@ if (Test-Path -LiteralPath $LlmModelPath -PathType Leaf) {
 }
 if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
     # All 16.8 GB of Q4_K_M cannot sit beside the resident TTS model on a
-    # 24 GB card, but most of it can: only the first 10 layers' MoE experts
-    # stay in system RAM (measured on this 3090: prompt 381 t/s and decode
-    # 44 t/s versus 129/17 with everything on the CPU, at 13.3 GB -- the same
-    # total footprint as the Peach setup). Gemma 4 is a reasoning model, and
-    # a voice conversation cannot wait through a hidden think phase -- a zero
+    # 24 GB card, but most of it can: only the first 9 layers' MoE experts
+    # stay in system RAM, and a 1024-token micro-batch keeps the split
+    # prefill efficient (measured on this 3090: prompt 590 t/s and decode
+    # 47 t/s versus 129/17 with everything on the CPU, at 14.5 GB beside
+    # the trimmed TTS caches). Gemma 4 is a reasoning model, and a voice
+    # conversation cannot wait through a hidden think phase -- a zero
     # reasoning budget makes it answer directly.
     $llmModels += , [ordered]@{
         id = "gemma"
         name = "Gemma 4 26B heretic"
         path = ($gemmaModelPath -replace "\\", "/")
-        extra_args = @("--n-cpu-moe", "10", "--reasoning-budget", "0")
+        extra_args = @("--n-cpu-moe", "9", "-ub", "1024", "--reasoning-budget", "0")
     }
 }
 $llmAvailable = $false
@@ -257,12 +258,14 @@ $effectiveConfig = [ordered]@{
                 # graph capture, so the parity default is also the fast one.
                 "qwen3_tts.perf_mode" = "off"
                 # Chat speaks one sentence at a time, so text lengths vary far
-                # more than studio use did. Slots cover the bundled voices plus
-                # the active character, and enough prompt-shape graphs that a
-                # conversation stops paying capture spikes after its first
+                # more than studio use did. Three voice slots cover the active
+                # character plus a couple of demo auditions -- chat only ever
+                # uses one voice, and the reclaimed VRAM buys two more Gemma
+                # expert layers on the GPU. Twelve prompt-shape graphs still
+                # stop a conversation paying capture spikes after its first
                 # exchanges.
-                "qwen3_tts.voice_prompt_cache_slots" = "6"
-                "qwen3_tts.prefill_graph_cache_slots" = "16"
+                "qwen3_tts.voice_prompt_cache_slots" = "3"
+                "qwen3_tts.prefill_graph_cache_slots" = "12"
             }
             default_request_options = [ordered]@{
                 chunk_frames = "1"

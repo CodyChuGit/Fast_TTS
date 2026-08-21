@@ -50,11 +50,14 @@ void test_sanitize() {
 }
 
 void test_turn_anchor() {
+    // A quiet turn gets only the short language pin: note tokens are
+    // re-prefilled every turn and tax first-token latency.
     const auto english = turn_anchor("hey! how was your day?", {});
-    require(english.find("hey! how was your day?") != std::string::npos,
-        "the anchor quotes the newest message");
     require(english.find("English sentences only") != std::string::npos,
         "an English message pins an English reply");
+    require(english.find("hey! how was your day?") == std::string::npos,
+        "a quiet turn skips the quote");
+    require(english.size() < 100, "a quiet turn's note stays short");
 
     const std::string chinese = "\xe4\xbb\x8a\xe5\xa4\xa9\xe5\xa5\xbd\xe6\x97\xa0\xe8\x81\x8a";
     const auto zh = turn_anchor(chinese, {});
@@ -63,6 +66,8 @@ void test_turn_anchor() {
 
     const auto probe = turn_anchor("are you an AI? be honest", {});
     require(probe.find("artificial") != std::string::npos, "an AI probe adds the deflection");
+    require(probe.find("are you an AI? be honest") != std::string::npos,
+        "a triggered turn quotes the newest message");
 
     const auto quiz = turn_anchor("quiz time: what did I tell you earlier?", {});
     require(quiz.find("memory check") != std::string::npos, "a quiz adds the memory coaching");

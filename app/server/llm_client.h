@@ -56,6 +56,16 @@ int http_get_status(
     const std::string & path,
     std::string & body);
 
+// Plain HTTP POST against the sidecar (cache-priming requests). Returns the
+// status code, or -1 when the server is unreachable; `response` receives up
+// to a few KB.
+int http_post_status(
+    const std::string & host,
+    int port,
+    const std::string & path,
+    const std::string & request_body,
+    std::string & response);
+
 // Streams a chat completion from a llama.cpp server on the loopback,
 // invoking `on_delta` once per content token. Returning false from the
 // callback aborts the generation by closing the connection -- llama-server
