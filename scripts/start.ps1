@@ -223,6 +223,34 @@ if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
             "-ub", "1024", "--reasoning-budget", "0")
     }
 }
+$vanillaGemmaPath = Join-Path $repoRoot "models\gemma-4-26B-A4B-it-qat-GGUF\gemma-4-26B_q4_0-it.gguf"
+if (Test-Path -LiteralPath $vanillaGemmaPath -PathType Leaf) {
+    # Google's own QAT release, alignment intact: the "vanilla" alternative
+    # for anyone who wants stock Gemma behavior. Slightly larger than the
+    # heretic UD quant, so it keeps one more expert layer on the CPU.
+    $llmModels += , [ordered]@{
+        id = "gemma-vanilla"
+        name = "Gemma 4 26B (vanilla)"
+        path = ($vanillaGemmaPath -replace "\\", "/")
+        extra_args = @("--n-cpu-moe", $(if ($ModelPath -match '0\.6b') { "7" } else { "10" }),
+            "-ub", "1024", "--reasoning-budget", "0")
+    }
+}
+$orcaModelPath = Join-Path $repoRoot "models\Qwen3.8-27B-OrcaRouter-GGUF\Qwen3.8-27B-Uncensored-OrcaRouter-Q4_K_M.gguf"
+if (Test-Path -LiteralPath $orcaModelPath -PathType Leaf) {
+    # Dense 27B like the Huihui build: sharp functionally (its memory and
+    # language mirroring judged 10/10) but it cannot sit fully beside the TTS
+    # model, so whole layers go to the CPU and decode is slow. Its matched
+    # MTP draft head measured flat here (33% acceptance, heavy head, hybrid
+    # attention rollback), so speculation stays off.
+    $llmModels += , [ordered]@{
+        id = "orca-qwen"
+        name = "Qwen3.8 27B OrcaRouter (slow)"
+        path = ($orcaModelPath -replace "\\", "/")
+        extra_args = @("-ngl", "42", "-ub", "1024",
+            "--chat-template-kwargs", '{"enable_thinking":false}')
+    }
+}
 $huihuiModelPath = Join-Path $repoRoot "models\Huihui-Qwen3.8-27B-abliterated-GGUF\Huihui-Qwen3.8-27B-abliterated.Q4_K_M.gguf"
 if (Test-Path -LiteralPath $huihuiModelPath -PathType Leaf) {
     # A DENSE 27B: there is no expert-offload trick, so fitting beside the
