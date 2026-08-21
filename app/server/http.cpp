@@ -65,6 +65,8 @@ const char * status_text(int status) noexcept {
     switch (status) {
     case 200:
         return "OK";
+    case 202:
+        return "Accepted";
     case 204:
         return "No Content";
     case 400:

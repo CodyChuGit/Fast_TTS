@@ -1,8 +1,10 @@
 #pragma once
 
 #include "busy_guard.h"
+#include "character.h"
 #include "config.h"
 #include "http.h"
+#include "mcp.h"
 #include "model_installer.h"
 
 #include "../streaming/streaming.h"
@@ -150,6 +152,22 @@ private:
         const engine::runtime::TaskRequest & request,
         std::optional<int> busy_timeout_ms = std::nullopt);
     HttpResponse handle_transcription_live(const HttpRequest & request);
+    // The active character: the display name plus default voice used whenever a
+    // request names no voice, shared by the WebUI and MCP callers.
+    HttpResponse handle_character_get();
+    HttpResponse handle_character_set(const HttpRequest & request);
+    // Resolves the stored character into a runtime voice preset and installs it
+    // as the speech model's default under its metadata lock.
+    void apply_character(LoadedModel & model, const CharacterConfig & character);
+    // The single model MCP speak and the character apply to: the first
+    // configured TTS model.
+    LoadedModel * find_speech_model();
+    std::string character_name() const;
+
+    // MCP endpoint: JSON-RPC over streamable HTTP with one speak tool.
+    HttpResponse handle_mcp(const HttpRequest & request);
+    mcp::SpeakOutcome run_mcp_speak(const std::string & text, long long seed);
+
     HttpResponse handle_generic_run(const std::string & body_text);
     HttpResponse handle_generic_stream(const std::string & body_text);
     HttpResponse handle_voices(const HttpRequest & request) const;
@@ -170,6 +188,11 @@ private:
     mutable std::mutex model_installer_mutex_;
     std::unique_ptr<ModelInstaller> model_installer_;
     std::atomic<uint64_t> next_upload_id_{1};
+    // Guards character_; the voice preset it resolves to lives on the model and
+    // is guarded by that model's metadata_mutex.
+    mutable std::mutex character_mutex_;
+    CharacterConfig character_;
+    std::filesystem::path character_dir_;
 };
 
 }  // namespace minitts::server

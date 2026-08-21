@@ -258,6 +258,7 @@ if ($listenerPid -eq 0) {
         ArgumentList = @(
             "--config", $configPath,
             "--voice-dir", $voiceDir,
+            "--character-dir", (Join-Path $repoRoot "character"),
             "--cuda-keepalive-ms", [string]$CudaKeepaliveMs,
             "--cuda-keepalive-work-ms", [string]$CudaKeepaliveWorkMs)
         WorkingDirectory = $repoRoot

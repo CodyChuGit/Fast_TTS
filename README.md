@@ -5,6 +5,11 @@
 > KV state, complete codec-frame callbacks, a 25-frame sliding speech decoder,
 > Base/CustomVoice/VoiceDesign streaming, and HTTP PCM delivery. See the
 > [qwen3-tts-streamer guide](README_QWEN3_TTS_STREAMING.md).
+>
+> On top of that engine it ships a standalone app: an **MCP server for audio**
+> with one character voice (**F** by default, replaceable in Settings), a
+> single-purpose web page, and a `speak` tool that platforms like Open WebUI
+> can call. See the [Voice MCP guide](README_VOICE_MCP.md).
 
 [![0xShug0/audio.cpp | Trendshift](https://trendshift.io/api/badge/trendshift/repositories/64983/daily?language=C%2B%2B)](https://trendshift.io/repositories/64983?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-64983)
 

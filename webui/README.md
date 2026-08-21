@@ -1,64 +1,19 @@
-# Native WebUI Guide
+# Voice MCP WebUI
 
-audio.cpp ships one browser interface: a SvelteKit/TypeScript single-page app embedded directly in
-`audiocpp_server`. The compiled server needs neither Python, Node.js, nor separate frontend files for
-inference and normal UI operation.
+The embedded web page is the front door for this app's single function: making
+the configured character — **F** by default — speak. It is compiled from a small
+SvelteKit app in `native/` and embedded into `audiocpp_server`, so the running
+binary needs no frontend files.
 
-## Run
+Views:
 
-Build `audiocpp_server`, then start it with UI management enabled:
-
-```powershell
-.\build\windows-cuda-release\bin\audiocpp_server.exe --ui --backend cuda
-```
-
-```bash
-./build/bin/audiocpp_server --ui --backend cuda
-```
-
-Open **http://127.0.0.1:8080**. With no `--config`, `--ui` enables on-demand model loading,
-unloading, package management, and temporary browser uploads. Models default to a `models/` directory
-beside the server executable. The Models page can select and remember a different directory.
-
-An existing server configuration exposes the embedded UI by default:
-
-```bash
-audiocpp_server --config server.json
-```
-
-Configured models retain their eager or lazy behavior. Add `--ui-management` when the UI should be
-allowed to load, switch, unload, download, or delete model packages. Use `--no-ui` for an API-only
-server.
-
-## Features
-
-The native UI supports the shared model catalog and spec-driven controls for TTS, cloning, ASR,
-generation, conversion, separation, VAD, diarization, alignment, and voice design. It also provides:
-
-- background model downloads with progress, cancellation, partial-download cleanup, version status,
-  precision selection, and package deletion;
-- on-demand model loading with automatic unloading when switching model or precision;
-- sentence-aware long-text synthesis with browser-side WAV merging;
-- true incremental Qwen3-TTS PCM playback when the loaded model uses `mode=streaming`, while retaining a completed WAV for replay and download;
-- background two-frame prewarming for configured Qwen3-TTS quick-start voices and the current editor text; the exact 160 ms PCM prefix can start immediately, is byte-verified against the live request before duplicate network PCM is skipped, and never replaces audio in the saved WAV;
-- one page-lifetime interactive audio context, primed by the voice/text gesture, so repeated requests do not reopen the browser audio device on the click-to-audio path;
-- microphone capture and near-live input for streaming-capable ASR models;
-- embedded demo voices with matching transcripts;
-- a saved voice library stored in browser IndexedDB;
-- multilingual UI resources under `native/lang/`;
-- structured results, generated artifacts, and request timing.
-
-Uploaded request files use a per-process temporary directory and are deleted when the server exits.
-Saved voices remain in the current browser profile and are only uploaded when selected for a request.
-
-## Model downloads
-
-Inference and the embedded interface do not require Python. Model installation currently invokes the
-repository-level `tools/model_manager_v2.py`; legacy checkpoint conversion packages may invoke
-`tools/model_manager_deprecated.py`. These are general model-management utilities, not UI code.
-
-Set `AUDIOCPP_PYTHON` if the desired interpreter is not `python` on Windows or `python3` on Unix.
-Loading an existing model directory or standalone GGUF does not invoke either helper.
+- **Speak** — a text box, live streaming playback while generation runs, the
+  first-audio latency for each request, a WAV download of the last utterance,
+  and the MCP connection panel with Open WebUI instructions.
+- **Settings** — replace the character: rename it, pick one of the bundled demo
+  voices, or clone a custom voice from an uploaded or microphone-recorded
+  sample plus its transcript. The character is server state and applies to MCP
+  callers too; see [README_VOICE_MCP.md](../README_VOICE_MCP.md).
 
 ## Frontend development
 
@@ -68,18 +23,10 @@ Node.js is needed only to modify and rebuild the frontend:
 cd webui/native
 npm ci
 npm run check
-npm run build
+npm run test:stream
+npm run build        # writes native/dist, embedded on the next server build
 ```
 
-The build creates `webui/native/dist/index.html`. CMake converts that single-file application into an
-embedded byte array for `audiocpp_server`; rebuild the server after changing it. For live development,
-run `npm run dev`; Vite proxies `/health` and `/v1` to a server on port 8080.
-
-The frontend consumes:
-
-- `webui/configs/models_catalog.json` for model/task entries;
-- `webui/configs/model_params.json` for model-specific controls;
-- `webui/native/lang/lang_<code>.json` for optional translations;
-- `webui/native/demo_voices/` for demo reference voices embedded in the server.
-
-English strings are built into `native/src/lib/i18n.ts` and are the fallback for missing translations.
+The page keeps one interactive audio context for the whole session and feeds it
+16-bit PCM chunks as they arrive from `/v1/audio/speech`, so playback starts on
+the first decoded frames rather than after the clip completes.

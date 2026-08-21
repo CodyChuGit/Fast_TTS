@@ -91,6 +91,9 @@ struct ServerConfig {
     // mapping file (<basename>|<transcript>). A request `voice` name that is not a
     // model preset resolves to <voice_dir>/<name>.wav as the cloning reference.
     std::optional<std::filesystem::path> voice_dir;
+    // Where the active character (name + voice) is persisted. Defaults to
+    // `character/` under the server's working directory.
+    std::optional<std::filesystem::path> character_dir;
     std::vector<ServerModelConfig> models;
 };
 

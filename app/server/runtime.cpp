@@ -883,6 +883,27 @@ ServerState::ServerState(
             models_root_);
     }
     load_models();
+
+    // The active character survives restarts, so both the WebUI and MCP callers
+    // keep speaking with the chosen voice. A store that fails to load falls back
+    // to the default character rather than failing startup: speech must come up
+    // even when a customization file is broken, and the log says why F is back.
+    character_dir_ = config_.character_dir.value_or(request_base_ / "character");
+    try {
+        character_ = load_character(character_dir_);
+    } catch (const std::exception & ex) {
+        std::cerr << "character store ignored (" << ex.what() << "); using the default character\n";
+        character_ = default_character();
+    }
+    if (auto * model = find_speech_model()) {
+        try {
+            apply_character(*model, character_);
+        } catch (const std::exception & ex) {
+            std::cerr << "character voice not applied (" << ex.what() << "); using the default character\n";
+            character_ = default_character();
+            apply_character(*model, character_);
+        }
+    }
 }
 
 ServerState::~ServerState() {
@@ -935,6 +956,15 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
     }
     else if (request.method == "GET" && request.path == "/v1/audio/voices") {
         response = handle_voices(request);
+    }
+    else if (request.method == "GET" && request.path == "/v1/character") {
+        response = handle_character_get();
+    }
+    else if ((request.method == "POST" || request.method == "PUT") && request.path == "/v1/character") {
+        response = handle_character_set(request);
+    }
+    else if (request.path == "/mcp") {
+        response = handle_mcp(request);
     }
     else if (request.method == "POST" && request.path == "/v1/models/load") {
         response = handle_model_load(request.body);
@@ -2246,6 +2276,195 @@ HttpResponse ServerState::handle_transcription_live(const HttpRequest & request)
                     "}");
             write_sse_done(writer);
         });
+}
+
+ServerState::LoadedModel * ServerState::find_speech_model() {
+    std::lock_guard<std::mutex> state_lock(models_mutex_);
+    for (const auto & model : models_) {
+        if (model->config.task == "tts") {
+            // Entries are never removed, only unloaded, so the pointer stays
+            // valid after the lock is released.
+            return model.get();
+        }
+    }
+    return nullptr;
+}
+
+std::string ServerState::character_name() const {
+    std::lock_guard<std::mutex> lock(character_mutex_);
+    return character_.name;
+}
+
+void ServerState::apply_character(LoadedModel & model, const CharacterConfig & character) {
+    LoadedModel::RuntimeVoicePreset preset;
+    if (character.is_custom()) {
+        // Read outside the metadata lock; only the assignment needs it.
+        preset.audio = minitts::cli::read_audio_buffer(character_dir_ / character.voice_file);
+        if (!character.transcript.empty()) {
+            preset.reference_text = character.transcript;
+        }
+    }
+    std::unique_lock<std::shared_mutex> metadata_lock(model.metadata_mutex);
+    if (!character.is_custom()) {
+        const auto it = model.voice_presets.find(character.preset);
+        if (it == model.voice_presets.end()) {
+            throw std::runtime_error(
+                "character preset '" + character.preset + "' is not a configured voice preset");
+        }
+        preset = it->second;
+    }
+    model.default_voice_preset = std::move(preset);
+}
+
+HttpResponse ServerState::handle_character_get() {
+    CharacterConfig character;
+    {
+        std::lock_guard<std::mutex> lock(character_mutex_);
+        character = character_;
+    }
+    std::string presets = "[";
+    if (auto * model = find_speech_model()) {
+        std::shared_lock<std::shared_mutex> metadata_lock(model->metadata_mutex);
+        std::vector<std::string> names;
+        names.reserve(model->voice_presets.size());
+        for (const auto & [name, preset] : model->voice_presets) {
+            names.push_back(name);
+        }
+        std::sort(names.begin(), names.end());
+        for (size_t index = 0; index < names.size(); ++index) {
+            presets += (index == 0 ? "" : ",") + json_quote(names[index]);
+        }
+    }
+    presets += "]";
+
+    std::string body = "{\"name\":" + json_quote(character.name) +
+        ",\"source\":" + std::string(character.is_custom() ? "\"custom\"" : "\"preset\"");
+    if (!character.is_custom()) {
+        body += ",\"preset\":" + json_quote(character.preset);
+    }
+    if (!character.transcript.empty()) {
+        body += ",\"transcript\":" + json_quote(character.transcript);
+    }
+    body += ",\"available_presets\":" + presets + "}";
+    return json_response(body);
+}
+
+HttpResponse ServerState::handle_character_set(const HttpRequest & request) {
+    auto * model = find_speech_model();
+    if (model == nullptr) {
+        return error_response(400, "no TTS model is configured to give the character a voice", "invalid_request_error");
+    }
+
+    CharacterConfig character;
+    std::string content_type;
+    if (const auto it = request.headers.find("content-type"); it != request.headers.end()) {
+        content_type = it->second;
+    }
+    try {
+        if (const auto boundary = extract_multipart_boundary(content_type)) {
+            // A custom voice: name, transcript, and a WAV recording, stored under
+            // a fixed filename so replacing the character never accumulates files.
+            const auto parts = parse_multipart_body(request.body, *boundary);
+            const MultipartPart * file_part = nullptr;
+            for (const auto & part : parts) {
+                if (part.name == "file" || part.name == "voice") {
+                    file_part = &part;
+                } else if (part.name == "name") {
+                    character.name = part.data;
+                } else if (part.name == "transcript" || part.name == "reference_text") {
+                    character.transcript = part.data;
+                }
+            }
+            if (file_part == nullptr || file_part->data.empty()) {
+                throw std::runtime_error("a custom character voice requires a non-empty 'file' upload");
+            }
+            if (!is_wav_upload_filename(file_part->filename)) {
+                throw std::runtime_error("only WAV uploads are supported for the character voice");
+            }
+            character.name = sanitize_character_name(character.name);
+            std::filesystem::create_directories(character_dir_);
+            const auto voice_path = character_dir_ / "voice.wav";
+            {
+                std::ofstream out(voice_path, std::ios::binary | std::ios::trunc);
+                if (!out) {
+                    throw std::runtime_error("could not write " + voice_path.string());
+                }
+                out.write(file_part->data.data(), static_cast<std::streamsize>(file_part->data.size()));
+                if (!out) {
+                    throw std::runtime_error("could not write " + voice_path.string());
+                }
+            }
+            character.voice_file = "voice.wav";
+        } else {
+            // A bundled voice: {name, preset}.
+            const auto body = engine::io::json::parse(request.body);
+            character.name = sanitize_character_name(engine::io::json::require_string(body, "name"));
+            character.preset = engine::io::json::require_string(body, "preset");
+        }
+        apply_character(*model, character);
+    } catch (const std::exception & ex) {
+        return error_response(400, ex.what(), "invalid_request_error");
+    }
+
+    save_character(character_dir_, character);
+    {
+        std::lock_guard<std::mutex> lock(character_mutex_);
+        character_ = character;
+    }
+    return handle_character_get();
+}
+
+mcp::SpeakOutcome ServerState::run_mcp_speak(const std::string & text, long long seed) {
+    mcp::SpeakOutcome outcome;
+    try {
+        auto * model = find_speech_model();
+        if (model == nullptr) {
+            throw std::runtime_error("no TTS model is configured");
+        }
+        Value::Object fields;
+        fields.emplace("input", Value::make_string(text));
+        if (seed >= 0) {
+            fields.emplace("seed", Value::make_number(static_cast<double>(seed)));
+        }
+        const auto body = Value::make_object(std::move(fields));
+        auto request = build_speech_request(*model, body);
+        if (model_run_mode(*model) == engine::runtime::RunMode::Streaming) {
+            // MCP tool results carry a complete clip, so the streaming session
+            // has to keep the whole output it would otherwise discard.
+            request.options["stream_accumulate"] = "true";
+        }
+        const auto timed_result = model_run_mode(*model) == engine::runtime::RunMode::Streaming
+            ? run_streaming_model(*model, request)
+            : run_model(*model, request);
+        const auto & audio = select_audio_output(timed_result.result);
+        const auto wav = encode_pcm16_wav(audio);
+        outcome.wav_base64 = base64_encode(wav);
+        outcome.audio_seconds = audio_duration_ms(audio) / 1000.0;
+        outcome.ok = true;
+    } catch (const std::exception & ex) {
+        outcome.error_text = ex.what();
+    }
+    return outcome;
+}
+
+HttpResponse ServerState::handle_mcp(const HttpRequest & request) {
+    if (request.method != "POST") {
+        // No server-initiated stream and no session state, so GET and DELETE
+        // have nothing to do here; the spec allows refusing both.
+        HttpResponse response;
+        response.status = 405;
+        response.headers["Allow"] = "POST";
+        response.body = "{\"error\":\"POST a JSON-RPC message to this MCP endpoint\"}";
+        return response;
+    }
+    const auto reply = mcp::handle_mcp_message(
+        request.body,
+        character_name(),
+        [this](const std::string & text, long long seed) { return run_mcp_speak(text, seed); });
+    HttpResponse response;
+    response.status = reply.status;
+    response.body = reply.body;
+    return response;
 }
 
 HttpResponse ServerState::handle_generic_run(const std::string & body_text) {

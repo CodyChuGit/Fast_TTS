@@ -80,6 +80,7 @@ void print_help() {
         << "                                   interval to prevent idle downclocking; 0 disables\n"
         << "  --cuda-keepalive-work-ms <ms>    heartbeat kernel duration; default 50\n"
         << "  --voice-dir <directory>          override the shared reference voice library directory\n"
+        << "  --character-dir <directory>      where the active character voice is persisted\n"
         << "  --cors-origins \"*\"              experimental; disabled by default. Allows browser\n"
         << "                                   requests from any origin for trusted local demos only\n"
         << "\n"
@@ -101,6 +102,11 @@ void print_help() {
         << "  GET  /v1/ui/models/package-sizes package sizes from metadata-only checks\n"
         << "  GET  /v1/audio/voices?model=<id>\n"
         << "  POST /v1/audio/speech\n"
+        << "  GET  /v1/character               the active character (name + voice)\n"
+        << "  POST /v1/character               replace the character: JSON {name, preset} or\n"
+        << "                                   multipart name/transcript/file for a custom voice\n"
+        << "  POST /mcp                        Model Context Protocol endpoint (streamable HTTP)\n"
+        << "                                   with a speak tool that returns WAV audio\n"
         << "  POST /v1/audio/transcriptions\n"
         << "       fields: file, model, language, prompt, stream\n"
         << "       OpenAI-style streaming: speech stream_format=sse|audio, transcription stream=true\n"
@@ -188,6 +194,9 @@ int main(int argc, char ** argv) {
         }
         if (const auto voice_dir = arg_value(argc, argv, "--voice-dir")) {
             config.voice_dir = std::filesystem::path(*voice_dir);
+        }
+        if (const auto character_dir = arg_value(argc, argv, "--character-dir")) {
+            config.character_dir = std::filesystem::path(*character_dir);
         }
         if (!(config.cors_origins == "*" || config.cors_origins == "")) {
             throw std::runtime_error("--cors-origins must be '*' (allow all origins) or '' (disabled)");

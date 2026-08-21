@@ -1435,8 +1435,10 @@ configure_file(
 add_executable(audiocpp_server
     app/server/main.cpp
     app/server/base64.cpp
+    app/server/character.cpp
     app/server/config.cpp
     app/server/http.cpp
+    app/server/mcp.cpp
     app/server/model_installer.cpp
     app/server/multipart.cpp
     app/server/runtime.cpp
@@ -2215,6 +2217,30 @@ if (ENGINE_BUILD_TESTS)
     add_test(
         NAME server_multipart_test
         COMMAND server_multipart_test
+    )
+
+    add_executable(server_mcp_test
+        tests/unittests/test_server_mcp.cpp
+        app/server/mcp.cpp
+    )
+    target_include_directories(server_mcp_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/app/server)
+    target_link_libraries(server_mcp_test PRIVATE engine_runtime ggml)
+
+    add_test(
+        NAME server_mcp_test
+        COMMAND server_mcp_test
+    )
+
+    add_executable(server_character_test
+        tests/unittests/test_server_character.cpp
+        app/server/character.cpp
+    )
+    target_include_directories(server_character_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/app/server)
+    target_link_libraries(server_character_test PRIVATE engine_runtime ggml)
+
+    add_test(
+        NAME server_character_test
+        COMMAND server_character_test
     )
 
     add_executable(server_base64_test
