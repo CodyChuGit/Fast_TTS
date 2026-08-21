@@ -2001,6 +2001,24 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     if (messages == nullptr || !messages->is_array() || messages->as_array().empty()) {
         return error_response(400, "chat requires a non-empty 'messages' array", "invalid_request_error");
     }
+    // Bound the history before it reaches the sidecar: an oversized payload
+    // would otherwise turn into an opaque context-overflow error mid-stream.
+    // ~24k characters comfortably fills the useful part of Peach's 8k-token
+    // context; the client trims its own history well before this.
+    size_t total_content = 0;
+    for (const auto & message : messages->as_array()) {
+        if (const auto * content = message.find("content");
+            content != nullptr && content->is_string()) {
+            total_content += content->as_string().size();
+        }
+    }
+    if (total_content > 24000) {
+        return error_response(
+            400,
+            "chat history is too large (" + std::to_string(total_content) +
+                " characters; the limit is 24000) -- trim older messages",
+            "invalid_request_error");
+    }
 
     CharacterConfig character;
     LlmSettings settings;
@@ -2124,7 +2142,13 @@ void ServerState::chat_orchestrate(
                 return !abort.load();
             });
         auto rest = segmenter.flush();
-        if (!rest.empty()) {
+        // A reply cut off by the token ceiling ends mid-thought. The dangling
+        // fragment still displays as text, but speaking it would stop the
+        // character mid-word -- keep it out of the audio unless it happens to
+        // end like a sentence anyway.
+        const bool truncated_tail = result.finish_reason == "length" &&
+            !ends_with_sentence_terminal(strip_speech_markup(rest));
+        if (!rest.empty() && !truncated_tail) {
             push({ChatEvent::Kind::Sentence, std::move(rest)});
         }
         push({ChatEvent::Kind::LlmDone, result.finish_reason, result.ok, result.error});

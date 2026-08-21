@@ -50,6 +50,12 @@ private:
     bool first_segment_emitted_ = false;
 };
 
+// True when the text ends with sentence-final punctuation (ASCII or CJK),
+// ignoring trailing quotes and whitespace. Used to keep a length-truncated
+// reply's dangling half-sentence out of the audio: text that stops mid-thought
+// reads fine but sounds broken.
+bool ends_with_sentence_terminal(const std::string & text);
+
 // Strips markup that reads badly aloud -- roleplay asterisk actions and
 // markdown emphasis -- while leaving the text itself intact. The display copy
 // keeps the original; only the TTS input goes through this.

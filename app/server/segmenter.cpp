@@ -150,6 +150,35 @@ std::string SentenceSegmenter::flush() {
     return segment;
 }
 
+bool ends_with_sentence_terminal(const std::string & text) {
+    size_t end = text.size();
+    while (end > 0) {
+        const char ch = text[end - 1];
+        if (is_space_byte(ch) || ch == '"' || ch == '\'' || ch == ')' || ch == '*') {
+            --end;
+            continue;
+        }
+        break;
+    }
+    if (end == 0) {
+        return false;
+    }
+    const char last = text[end - 1];
+    if (last == '.' || last == '!' || last == '?') {
+        return true;
+    }
+    // CJK enders are 3-byte UTF-8 sequences.
+    if (end >= 3) {
+        static const char * kCjk[] = {"\xe3\x80\x82", "\xef\xbc\x81", "\xef\xbc\x9f", "\xe2\x80\xa6"};
+        for (const char * ender : kCjk) {
+            if (text.compare(end - 3, 3, ender) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 std::string strip_speech_markup(const std::string & text) {
     std::string out;
     out.reserve(text.size());

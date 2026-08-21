@@ -8,6 +8,7 @@
 namespace {
 
 using minitts::server::SentenceSegmenter;
+using minitts::server::ends_with_sentence_terminal;
 using minitts::server::strip_speech_markup;
 
 void require(bool condition, const std::string & message) {
@@ -106,6 +107,18 @@ void test_a_runon_opener_is_cut_at_a_word_boundary() {
     require(segments[0].find(' ') != std::string::npos, "the cut is at a word boundary, not mid-word");
 }
 
+void test_terminal_detection_for_truncated_tails() {
+    require(ends_with_sentence_terminal("It ends here."), "a period terminates");
+    require(ends_with_sentence_terminal("Really?!"), "stacked enders terminate");
+    require(ends_with_sentence_terminal("\"So it goes.\""), "trailing quotes are ignored");
+    require(ends_with_sentence_terminal(strip_speech_markup("Done. *smiles*")),
+        "a trailing action is stripped before the check at the call site");
+    require(!ends_with_sentence_terminal("and then she was about to"), "mid-thought text does not");
+    require(!ends_with_sentence_terminal("half a word, then a comma,"), "a comma does not terminate");
+    require(!ends_with_sentence_terminal("   "), "whitespace alone does not");
+    require(ends_with_sentence_terminal("\xe5\xa5\xbd\xe3\x80\x82"), "CJK enders terminate");
+}
+
 }  // namespace
 
 int main() {
@@ -117,6 +130,7 @@ int main() {
         test_runons_are_force_split_at_a_space();
         test_speech_markup_is_stripped_for_tts();
         test_a_runon_opener_is_cut_at_a_word_boundary();
+        test_terminal_detection_for_truncated_tails();
     } catch (const std::exception & error) {
         std::cerr << error.what() << '\n';
         return 1;

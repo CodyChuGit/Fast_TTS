@@ -36,10 +36,13 @@ if (Test-Path -LiteralPath $pidFile) {
             $targets += [pscustomobject]@{ Kind = $Matches[1]; ProcessId = [int]$Matches[2] }
         }
     }
-} else {
-    Write-Host "No PID file at $pidFile; matching by process name instead."
-    foreach ($name in @("audiocpp_server", "llama-server")) {
-        foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+}
+# The PID file can go stale -- a sidecar restarted outside the launcher keeps
+# running under a new PID. Always sweep by process name as well; duplicates
+# are de-duplicated below and a process that matches neither name is skipped.
+foreach ($name in @("audiocpp_server", "llama-server")) {
+    foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+        if (-not ($targets | Where-Object { $_.ProcessId -eq $process.Id })) {
             $targets += [pscustomobject]@{ Kind = $name; ProcessId = $process.Id }
         }
     }
