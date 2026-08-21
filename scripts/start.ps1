@@ -146,6 +146,9 @@ $stderrPath = Join-Path $buildRoot "qwen3_tts_server.stderr.log"
 $baseUrl = "http://127.0.0.1:$Port"
 
 if ([string]::IsNullOrWhiteSpace($ModelPath)) {
+    # The 1.7B is the voice-quality pick (the 0.6B measured faster but lost
+    # too much of the clone); pass the 0.6B path explicitly to trade voice
+    # fidelity for ~250 ms per reply.
     $ModelPath = Join-Path $repoRoot "models\Qwen3-TTS-12Hz-1.7B-Base-GGUF\qwen3-tts-12hz-1.7b-base-q8_0_v2.gguf"
 }
 $ModelPath = [System.IO.Path]::GetFullPath($ModelPath)
@@ -154,7 +157,7 @@ if (-not (Test-Path -LiteralPath $serverExe -PathType Leaf)) {
     throw "CUDA server not found: $serverExe"
 }
 if (-not (Test-Path -LiteralPath $ModelPath -PathType Leaf)) {
-    throw "Qwen3-TTS 1.7B Q8 model not found: $ModelPath"
+    throw "Qwen3-TTS model not found: $ModelPath"
 }
 if (-not (Test-Path -LiteralPath $voiceDir -PathType Container)) {
     throw "Demo voice directory not found: $voiceDir"
