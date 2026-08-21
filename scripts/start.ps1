@@ -222,7 +222,7 @@ if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
         name = "Gemma 4 26B heretic"
         path = ($gemmaModelPath -replace "\\", "/")
         # Two expert layers deeper when the small TTS model frees the VRAM.
-        extra_args = @("--n-cpu-moe", $(if ($ModelPath -match '0\.6b') { "5" } else { "7" }),
+        extra_args = @("--n-cpu-moe", $(if ($ModelPath -match '0\.6b|q4_k-mix') { "5" } else { "7" }),
             "-ub", "1024", "--reasoning-budget", "0")
     }
 }
@@ -235,7 +235,7 @@ if (Test-Path -LiteralPath $vanillaGemmaPath -PathType Leaf) {
         id = "gemma-vanilla"
         name = "Gemma 4 26B (vanilla)"
         path = ($vanillaGemmaPath -replace "\\", "/")
-        extra_args = @("--n-cpu-moe", $(if ($ModelPath -match '0\.6b') { "7" } else { "10" }),
+        extra_args = @("--n-cpu-moe", $(if ($ModelPath -match '0\.6b|q4_k-mix') { "7" } else { "10" }),
             "-ub", "1024", "--reasoning-budget", "0")
     }
 }
