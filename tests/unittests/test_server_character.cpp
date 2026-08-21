@@ -235,8 +235,8 @@ void test_reply_length_ramps_across_turns() {
 
     require(length_guidance(settings, 0).find("one or two") != std::string::npos,
         "the opener asks for one or two sentences");
-    require(length_guidance(settings, 5).find("four or five") != std::string::npos,
-        "later turns are allowed more");
+    require(length_guidance(settings, 5).find("three or four") != std::string::npos,
+        "later turns stay disciplined");
 
     settings.length_ramp = false;
     require(ramped_max_tokens(settings, 0) == 140, "disabling the ramp restores the flat ceiling");

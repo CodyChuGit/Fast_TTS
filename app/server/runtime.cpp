@@ -4,6 +4,7 @@
 #include "llm_client.h"
 #include "segmenter.h"
 #include "multipart.h"
+#include "chat_hygiene.h"
 #include "ui_assets.h"
 
 #include "../cli/request.h"
@@ -2157,29 +2158,18 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     const int64_t llm_seed = engine::io::json::optional_i64(body, "seed", -1);
     const int64_t tts_seed = engine::io::json::optional_i64(body, "tts_seed", -1);
 
+    // The system prompt is deliberately STATIC across turns (master prompt,
+    // the bracketed-note contract, and the ramp-tier guidance): per-turn
+    // steering rides inside the newest user message instead, so the prompt
+    // cache keeps first-token latency low.
     const std::string system_prompt =
         render_master_prompt(settings, character.name, character.persona) +
+        hygiene::kNoteRule +
         length_guidance(settings, assistant_turns);
 
-    // Build the llama.cpp request by hand: cache_prompt keeps the chat prefix
-    // KV resident across turns, so each turn's prefill covers only what is new.
-    std::string llama_body = "{\"stream\":true,\"cache_prompt\":true";
-    llama_body += ",\"temperature\":" + std::to_string(temperature);
-    llama_body += ",\"top_p\":" + std::to_string(top_p);
-    llama_body += ",\"repeat_penalty\":" + std::to_string(repeat_penalty);
-    llama_body += ",\"max_tokens\":" + std::to_string(max_tokens);
-    if (llm_seed >= 0) {
-        llama_body += ",\"seed\":" + std::to_string(llm_seed);
-    }
-    llama_body += ",\"messages\":[";
-    bool first_message = true;
+    // Validate roles first, then collect what the steering note needs: the
+    // sanitized assistant history and the newest user message.
     const auto & list = messages->as_array();
-    const bool client_has_system = list[0].find("role") != nullptr &&
-        list[0].find("role")->is_string() && list[0].find("role")->as_string() == "system";
-    if (!client_has_system) {
-        llama_body += "{\"role\":\"system\",\"content\":" + json_quote(system_prompt) + "}";
-        first_message = false;
-    }
     for (const auto & message : list) {
         const auto * role = message.find("role");
         const auto * content = message.find("content");
@@ -2190,9 +2180,60 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
         if (role_name != "system" && role_name != "user" && role_name != "assistant") {
             return error_response(400, "message roles must be system, user, or assistant", "invalid_request_error");
         }
+    }
+    std::vector<std::string> assistant_history;
+    size_t last_user_index = list.size();
+    for (size_t i = 0; i < list.size(); ++i) {
+        const auto & role_name = list[i].find("role")->as_string();
+        if (role_name == "assistant") {
+            assistant_history.push_back(
+                hygiene::sanitize_assistant_text(list[i].find("content")->as_string()));
+        } else if (role_name == "user") {
+            last_user_index = i;
+        }
+    }
+
+    // Build the llama.cpp request by hand: cache_prompt keeps the chat prefix
+    // KV resident across turns, so each turn's prefill covers only what is
+    // new. The stop strings end generation at role leakage (even Peach's
+    // habit of continuing the dialogue as the user) and at the blank line
+    // where a drifting model starts re-answering old turns.
+    std::string llama_body = "{\"stream\":true,\"cache_prompt\":true";
+    llama_body += ",\"stop\":[\"<|im_end|>\",\"<|im_start|>\",\"\\n\\n\"]";
+    // The DRY sampler stops the model from recycling whole sentences it wrote
+    // dozens of turns ago (goodnight sign-offs were coming back verbatim);
+    // allowed_length 4 leaves ordinary short phrases untouched.
+    llama_body += ",\"dry_multiplier\":0.8,\"dry_base\":1.75"
+                  ",\"dry_allowed_length\":4,\"dry_penalty_last_n\":8192";
+    llama_body += ",\"temperature\":" + std::to_string(temperature);
+    llama_body += ",\"top_p\":" + std::to_string(top_p);
+    llama_body += ",\"repeat_penalty\":" + std::to_string(repeat_penalty);
+    llama_body += ",\"max_tokens\":" + std::to_string(max_tokens);
+    if (llm_seed >= 0) {
+        llama_body += ",\"seed\":" + std::to_string(llm_seed);
+    }
+    llama_body += ",\"messages\":[";
+    bool first_message = true;
+    const bool client_has_system = list[0].find("role")->as_string() == "system";
+    if (!client_has_system) {
+        llama_body += "{\"role\":\"system\",\"content\":" + json_quote(system_prompt) + "}";
+        first_message = false;
+    }
+    size_t assistant_seen = 0;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const auto & role_name = list[i].find("role")->as_string();
+        std::string content_text = list[i].find("content")->as_string();
+        if (role_name == "assistant") {
+            // The model's own past, cleaned: feeding it raw teaches it to
+            // imitate its own markup and drift.
+            content_text = assistant_history[assistant_seen++];
+        } else if (role_name == "user" && i == last_user_index) {
+            content_text += "\n[" +
+                hygiene::turn_anchor(content_text, assistant_history) + "]";
+        }
         llama_body += std::string(first_message ? "" : ",") +
             "{\"role\":" + json_quote(role_name) +
-            ",\"content\":" + json_quote(content->as_string()) + "}";
+            ",\"content\":" + json_quote(content_text) + "}";
         first_message = false;
     }
     llama_body += "]}";
@@ -2234,17 +2275,28 @@ void ServerState::chat_orchestrate(
 
     std::thread llm_thread([&] {
         SentenceSegmenter segmenter;
+        // The scrubber cleans the stream before ANYONE sees it: the transcript
+        // the client renders, the sentences the TTS speaks, and (next turn)
+        // the history the model re-reads all stay free of roleplay markup.
+        hygiene::StreamScrubber scrubber;
+        auto emit = [&](const std::string & clean) {
+            if (clean.empty()) {
+                return;
+            }
+            push({ChatEvent::Kind::Token, clean});
+            for (auto & sentence : segmenter.feed(clean)) {
+                push({ChatEvent::Kind::Sentence, std::move(sentence)});
+            }
+        };
         const auto result = llm::stream_chat(
             config_.llm_host,
             config_.llm_port,
             llama_body,
             [&](const std::string & delta) {
-                push({ChatEvent::Kind::Token, delta});
-                for (auto & sentence : segmenter.feed(delta)) {
-                    push({ChatEvent::Kind::Sentence, std::move(sentence)});
-                }
+                emit(scrubber.feed(delta));
                 return !abort.load();
             });
+        emit(scrubber.flush());
         auto rest = segmenter.flush();
         // A reply cut off by the token ceiling ends mid-thought. The dangling
         // fragment still displays as text, but speaking it would stop the
