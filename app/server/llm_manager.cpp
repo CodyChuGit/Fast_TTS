@@ -69,6 +69,11 @@ bool LlmManager::start(const LlmModelSpec & spec, std::string & error) {
         "--cache-reuse", "256",
         "--parallel", "1",
         "-t", "6",
+        // CPU-resident tensors (MoE expert offload) load as real memory, not
+        // mmap: mapped pages get evicted whenever a game or browser wants
+        // RAM, and the next chat then page-faults experts back from disk.
+        // The host has RAM to spare; llama itself recommends this.
+        "--load-mode", "none",
     };
     for (const auto & extra : spec.extra_args) {
         args.push_back(extra);

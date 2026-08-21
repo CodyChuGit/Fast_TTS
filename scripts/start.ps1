@@ -566,6 +566,11 @@ if (-not $SkipWarmup -and $WarmVoices.Count -gt 0) {
     }
 }
 
+# (A background page-cache warm of the whole model menu was tried here and
+# removed: streaming ~70 GB of GGUFs competes with the CPU-resident experts
+# for memory bandwidth and showed up as multi-second first-token spikes
+# mid-chat. Model switches simply pay their disk read.)
+
 # The sidecar is the server's child, so its PID is discovered from the port it
 # serves; stop.ps1 uses the file as a hint and name-sweeps regardless.
 $llmPid = if ($llmAvailable) { Get-ListeningProcessId -LocalPort $LlmPort } else { 0 }
