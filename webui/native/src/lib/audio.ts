@@ -113,6 +113,13 @@ export class Pcm16StreamPlayer {
   private underruns = 0;
   private rebuffering = false;
   private rebufferTargetSeconds = 0;
+  // Caption sync: each scheduled buffer records where it starts on the
+  // context clock and where it falls in the pushed PCM stream, so the UI can
+  // ask which stream second is at the speakers right now.
+  private segments: Array<{ ctxStart: number; streamStart: number; seconds: number }> = [];
+  private scheduledSeconds = 0;
+  private receivedSeconds = 0;
+  private lastPlayedSeconds = 0;
 
   constructor(
     sampleRate: number,
@@ -158,6 +165,7 @@ export class Pcm16StreamPlayer {
     if (!completeBytes) return;
 
     const frames = completeBytes / frameBytes;
+    this.receivedSeconds += frames / this.sampleRate;
     const audio = this.context.createBuffer(this.channels, frames, this.sampleRate);
     const view = new DataView(bytes.buffer, bytes.byteOffset, completeBytes);
     for (let channel = 0; channel < this.channels; channel += 1) {
@@ -250,8 +258,38 @@ export class Pcm16StreamPlayer {
     const floorLead = this.hasScheduledAudio ? CONTINUATION_LEAD_SECONDS : 0;
     const startAt = Math.max(this.nextStartTime, this.context.currentTime + floorLead);
     source.start(startAt);
-    this.nextStartTime = startAt + audio.length / this.sampleRate;
+    const seconds = audio.length / this.sampleRate;
+    this.segments.push({ ctxStart: startAt, streamStart: this.scheduledSeconds, seconds });
+    if (this.segments.length > 512) this.segments.splice(0, 256);
+    this.scheduledSeconds += seconds;
+    this.nextStartTime = startAt + seconds;
     this.hasScheduledAudio = true;
+  }
+
+  // The stream position (seconds of pushed PCM) currently at the speakers.
+  // Between scheduled buffers (an underrun gap) the position holds at the end
+  // of the last played buffer; after the context is released it stays frozen.
+  playedSeconds(): number {
+    const context = this.context;
+    if (!context) return this.lastPlayedSeconds;
+    const now = context.currentTime;
+    for (let index = this.segments.length - 1; index >= 0; index -= 1) {
+      const segment = this.segments[index];
+      if (now >= segment.ctxStart) {
+        this.lastPlayedSeconds = Math.min(
+          segment.streamStart + (now - segment.ctxStart),
+          segment.streamStart + segment.seconds
+        );
+        break;
+      }
+    }
+    return this.lastPlayedSeconds;
+  }
+
+  // Seconds of complete PCM received so far, including audio still queued in
+  // the jitter buffer -- the caption layer's generation frontier.
+  bufferedSeconds(): number {
+    return this.receivedSeconds;
   }
 
   async finish(): Promise<void> {
@@ -303,6 +341,7 @@ export class Pcm16StreamPlayer {
   }
 
   private releaseContext(): void {
+    if (this.context) this.playedSeconds();
     this.context = null;
     this.stopped = true;
   }

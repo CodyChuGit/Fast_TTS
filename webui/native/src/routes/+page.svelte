@@ -32,9 +32,10 @@
     type ServerHealth,
     type SpeakStats
   } from '$lib/client';
+  import { CaptionTimeline } from '$lib/karaoke';
   import '../app.css';
 
-  let view: 'speak' | 'chat' | 'settings' = 'speak';
+  let view: 'speak' | 'chat' | 'settings' | 'live' = 'speak';
   let server: ServerHealth | null = null;
   let active: Character | null = null;
 
@@ -47,6 +48,23 @@
   let lastWavUrl = '';
   let aborter: AbortController | null = null;
   let player: Pcm16StreamPlayer | null = null;
+
+  // Live view: the minimalist sing-along stage. Words of the input light up
+  // exactly as the voice reaches them, driven by the player's playback clock
+  // against a caption timeline that snaps to the true clip length at the end.
+  let liveText = '';
+  let liveSpeaking = false;
+  let liveDone = false;
+  let liveError = '';
+  let liveWavUrl = '';
+  let liveAborter: AbortController | null = null;
+  let livePlayer: Pcm16StreamPlayer | null = null;
+  let liveTimeline: CaptionTimeline | null = null;
+  let liveWords: string[] = [];
+  let liveVisible = 0;
+  let liveRaf = 0;
+  let liveStage: HTMLElement | null = null;
+  let liveScrollQueued = false;
 
   // Settings view. The form is populated from the server once (and again after
   // each save), never on navigation -- switching to Speak and back must not
@@ -264,6 +282,105 @@
 
   function stop() {
     aborter?.abort();
+  }
+
+  function stopLiveLoop() {
+    if (liveRaf) cancelAnimationFrame(liveRaf);
+    liveRaf = 0;
+  }
+
+  // Keeps the word being spoken in the middle of the stage without ever
+  // scrolling the page itself.
+  function queueLiveScroll() {
+    if (liveScrollQueued) return;
+    liveScrollQueued = true;
+    requestAnimationFrame(() => {
+      liveScrollQueued = false;
+      const stage = liveStage;
+      if (!stage) return;
+      const current = stage.querySelector<HTMLElement>('.live-word.current') ??
+        stage.querySelector<HTMLElement>('.live-word.shown:last-of-type');
+      if (!current) return;
+      const target = current.offsetTop - stage.clientHeight * 0.45;
+      if (Math.abs(stage.scrollTop - target) > 8) {
+        stage.scrollTo({ top: Math.max(0, target), behavior: 'smooth' });
+      }
+    });
+  }
+
+  function startLiveLoop() {
+    stopLiveLoop();
+    const step = () => {
+      if (livePlayer && liveTimeline) {
+        const count = liveTimeline.update(livePlayer.playedSeconds());
+        if (count !== liveVisible) {
+          liveVisible = count;
+          queueLiveScroll();
+        }
+      }
+      liveRaf = requestAnimationFrame(step);
+    };
+    liveRaf = requestAnimationFrame(step);
+  }
+
+  async function liveSpeak() {
+    const input = liveText.trim();
+    if (!input || liveSpeaking) return;
+    liveSpeaking = true;
+    liveDone = false;
+    liveError = '';
+    if (liveWavUrl) {
+      URL.revokeObjectURL(liveWavUrl);
+      liveWavUrl = '';
+    }
+    liveTimeline = new CaptionTimeline(input);
+    liveWords = liveTimeline.words.map((word) => word.text);
+    liveVisible = 0;
+    liveStage?.scrollTo({ top: 0 });
+    liveAborter = new AbortController();
+    try {
+      await primePcm16Playback();
+      livePlayer = new Pcm16StreamPlayer(24000, 1);
+      await livePlayer.start();
+      startLiveLoop();
+      const result = await speakStream(input, null, (chunk) => livePlayer?.push(chunk), liveAborter.signal);
+      // The true clip length is now known; the words still ahead re-pace to it.
+      liveTimeline.finish(result.stats.audioSeconds);
+      await livePlayer.finish();
+      liveVisible = liveTimeline.revealAll();
+      liveWavUrl = URL.createObjectURL(encodePcm16BytesWav(result.chunks, 24000, 1));
+      liveDone = true;
+    } catch (error) {
+      if ((error as Error)?.name !== 'AbortError') {
+        liveError = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      stopLiveLoop();
+      await livePlayer?.stop();
+      livePlayer = null;
+      liveSpeaking = false;
+      liveAborter = null;
+    }
+  }
+
+  function liveStop() {
+    liveAborter?.abort();
+  }
+
+  function liveClear() {
+    if (liveSpeaking) return;
+    liveWords = [];
+    liveVisible = 0;
+    liveDone = false;
+    liveError = '';
+    liveTimeline = null;
+  }
+
+  function liveKeydown(event: KeyboardEvent) {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      void liveSpeak();
+    }
   }
 
   function recordingMimeType() {
@@ -526,9 +643,12 @@
 
   onDestroy(() => {
     aborter?.abort();
+    liveAborter?.abort();
+    stopLiveLoop();
     if (recorder?.state === 'recording') recorder.stop();
     recordingStream?.getTracks().forEach((track) => track.stop());
     if (lastWavUrl) URL.revokeObjectURL(lastWavUrl);
+    if (liveWavUrl) URL.revokeObjectURL(liveWavUrl);
     void closePcm16Playback();
   });
 </script>
@@ -547,6 +667,7 @@
   </div>
   <nav>
     <button class:active={view === 'speak'} on:click={() => (view = 'speak')}>Speak</button>
+    <button class:active={view === 'live'} on:click={() => (view = 'live')}>Live</button>
     {#if server?.llm}
       <button class:active={view === 'chat'} on:click={() => (view = 'chat')}>Chat</button>
     {/if}
@@ -626,6 +747,47 @@
           stream sentences to this server as they are generated — an Open WebUI-side change.
         </p>
       </details>
+    </section>
+  {:else if view === 'live'}
+    <section class="live-stage">
+      <div class="live-caption" bind:this={liveStage}>
+        {#if liveWords.length}
+          <p class="live-line">
+            {#each liveWords as word, index}
+              <span
+                class="live-word"
+                class:shown={index < liveVisible}
+                class:current={liveSpeaking && index === liveVisible - 1}
+              >{word}</span>
+            {/each}
+          </p>
+        {:else}
+          <p class="live-empty">Words appear here the instant they're spoken.</p>
+        {/if}
+      </div>
+      {#if liveError}
+        <p class="live-error">{liveError}</p>
+      {/if}
+      <div class="live-bar">
+        <textarea
+          rows="1"
+          bind:value={liveText}
+          disabled={liveSpeaking}
+          on:keydown={liveKeydown}
+          placeholder="Type something and press Enter…"
+        ></textarea>
+        {#if liveSpeaking}
+          <button class="danger" on:click={liveStop}>Stop</button>
+        {:else}
+          <button class="primary" on:click={liveSpeak} disabled={!liveText.trim()}>Speak</button>
+        {/if}
+        {#if liveWords.length && !liveSpeaking}
+          {#if liveWavUrl && liveDone}
+            <a class="ghost" href={liveWavUrl} download="speech.wav">WAV</a>
+          {/if}
+          <button class="ghost" on:click={liveClear}>Clear</button>
+        {/if}
+      </div>
     </section>
   {:else if view === 'chat'}
     <section class="hero">

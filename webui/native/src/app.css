@@ -181,3 +181,49 @@ button.slim { min-height: 32px; padding: 4px 10px; font-size: 12px; }
 .llm-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px 14px; margin-top: 4px; }
 .llm-grid small { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.35; }
 @media (max-width: 640px) { .llm-grid { grid-template-columns: 1fr; } }
+
+/* Live caption stage — the minimalist sing-along view. Fixed to the viewport
+   below the topbar so nothing but the words and one input row is on screen. */
+.live-stage {
+  position: fixed; inset: 58px 0 0; z-index: 4; display: flex; flex-direction: column;
+  background:
+    radial-gradient(circle at 50% 120%, rgba(45, 107, 189, .14), transparent 42rem),
+    var(--bg);
+}
+.live-caption {
+  position: relative; flex: 1; overflow-y: auto; scrollbar-width: none;
+  padding: 10vh max(6vw, calc((100vw - 1100px) / 2)) 30vh;
+}
+.live-caption::-webkit-scrollbar { display: none; }
+.live-line {
+  margin: 0; font-size: clamp(28px, 4.4vw, 52px); font-weight: 700;
+  line-height: 1.55; letter-spacing: -.015em;
+}
+.live-word {
+  display: inline-block; margin-right: .42ch; color: #dce8fa;
+  opacity: .07; transform: translateY(.28em);
+  transition: opacity .13s ease-out, transform .13s ease-out, color .13s ease-out;
+}
+.live-word.shown { opacity: 1; transform: none; }
+.live-word.current {
+  color: var(--cyan);
+  text-shadow: 0 0 26px rgba(66, 232, 213, .45);
+}
+.live-empty {
+  display: grid; place-items: center; height: 100%; margin: 0;
+  color: #44608a; font-size: 15px; font-weight: 600; letter-spacing: .02em;
+}
+.live-error {
+  margin: 0; padding: 8px max(6vw, calc((100vw - 1100px) / 2));
+  color: var(--danger); font-size: 13px;
+}
+.live-bar {
+  display: flex; gap: 9px; align-items: flex-end;
+  padding: 13px max(6vw, calc((100vw - 1100px) / 2)) 18px;
+  border-top: 1px solid var(--line); background: rgba(7, 16, 31, .92);
+  backdrop-filter: blur(7px);
+}
+.live-bar textarea {
+  flex: 1; resize: none; min-height: 44px; max-height: 26vh; font-size: 15px;
+}
+.live-bar .ghost, .live-bar .primary, .live-bar .danger { flex: 0 0 auto; }
