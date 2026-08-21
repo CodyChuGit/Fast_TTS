@@ -146,10 +146,11 @@ $stderrPath = Join-Path $buildRoot "qwen3_tts_server.stderr.log"
 $baseUrl = "http://127.0.0.1:$Port"
 
 if ([string]::IsNullOrWhiteSpace($ModelPath)) {
-    # The 1.7B is the voice-quality pick (the 0.6B measured faster but lost
-    # too much of the clone); pass the 0.6B path explicitly to trade voice
-    # fidelity for ~250 ms per reply.
-    $ModelPath = Join-Path $repoRoot "models\Qwen3-TTS-12Hz-1.7B-Base-GGUF\qwen3-tts-12hz-1.7b-base-q8_0_v2.gguf"
+    # The ear-approved default: the 1.7B talker at q4_k with the speech codec
+    # kept at f16 (a homemade audiocpp_gguf requant). Same voice as the stock
+    # q8_0 package to the ear, and the freed VRAM funds two more Gemma expert
+    # layers on the GPU. The q8_0_v2 package stays on disk as the fallback.
+    $ModelPath = Join-Path $repoRoot "models\Qwen3-TTS-12Hz-1.7B-Base-GGUF\qwen3-tts-12hz-1.7b-base-q4_k-mix.gguf"
 }
 $ModelPath = [System.IO.Path]::GetFullPath($ModelPath)
 

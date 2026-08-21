@@ -2272,7 +2272,7 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     // dozens of turns ago (goodnight sign-offs were coming back verbatim);
     // allowed_length 4 leaves ordinary short phrases untouched.
     llama_body += ",\"dry_multiplier\":0.8,\"dry_base\":1.75"
-                  ",\"dry_allowed_length\":4,\"dry_penalty_last_n\":8192";
+                  ",\"dry_allowed_length\":4,\"dry_penalty_last_n\":4096";
     llama_body += ",\"temperature\":" + std::to_string(temperature);
     llama_body += ",\"top_p\":" + std::to_string(top_p);
     llama_body += ",\"repeat_penalty\":" + std::to_string(repeat_penalty);
@@ -2369,7 +2369,12 @@ void ServerState::chat_orchestrate(
     };
 
     std::thread llm_thread([&] {
-        SentenceSegmenter segmenter;
+        // Chat cuts the opening clause earlier than the default: with decode
+        // at ~58 t/s the difference between 28 and 16 buffered characters is
+        // ~50 ms of silence before the first sound, and a short first clause
+        // at a comma boundary speaks naturally. Only the first segment is
+        // compromised; every later one is a whole sentence.
+        SentenceSegmenter segmenter(SentenceSegmenter::Options{16, 28, 300});
         // The scrubber cleans the stream before ANYONE sees it: the transcript
         // the client renders, the sentences the TTS speaks, and (next turn)
         // the history the model re-reads all stay free of roleplay markup.
