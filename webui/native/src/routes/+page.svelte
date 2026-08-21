@@ -74,6 +74,7 @@
   let chatAborter: AbortController | null = null;
   let chatPlayer: Pcm16StreamPlayer | null = null;
   let chatLog: HTMLElement | null = null;
+  let chatScrollQueued = false;
 
   // MCP panel.
   let endpoint = '';
@@ -355,7 +356,13 @@
           const last = chatMessages[chatMessages.length - 1];
           last.content += event.text;
           chatMessages = chatMessages;
-          queueMicrotask(() => chatLog?.scrollTo({ top: chatLog.scrollHeight }));
+          if (!chatScrollQueued) {
+            chatScrollQueued = true;
+            requestAnimationFrame(() => {
+              chatScrollQueued = false;
+              chatLog?.scrollTo({ top: chatLog.scrollHeight });
+            });
+          }
         } else if (event.type === 'audio') {
           chatPlayer?.push(base64ToBytes(event.audio));
         } else if (event.type === 'error') {

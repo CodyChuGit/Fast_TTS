@@ -11,6 +11,15 @@ function writeAscii(view: DataView, offset: number, text: string) {
 // chunks do not click.
 const INITIAL_PLAYBACK_LEAD_SECONDS = 0.064;
 const CONTINUATION_LEAD_SECONDS = 0.01;
+// Startup jitter buffer: hold this much audio (three 80 ms codec frames)
+// before the first sample plays, or start anyway once the deadline passes.
+// Warm generation outpaces playback 2-3x, so a reserve established once never
+// shrinks; it exists purely to ride out the uneven arrival of the first
+// chunks.
+const DEFAULT_START_BUFFER_SECONDS = 0.24;
+const DEFAULT_START_MAX_WAIT_MS = 350;
+// Ceiling for the re-arm lead after repeated mid-stream underruns.
+const MAX_UNDERRUN_LEAD_SECONDS = 0.32;
 
 // Keep one interactive output context alive for the page lifetime. Creating,
 // resuming, and closing a context around every request adds work directly on
@@ -80,6 +89,8 @@ export function encodePcm16BytesWav(
 export class Pcm16StreamPlayer {
   private readonly sampleRate: number;
   private readonly channels: number;
+  private readonly startBufferSeconds: number;
+  private readonly startMaxWaitMs: number;
   private context: AudioContext | null = null;
   private nextStartTime = 0;
   private carry = new Uint8Array(0);
@@ -88,10 +99,21 @@ export class Pcm16StreamPlayer {
   private stopped = false;
   private initialPlaybackLeadSeconds = INITIAL_PLAYBACK_LEAD_SECONDS;
   private hasScheduledAudio = false;
+  private begun = false;
+  private pending: AudioBuffer[] = [];
+  private pendingSeconds = 0;
+  private startTimer: ReturnType<typeof setTimeout> | null = null;
+  private underruns = 0;
 
-  constructor(sampleRate: number, channels = 1) {
+  constructor(
+    sampleRate: number,
+    channels = 1,
+    options: { startBufferSeconds?: number; startMaxWaitMs?: number } = {}
+  ) {
     this.sampleRate = sampleRate;
     this.channels = channels;
+    this.startBufferSeconds = options.startBufferSeconds ?? DEFAULT_START_BUFFER_SECONDS;
+    this.startMaxWaitMs = options.startMaxWaitMs ?? DEFAULT_START_MAX_WAIT_MS;
   }
 
   async start(): Promise<void> {
@@ -104,7 +126,7 @@ export class Pcm16StreamPlayer {
     if (!Number.isFinite(seconds) || seconds < 0) {
       throw new Error('Initial PCM playback lead must be a non-negative finite number.');
     }
-    if (this.sources.size || this.nextStartTime > (this.context?.currentTime || 0)) {
+    if (this.begun || this.sources.size) {
       throw new Error('Initial PCM playback lead must be set before the first audio chunk.');
     }
     this.initialPlaybackLeadSeconds = seconds;
@@ -136,6 +158,46 @@ export class Pcm16StreamPlayer {
       }
     }
 
+    // Startup jitter buffer. Generation runs faster than real time, but the
+    // FIRST chunks arrive unevenly (prefill tail, graph capture, event
+    // batching); starting on the very first 80 ms frame therefore stutters.
+    // Hold playback until a few frames are queued -- once that reserve exists,
+    // the faster-than-real-time producer only ever grows it. The deadline
+    // bounds added latency when a clip is shorter than the reserve.
+    if (!this.begun) {
+      this.pending.push(audio);
+      this.pendingSeconds += frames / this.sampleRate;
+      if (this.pendingSeconds >= this.startBufferSeconds) {
+        this.beginPlayback();
+      } else if (this.startTimer === null) {
+        this.startTimer = setTimeout(() => {
+          this.startTimer = null;
+          if (!this.begun && !this.stopped) this.beginPlayback();
+        }, this.startMaxWaitMs);
+      }
+      return;
+    }
+    this.scheduleBuffer(audio);
+  }
+
+  private beginPlayback(): void {
+    if (this.begun || !this.context) return;
+    this.begun = true;
+    if (this.startTimer !== null) {
+      clearTimeout(this.startTimer);
+      this.startTimer = null;
+    }
+    this.nextStartTime = this.context.currentTime + this.initialPlaybackLeadSeconds;
+    const queued = this.pending;
+    this.pending = [];
+    this.pendingSeconds = 0;
+    for (const buffer of queued) {
+      this.scheduleBuffer(buffer);
+    }
+  }
+
+  private scheduleBuffer(audio: AudioBuffer): void {
+    if (!this.context) return;
     const source = this.context.createBufferSource();
     source.buffer = audio;
     source.connect(this.context.destination);
@@ -149,19 +211,36 @@ export class Pcm16StreamPlayer {
     };
     this.sources.add(source);
 
-    const streamNeedsBuffer = this.nextStartTime <= this.context.currentTime;
-    const leadTime = streamNeedsBuffer
-      ? (this.hasScheduledAudio ? INITIAL_PLAYBACK_LEAD_SECONDS : this.initialPlaybackLeadSeconds)
-      : CONTINUATION_LEAD_SECONDS;
-    const startAt = Math.max(this.nextStartTime, this.context.currentTime + leadTime);
+    const floorLead = this.hasScheduledAudio ? CONTINUATION_LEAD_SECONDS : 0;
+    let startAt = Math.max(this.nextStartTime, this.context.currentTime + floorLead);
+    if (this.hasScheduledAudio && this.nextStartTime <= this.context.currentTime) {
+      // A real underrun: the stream drained mid-playback. Re-arm with a lead
+      // that grows on every repeat, so persistent jitter converges on a buffer
+      // deep enough to absorb it instead of clicking at every chunk.
+      this.underruns += 1;
+      const lead = Math.min(
+        INITIAL_PLAYBACK_LEAD_SECONDS * (1 + this.underruns),
+        MAX_UNDERRUN_LEAD_SECONDS
+      );
+      startAt = this.context.currentTime + lead;
+    }
     source.start(startAt);
-    this.nextStartTime = startAt + frames / this.sampleRate;
+    this.nextStartTime = startAt + audio.length / this.sampleRate;
     this.hasScheduledAudio = true;
   }
 
   async finish(): Promise<void> {
     if (!this.context || this.stopped) return;
     this.carry = new Uint8Array(0);
+    // A clip shorter than the startup reserve never crossed the threshold;
+    // play what was gathered.
+    if (!this.begun && this.pending.length) {
+      this.beginPlayback();
+    }
+    if (this.startTimer !== null) {
+      clearTimeout(this.startTimer);
+      this.startTimer = null;
+    }
     if (this.sources.size) {
       await new Promise<void>((resolve) => {
         this.drainResolver = resolve;
@@ -174,6 +253,12 @@ export class Pcm16StreamPlayer {
     if (this.stopped) return;
     this.stopped = true;
     this.carry = new Uint8Array(0);
+    this.pending = [];
+    this.pendingSeconds = 0;
+    if (this.startTimer !== null) {
+      clearTimeout(this.startTimer);
+      this.startTimer = null;
+    }
     for (const source of this.sources) {
       try {
         source.stop();
