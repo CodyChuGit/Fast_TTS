@@ -206,16 +206,18 @@ if (Test-Path -LiteralPath $LlmModelPath -PathType Leaf) {
     }
 }
 if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
-    # 16.8 GB of Q4_K_M cannot sit beside the resident TTS model on a 24 GB
-    # card, so the MoE expert tensors stay in system RAM; attention and the
-    # dense layers still run on the GPU. Gemma 4 is a reasoning model, and a
-    # voice conversation cannot wait through a hidden think phase -- a zero
+    # All 16.8 GB of Q4_K_M cannot sit beside the resident TTS model on a
+    # 24 GB card, but most of it can: only the first 10 layers' MoE experts
+    # stay in system RAM (measured on this 3090: prompt 381 t/s and decode
+    # 44 t/s versus 129/17 with everything on the CPU, at 13.3 GB -- the same
+    # total footprint as the Peach setup). Gemma 4 is a reasoning model, and
+    # a voice conversation cannot wait through a hidden think phase -- a zero
     # reasoning budget makes it answer directly.
     $llmModels += , [ordered]@{
         id = "gemma"
         name = "Gemma 4 26B heretic"
         path = ($gemmaModelPath -replace "\\", "/")
-        extra_args = @("--n-cpu-moe", "99", "--reasoning-budget", "0")
+        extra_args = @("--n-cpu-moe", "10", "--reasoning-budget", "0")
     }
 }
 $llmAvailable = $false
@@ -286,11 +288,11 @@ $configJson = $effectiveConfig | ConvertTo-Json -Depth 8
     [System.Text.UTF8Encoding]::new($false))
 
 # ---- VRAM preflight ---------------------------------------------------------
-# Budget on a 24 GB card: Qwen3-TTS resident ~6.5 GB, Peach-2.0 Q8 weights
-# ~9.4 GB + 8k KV ~1 GB, CUDA runtime overhead ~1.5 GB. Anything already
-# serving on our ports is reused, so its memory does not count against a
-# fresh launch.
-$RequiredVramMiB = 19000
+# Budget on a 24 GB card: Qwen3-TTS resident ~6.5 GB, the chat model up to
+# ~13.3 GB (Gemma 26B with 10 expert layers on the CPU; Peach Q8 is ~11.5 GB),
+# CUDA runtime overhead ~1.5 GB. Anything already serving on our ports is
+# reused, so its memory does not count against a fresh launch.
+$RequiredVramMiB = 21000
 try {
     $freeVram = [int](& nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits --id=$Device 2>$null |
         Select-Object -First 1)
