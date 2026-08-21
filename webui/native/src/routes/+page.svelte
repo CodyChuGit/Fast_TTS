@@ -14,6 +14,7 @@
     setCharacterCustom,
     setCharacterPreset,
     speakStream,
+    updateCharacter,
     type Character,
     type ServerHealth,
     type SpeakStats
@@ -34,7 +35,10 @@
   let aborter: AbortController | null = null;
   let player: Pcm16StreamPlayer | null = null;
 
-  // Settings view.
+  // Settings view. The form is populated from the server once (and again after
+  // each save), never on navigation -- switching to Speak and back must not
+  // discard what the user was editing.
+  let formReady = false;
   let editName = '';
   let voiceSource: 'preset' | 'custom' = 'preset';
   let editPreset = '';
@@ -51,7 +55,14 @@
   let endpoint = '';
   let copied = false;
 
-  $: characterName = active?.name || 'F';
+  function populateForm(from: Character | null) {
+    editName = from?.name || '';
+    voiceSource = from?.source === 'custom' ? 'custom' : 'preset';
+    editPreset = from?.preset || from?.available_presets?.[0] || '';
+    customTranscript = from?.transcript || '';
+    customFile = null;
+    formReady = true;
+  }
 
   async function refresh() {
     try {
@@ -61,20 +72,10 @@
     }
     try {
       active = await fetchCharacter();
+      if (!formReady) populateForm(active);
     } catch {
       active = null;
     }
-  }
-
-  function beginEdit() {
-    view = 'settings';
-    settingsStatus = '';
-    settingsError = '';
-    editName = active?.name || 'F';
-    voiceSource = active?.source === 'custom' ? 'custom' : 'preset';
-    editPreset = active?.preset || active?.available_presets?.[0] || '';
-    customTranscript = active?.transcript || '';
-    customFile = null;
   }
 
   async function speak() {
@@ -175,17 +176,21 @@
       if (voiceSource === 'preset') {
         if (!editPreset) throw new Error('Choose a bundled voice.');
         active = await setCharacterPreset(editName, editPreset);
-      } else {
-        if (!customFile) throw new Error('Choose or record a voice sample.');
+      } else if (customFile) {
+        // A new recording replaces the voice.
         if (!customTranscript.trim()) {
           throw new Error('Enter the transcript of what the sample says — cloning quality depends on it.');
         }
-        // The server takes WAV; browser recordings and compressed files are
-        // decoded here first.
         const wav = await browserDecodeToWav(customFile);
         active = await setCharacterCustom(editName, customTranscript.trim(), wav);
+      } else if (active?.source === 'custom') {
+        // No new recording: keep the saved voice, update name and transcript.
+        active = await updateCharacter(editName, customTranscript.trim() || undefined);
+      } else {
+        throw new Error('Choose or record a voice sample.');
       }
-      settingsStatus = `Saved. This app now speaks as ${active.name}.`;
+      populateForm(active);
+      settingsStatus = 'Character saved.';
       view = 'speak';
     } catch (error) {
       settingsError = error instanceof Error ? error.message : String(error);
@@ -222,20 +227,20 @@
 </script>
 
 <svelte:head>
-  <title>Voice MCP — {characterName}</title>
+  <title>Super Fast TTS MCP Server</title>
 </svelte:head>
 
 <header class="topbar">
   <div class="brand">
-    <div class="mark">{characterName.slice(0, 1).toUpperCase()}</div>
+    <div class="mark">⚡</div>
     <div>
-      <strong>Voice MCP</strong>
-      <span>speaks as {characterName}</span>
+      <strong>Super Fast TTS</strong>
+      <span>MCP Server</span>
     </div>
   </div>
   <nav>
     <button class:active={view === 'speak'} on:click={() => (view = 'speak')}>Speak</button>
-    <button class:active={view === 'settings'} on:click={beginEdit}>Settings</button>
+    <button class:active={view === 'settings'} on:click={() => (view = 'settings')}>Settings</button>
   </nav>
   <div class="server-pill" class:online={server?.status === 'ok'}>
     <i></i>{server ? server.backend : 'offline'}
@@ -246,20 +251,20 @@
   {#if view === 'speak'}
     <section class="hero">
       <p class="eyebrow">MCP AUDIO SERVER</p>
-      <h1>Give {characterName} something to say</h1>
+      <h1>Super Fast TTS MCP Server</h1>
       <p>
-        This app does one thing: it turns text into {characterName}'s voice, streamed as it is
-        generated. Agents connect over MCP and call the same voice through the
-        <code>speak</code> tool.
+        Text in, speech out — streamed while it is still being generated, with first audio in
+        well under a second once warm. Agents connect over MCP and call the
+        <code>speak</code> tool; this page drives the same engine by hand.
       </p>
     </section>
 
     <section class="panel speak-panel">
       <textarea rows="5" bind:value={text} disabled={speaking}
-        placeholder="Type what {characterName} should say…"></textarea>
+        placeholder="Type something to say…"></textarea>
       <div class="speak-actions">
         <button class="primary" on:click={speak} disabled={speaking || !text.trim()}>
-          {speaking ? 'Speaking…' : `Speak as ${characterName}`}
+          {speaking ? 'Speaking…' : 'Speak'}
         </button>
         {#if speaking}
           <button class="danger" on:click={stop}>Stop</button>
@@ -293,15 +298,15 @@
           <li>
             <strong>As an MCP tool server</strong> — Admin Settings → External Tools → add this
             endpoint as a streamable-HTTP MCP server. Models can then call
-            <code>speak</code> and attach {characterName}'s audio to their replies. If your Open
-            WebUI only accepts OpenAPI tool servers, bridge it with
+            <code>speak</code> and attach the audio to their replies. If your Open WebUI only
+            accepts OpenAPI tool servers, bridge it with
             <code>uvx mcpo --port 8600 --server-type streamable-http -- {endpoint}</code> and add
             <code>http://localhost:8600</code> instead.
           </li>
           <li>
             <strong>As the TTS engine</strong> — Admin Settings → Audio → Text-to-Speech →
             OpenAI, API base <code>{endpoint.replace('/mcp', '/v1')}</code> (any API key), any
-            voice name. Every read-aloud then uses {characterName}'s voice.
+            voice name. Every read-aloud then uses this server's voice.
           </li>
         </ol>
         <p class="mcp-note">
@@ -315,7 +320,7 @@
   {:else}
     <section class="hero">
       <p class="eyebrow">SETTINGS</p>
-      <h1>Replace {characterName}</h1>
+      <h1>Voice settings</h1>
       <p>
         The character is server state: the name and voice chosen here apply to this page and to
         every MCP call, and survive restarts.
@@ -324,7 +329,7 @@
 
     <section class="panel settings-panel">
       <label for="char-name">Character name</label>
-      <input id="char-name" bind:value={editName} maxlength="64" placeholder="F" />
+      <input id="char-name" bind:value={editName} maxlength="64" placeholder="Name this character" />
 
       <fieldset>
         <legend>Voice</legend>
@@ -356,7 +361,7 @@
             on:change={(event) => (customFile = event.currentTarget.files?.[0] || null)} />
           <label class="file-picker" for="char-voice">
             <strong>Choose file</strong>
-            <span>{customFile?.name || 'No file selected'}</span>
+            <span>{customFile?.name || (active?.source === 'custom' ? 'Keeping the saved recording' : 'No file selected')}</span>
           </label>
           <div class="record-row">
             {#if recording}
@@ -375,7 +380,7 @@
         <button class="primary" on:click={saveCharacter} disabled={saving}>
           {saving ? 'Saving…' : 'Save character'}
         </button>
-        <button class="ghost" on:click={() => (view = 'speak')}>Cancel</button>
+        <button class="ghost" on:click={() => (view = 'speak')}>Back</button>
       </div>
       {#if settingsError}
         <p class="status bad">{settingsError}</p>
@@ -387,6 +392,6 @@
 </main>
 
 <footer>
-  <span>Qwen3-TTS · streaming CUDA inference · MCP streamable HTTP</span>
-  <span>character and voice persist on the server</span>
+  <span>Super Fast TTS · Qwen3 streaming CUDA inference · MCP streamable HTTP</span>
+  <span>voice settings persist on the server</span>
 </footer>

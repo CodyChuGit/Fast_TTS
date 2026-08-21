@@ -51,6 +51,17 @@ export function setCharacterPreset(name: string, preset: string): Promise<Charac
   });
 }
 
+// Edits the character while keeping its saved voice -- a rename (and, for a
+// custom character, a transcript touch-up) never demands the recording again.
+export function updateCharacter(name: string, transcript?: string): Promise<Character> {
+  const body: Record<string, string> = { name };
+  if (transcript) body.transcript = transcript;
+  return json<Character>('/v1/character', {
+    method: 'POST',
+    body: JSON.stringify(body)
+  });
+}
+
 export function setCharacterCustom(name: string, transcript: string, voice: Blob): Promise<Character> {
   const form = new FormData();
   form.append('name', name);

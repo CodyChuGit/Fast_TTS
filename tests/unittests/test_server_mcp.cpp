@@ -36,7 +36,7 @@ SpeakOutcome failing_speak(const std::string &, long long) {
 }
 
 McpReply call(const std::string & body, const minitts::server::mcp::SpeakFn & speak = ok_speak) {
-    return handle_mcp_message(body, "F", speak);
+    return handle_mcp_message(body, speak);
 }
 
 // Every reply is itself JSON; parse it so assertions read fields rather than
@@ -56,8 +56,11 @@ void test_initialize_negotiates_the_protocol_version() {
         "a supported requested version is echoed");
     require(result.require("capabilities").find("tools") != nullptr, "tools capability is declared");
     require(
-        engine::io::json::require_string(result, "instructions").find("\"F\"") != std::string::npos,
-        "instructions name the character");
+        engine::io::json::require_string(result.require("serverInfo"), "title") == "Super Fast TTS MCP Server",
+        "the server presents itself as a fast TTS server, not a character");
+    require(
+        engine::io::json::require_string(result, "instructions").find("speak tool") != std::string::npos,
+        "instructions point the agent at the speak tool");
 
     const auto future = parsed(call(
         R"({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2099-01-01"}})"));
@@ -72,14 +75,14 @@ void test_notifications_are_accepted_without_a_body() {
     require(reply.body.empty(), "notifications carry no body");
 }
 
-void test_tools_list_names_the_character() {
+void test_tools_list_describes_generic_speech() {
     const auto body = parsed(call(R"({"jsonrpc":"2.0","id":3,"method":"tools/list"})"));
     const auto & tools = body.require("result").require("tools").as_array();
     require(tools.size() == 1, "exactly one tool");
     require(engine::io::json::require_string(tools[0], "name") == "speak", "the tool is speak");
     require(
-        engine::io::json::require_string(tools[0], "description").find("\"F\"") != std::string::npos,
-        "the description names the character");
+        engine::io::json::require_string(tools[0], "description").find("spoken audio") != std::string::npos,
+        "the description says what the tool does");
     const auto & schema = tools[0].require("inputSchema");
     require(schema.require("required").as_array().size() == 1, "only text is required");
 }
@@ -95,8 +98,8 @@ void test_tools_call_returns_audio_content() {
     require(engine::io::json::require_string(content[0], "mimeType") == "audio/wav", "wav mime type");
     require(engine::io::json::require_string(content[0], "data") == "UklGRg==", "audio data passes through");
     require(
-        engine::io::json::require_string(content[1], "text").find("F") != std::string::npos,
-        "the summary names the character");
+        engine::io::json::require_string(content[1], "text").find("1.5 seconds") != std::string::npos,
+        "the summary reports the spoken duration");
 }
 
 void test_tool_failures_are_tool_results_not_protocol_errors() {
@@ -152,7 +155,7 @@ int main() {
     try {
         test_initialize_negotiates_the_protocol_version();
         test_notifications_are_accepted_without_a_body();
-        test_tools_list_names_the_character();
+        test_tools_list_describes_generic_speech();
         test_tools_call_returns_audio_content();
         test_tool_failures_are_tool_results_not_protocol_errors();
         test_protocol_errors_use_jsonrpc_codes();

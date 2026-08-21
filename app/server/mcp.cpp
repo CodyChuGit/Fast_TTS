@@ -102,27 +102,27 @@ std::string negotiated_protocol_version(const Value * params) {
     return kSupportedProtocolVersions[0];
 }
 
-std::string initialize_result(const Value * params, const std::string & character_name) {
+std::string initialize_result(const Value * params) {
     return "{\"protocolVersion\":" + quoted(negotiated_protocol_version(params)) +
         ",\"capabilities\":{\"tools\":{}}" +
         ",\"serverInfo\":{\"name\":" + quoted(kServerName) +
-        ",\"title\":" + quoted("Qwen3 Voice MCP (" + character_name + ")") +
+        ",\"title\":" + quoted("Super Fast TTS MCP Server") +
         ",\"version\":" + quoted(kServerVersion) + "}" +
-        ",\"instructions\":" + quoted(
-            "This server turns text into spoken audio in the voice of the character \"" +
-            character_name + "\". Call the speak tool with the text to say; it returns a "
-            "complete WAV clip. Keep each call to one utterance -- a sentence or short "
-            "paragraph -- and make several calls for longer passages.") +
+        ",\"instructions\":" + quoted(std::string(
+            "This server turns text into spoken audio with a fast streaming TTS engine. "
+            "Call the speak tool with the text to say; it returns a complete WAV clip. "
+            "Keep each call to one utterance -- a sentence or short paragraph -- and "
+            "make several calls for longer passages.")) +
         "}";
 }
 
-std::string tools_list_result(const std::string & character_name) {
-    return "{\"tools\":[{"
+std::string tools_list_result() {
+    return std::string("{\"tools\":[{"
         "\"name\":\"speak\","
-        "\"title\":" + quoted("Speak as " + character_name) + ","
-        "\"description\":" + quoted(
-            "Convert text to spoken audio in the voice of the character \"" + character_name +
-            "\" and return it as a WAV clip. Best for one utterance per call.") + ","
+        "\"title\":\"Speak\","
+        "\"description\":") + quoted(
+            "Convert text to spoken audio and return it as a WAV clip. "
+            "Best for one utterance per call.") + ","
         "\"inputSchema\":{"
             "\"type\":\"object\","
             "\"properties\":{"
@@ -140,7 +140,6 @@ std::string tool_error_result(const std::string & message) {
 McpReply handle_tools_call(
     const std::string & id,
     const Value * params,
-    const std::string & character_name,
     const SpeakFn & speak) {
     if (params == nullptr || !params->is_object()) {
         return jsonrpc_error(200, id, -32602, "tools/call requires params with a tool name");
@@ -177,9 +176,8 @@ McpReply handle_tools_call(
         return jsonrpc_result(id, tool_error_result("Speech generation failed: " + outcome.error_text));
     }
 
-    char summary[96];
-    std::snprintf(summary, sizeof(summary), "Spoke %.1f seconds of audio as %s.",
-        outcome.audio_seconds, character_name.c_str());
+    char summary[64];
+    std::snprintf(summary, sizeof(summary), "Spoke %.1f seconds of audio.", outcome.audio_seconds);
     return jsonrpc_result(id,
         "{\"content\":[{\"type\":\"audio\",\"data\":\"" + outcome.wav_base64 +
         "\",\"mimeType\":\"audio/wav\"},{\"type\":\"text\",\"text\":" + quoted(summary) +
@@ -188,10 +186,7 @@ McpReply handle_tools_call(
 
 }  // namespace
 
-McpReply handle_mcp_message(
-    const std::string & body_text,
-    const std::string & character_name,
-    const SpeakFn & speak) {
+McpReply handle_mcp_message(const std::string & body_text, const SpeakFn & speak) {
     Value message = Value::make_null();
     try {
         message = engine::io::json::parse(body_text);
@@ -218,16 +213,16 @@ McpReply handle_mcp_message(
     const auto * params = message.find("params");
 
     if (name == "initialize") {
-        return jsonrpc_result(id, initialize_result(params, character_name));
+        return jsonrpc_result(id, initialize_result(params));
     }
     if (name == "ping") {
         return jsonrpc_result(id, "{}");
     }
     if (name == "tools/list") {
-        return jsonrpc_result(id, tools_list_result(character_name));
+        return jsonrpc_result(id, tools_list_result());
     }
     if (name == "tools/call") {
-        return handle_tools_call(id, params, character_name, speak);
+        return handle_tools_call(id, params, speak);
     }
     return jsonrpc_error(200, id, -32601, "Method not found: " + name);
 }

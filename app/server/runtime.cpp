@@ -2320,11 +2320,6 @@ ServerState::LoadedModel * ServerState::find_speech_model() {
     return nullptr;
 }
 
-std::string ServerState::character_name() const {
-    std::lock_guard<std::mutex> lock(character_mutex_);
-    return character_.name;
-}
-
 void ServerState::apply_character(LoadedModel & model, const CharacterConfig & character) {
     LoadedModel::RuntimeVoicePreset preset;
     if (character.is_custom()) {
@@ -2426,10 +2421,28 @@ HttpResponse ServerState::handle_character_set(const HttpRequest & request) {
             }
             character.voice_file = "voice.wav";
         } else {
-            // A bundled voice: {name, preset}.
+            // JSON: {name, preset} switches to a bundled voice; {name} alone (or
+            // {name, transcript} for a custom character) edits the character
+            // while keeping its saved voice, so a rename never demands the
+            // recording be uploaded again.
             const auto body = engine::io::json::parse(request.body);
+            {
+                std::lock_guard<std::mutex> lock(character_mutex_);
+                character = character_;
+            }
             character.name = sanitize_character_name(engine::io::json::require_string(body, "name"));
-            character.preset = engine::io::json::require_string(body, "preset");
+            if (const auto * preset = body.find("preset");
+                preset != nullptr && preset->is_string() && !preset->as_string().empty()) {
+                character.preset = preset->as_string();
+                character.voice_file.clear();
+                character.transcript.clear();
+            } else if (const auto * transcript = body.find("transcript");
+                transcript != nullptr && transcript->is_string() && character.is_custom()) {
+                character.transcript = transcript->as_string();
+            }
+            if (character.preset.empty() && !character.is_custom()) {
+                throw std::runtime_error("the character needs a voice: name a 'preset' or upload a recording");
+            }
         }
         apply_character(*model, character);
     } catch (const std::exception & ex) {
@@ -2489,7 +2502,6 @@ HttpResponse ServerState::handle_mcp(const HttpRequest & request) {
     }
     const auto reply = mcp::handle_mcp_message(
         request.body,
-        character_name(),
         [this](const std::string & text, long long seed) { return run_mcp_speak(text, seed); });
     HttpResponse response;
     response.status = reply.status;

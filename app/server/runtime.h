@@ -166,7 +166,6 @@ private:
     // configured (TTS) model -- the Speak page and MCP callers do not know
     // model ids.
     LoadedModel & require_speech_model(const engine::io::json::Value & body);
-    std::string character_name() const;
 
     // MCP endpoint: JSON-RPC over streamable HTTP with one speak tool.
     HttpResponse handle_mcp(const HttpRequest & request);

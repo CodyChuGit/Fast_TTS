@@ -31,12 +31,6 @@ struct McpReply {
 // transport, single-message bodies -- batching was removed from the spec).
 // Responses are plain JSON rather than SSE, which the transport permits and
 // every client must accept.
-//
-// `character_name` is folded into the server instructions and the speak tool's
-// description so a connected agent knows whose voice it is invoking.
-McpReply handle_mcp_message(
-    const std::string & body_text,
-    const std::string & character_name,
-    const SpeakFn & speak);
+McpReply handle_mcp_message(const std::string & body_text, const SpeakFn & speak);
 
 }  // namespace minitts::server::mcp
