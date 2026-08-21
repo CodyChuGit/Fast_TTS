@@ -419,14 +419,15 @@
     chatAborter = new AbortController();
     try {
       await primePcm16Playback();
-      // A chat reply starts while the LLM is still decoding on the same GPU,
-      // so TTS can run below real time for the first sentence or two. A
-      // deeper startup reserve and a patient deadline trade a few dozen
-      // milliseconds of extra wait for a start that does not stutter through
-      // that contention window.
+      // Measured on the current engine stack, TTS production never falls
+      // behind playback any more -- the LLM finishes writing long before the
+      // audio catches up -- so the chat reserve only needs to ride out
+      // browser-side jitter. A shallow reserve starts replies sooner; the
+      // player's rebuffer-on-underrun logic absorbs the rare mid-reply
+      // graph-capture stall with a single clean pause.
       chatPlayer = new Pcm16StreamPlayer(24000, 1, {
-        startBufferSeconds: 0.32,
-        startMaxWaitMs: 700
+        startBufferSeconds: 0.12,
+        startMaxWaitMs: 250
       });
       await chatPlayer.start();
       // The full visible history goes up each turn; the sidecar's prompt cache
