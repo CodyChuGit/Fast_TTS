@@ -10,9 +10,9 @@ const std::vector<Entry> & library() {
         // English, short
         {Size::Short, false, "Mmm."},
         {Size::Short, false, "Uhh..."},
-        {Size::Short, false, "Ooh."},
+        {Size::Short, false, "Ooh.", false},
         {Size::Short, false, "Hmm?"},
-        {Size::Short, false, "Oh!"},
+        {Size::Short, false, "Oh!", false},
         {Size::Short, false, "Right..."},
         // English, medium
         {Size::Medium, false, "Ummm, okay so..."},
@@ -28,10 +28,10 @@ const std::vector<Entry> & library() {
         {Size::Long, false, "Mmm, wait wait... okay, I think I know what I want to say..."},
         // Chinese, short
         {Size::Short, true, "嗯…"},
-        {Size::Short, true, "哦？"},
+        {Size::Short, true, "哦？", false},
         {Size::Short, true, "呃…"},
         {Size::Short, true, "嗯哼。"},
-        {Size::Short, true, "哦——"},
+        {Size::Short, true, "哦——", false},
         // Chinese, medium
         {Size::Medium, true, "嗯…让我想想哦…"},
         {Size::Medium, true, "哎呀，这个嘛…"},
@@ -64,11 +64,17 @@ uint64_t clip_key(uint64_t voice_fingerprint, const std::string & text) {
     return fnv1a(voice_fingerprint, text.data(), text.size());
 }
 
-int pick(Size size, bool chinese, uint64_t random_seed) {
+int pick(Size size, bool chinese, uint64_t random_seed, bool chain_only) {
+    // Callers seed from the clock, whose low bits are patterned by tick
+    // granularity; a mix keeps the modulo below from favoring entries.
+    random_seed ^= random_seed >> 33;
+    random_seed *= 0xff51afd7ed558ccdull;
+    random_seed ^= random_seed >> 33;
     const auto & entries = library();
     std::vector<int> candidates;
     for (size_t i = 0; i < entries.size(); ++i) {
-        if (entries[i].size == size && entries[i].chinese == chinese) {
+        if (entries[i].size == size && entries[i].chinese == chinese &&
+            (!chain_only || entries[i].chain)) {
             candidates.push_back(static_cast<int>(i));
         }
     }
@@ -76,6 +82,28 @@ int pick(Size size, bool chinese, uint64_t random_seed) {
         return -1;
     }
     return candidates[static_cast<size_t>(random_seed % candidates.size())];
+}
+
+std::string strip_leading(std::string text) {
+    while (true) {
+        // The longest matching entry wins: some entries are prefixes of
+        // others ("嗯…" opens "嗯…让我想想哦…"), and taking the short one
+        // would leave the tail of the long one behind.
+        size_t best = 0;
+        for (const auto & entry : library()) {
+            if (entry.text.size() > best &&
+                text.compare(0, entry.text.size(), entry.text) == 0) {
+                best = entry.text.size();
+            }
+        }
+        if (best == 0) {
+            return text;
+        }
+        while (best < text.size() && text[best] == ' ') {
+            ++best;
+        }
+        text.erase(0, best);
+    }
 }
 
 }  // namespace minitts::server::filler

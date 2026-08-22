@@ -20,6 +20,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <unordered_map>
 #include <vector>
@@ -54,6 +55,18 @@ struct ChatSpeculation {
     enum class AudioState { None, Running, Done, Failed };
     AudioState audio_state = AudioState::None;
     std::vector<std::vector<uint8_t>> first_audio_chunks;
+};
+
+// A hesitation clip chosen for one chat turn: the PCM to play, the text it
+// speaks (shown in the transcript and captions, since it is really said), and
+// what chat_orchestrate needs to chain a follow-up clip if the reply outlasts
+// this one (language, voice fingerprint, which library entry it was).
+struct ChatFiller {
+    std::shared_ptr<std::vector<uint8_t>> clip;
+    std::string text;
+    bool chinese = false;
+    uint64_t voice_fp = 0;
+    int index = -1;
 };
 
 class ServerState final : public IHttpHandler {
@@ -208,7 +221,7 @@ private:
         long long tts_seed,
         HttpStreamWriter & writer,
         std::shared_ptr<ChatSpeculation> speculation = nullptr,
-        std::shared_ptr<std::vector<uint8_t>> filler_pcm = nullptr);
+        std::optional<ChatFiller> filler = std::nullopt);
     // Pre-synthesizes the filler library in the active character's voice on a
     // background thread, disk-cached per (voice, text) so later boots just
     // load. Restarted whenever the character voice changes.
