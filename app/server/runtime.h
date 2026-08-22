@@ -67,6 +67,10 @@ struct ChatFiller {
     bool chinese = false;
     uint64_t voice_fp = 0;
     int index = -1;
+    // Which wait estimate this turn updates: 0 = fresh conversation,
+    // 1 = later turn. -1 skips the update (speculative attaches replay at
+    // memory speed and would drag the estimate down).
+    int wait_bucket = -1;
 };
 
 class ServerState final : public IHttpHandler {
@@ -271,6 +275,12 @@ private:
     mutable std::mutex filler_mutex_;
     uint64_t filler_voice_fp_ = 0;
     std::atomic<bool> filler_build_running_{false};
+    // Running estimate of how long a non-speculative turn takes to reach its
+    // first real audio, by ChatFiller::wait_bucket. The pick targets a clip
+    // of roughly this length, so the hesitation ends about when the real
+    // voice arrives instead of at a random moment. Seeded from measured
+    // prewarmed-path times; guarded by filler_mutex_.
+    double filler_wait_ms_[2] = {1600.0, 1200.0};
 };
 
 }  // namespace minitts::server

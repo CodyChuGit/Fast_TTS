@@ -394,9 +394,11 @@ void bound_filler_clip(filler::Size size, std::vector<uint8_t> & pcm) {
             }
         }
     }
-    const size_t cap = size == filler::Size::Short ? 24000       // 1.0 s
-        : size == filler::Size::Medium ? 62400                   // 2.6 s
-        : 108000;                                                // 4.5 s
+    // Safety ceilings only: scripts/filler_qa.py curates the clips well
+    // under these, so a cap firing means an uncurated synthesis slipped in.
+    const size_t cap = size == filler::Size::Short ? 38400       // 1.6 s
+        : size == filler::Size::Medium ? 67200                   // 2.8 s
+        : 115200;                                                // 4.8 s
     cut = std::min(cut, cap);
     if (cut >= count) {
         return;
@@ -2578,8 +2580,14 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     // scratch. A speculative hit whose reply has settled (or whose first
     // sentence is already synthesizing) has instant real audio and needs
     // none; an early attach that caught the worker before any of that gets
-    // one like a cold turn does. Size by how cold the turn is, language by
-    // the user's newest message.
+    // one like a cold turn does. The pick is not random: the kind answers
+    // the message (thinking at a question, a reaction to excitement, an
+    // acknowledgment otherwise) and the length targets the measured wait for
+    // this path, so the hesitation ends about when the real voice arrives.
+    const bool filler_wanted = [&] {
+        const auto * flag = body.find("filler");
+        return flag == nullptr || !flag->is_bool() || flag->as_bool();
+    }();
     std::optional<ChatFiller> filler;
     bool spec_covered = false;
     if (speculation != nullptr) {
@@ -2588,31 +2596,75 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
             speculation->audio_state == ChatSpeculation::AudioState::Running ||
             speculation->audio_state == ChatSpeculation::AudioState::Done;
     }
-    if (!spec_covered && last_user_index < list.size()) {
+    if (filler_wanted && !spec_covered && last_user_index < list.size()) {
         const auto & latest_user = list[last_user_index].find("content")->as_string();
         const bool zh = hygiene::mostly_cjk(latest_user);
+        const int bucket = assistant_turns == 0 ? 0 : 1;
         const auto size = speculation != nullptr || assistant_turns > 0
             ? filler::Size::Short
             : filler::Size::Medium;
-        const auto seed = static_cast<uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-        const int index = filler::pick(size, zh, seed);
-        if (index >= 0) {
-            const auto & text = filler::library()[static_cast<size_t>(index)].text;
-            uint64_t fp;
-            size_t cached;
-            {
-                std::lock_guard<std::mutex> lock(filler_mutex_);
-                fp = filler_voice_fp_;
-                cached = filler_pcm_.size();
-            }
+        const auto kind = filler::classify(latest_user);
+        uint64_t fp;
+        double target_ms;
+        {
+            std::lock_guard<std::mutex> lock(filler_mutex_);
+            fp = filler_voice_fp_;
+            target_ms = filler_wait_ms_[bucket];
+        }
+        // Among the kind-matched candidates, keep those whose length lands
+        // near the expected wait (a little over beats a little under -- the
+        // clip should not end noticeably before the real voice), then pad to
+        // at least two by nearest length so the same phrase never becomes
+        // the only choice; random among those.
+        struct Candidate {
+            double diff;
+            int index;
+            std::shared_ptr<std::vector<uint8_t>> clip;
+            bool in_band;
+        };
+        std::vector<Candidate> scored;
+        for (const int cand : filler::candidates(size, zh, kind, false)) {
+            const auto & text = filler::library()[static_cast<size_t>(cand)].text;
             auto clip = find_filler(filler::clip_key(fp, text));
-            if (clip != nullptr) {
-                filler = ChatFiller{std::move(clip), text, zh, fp, index};
-            } else {
-                std::cerr << "filler miss: index=" << index << " cached=" << cached
-                          << " fp=" << fp << "\n";
+            if (clip == nullptr || clip->empty()) {
+                continue;
             }
+            const double clip_ms = static_cast<double>(clip->size()) / 48.0;
+            scored.push_back({std::abs(clip_ms - target_ms), cand, std::move(clip),
+                              clip_ms >= target_ms - 450.0 && clip_ms <= target_ms + 700.0});
+        }
+        std::sort(scored.begin(), scored.end(),
+                  [](const Candidate & a, const Candidate & b) { return a.diff < b.diff; });
+        std::vector<const Candidate *> viable;
+        for (const auto & cand : scored) {
+            if (cand.in_band) {
+                viable.push_back(&cand);
+            }
+        }
+        for (const auto & cand : scored) {
+            if (viable.size() >= 2) {
+                break;
+            }
+            if (!cand.in_band) {
+                viable.push_back(&cand);
+            }
+        }
+        const auto seed = filler::mix(static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+        int index = -1;
+        std::shared_ptr<std::vector<uint8_t>> clip;
+        if (!viable.empty()) {
+            const auto & chosen = *viable[static_cast<size_t>(seed % viable.size())];
+            index = chosen.index;
+            clip = chosen.clip;
+        }
+        if (index >= 0 && clip != nullptr) {
+            const int spec_bucket = speculation != nullptr ? -1 : bucket;
+            filler = ChatFiller{std::move(clip),
+                                filler::library()[static_cast<size_t>(index)].text,
+                                zh, fp, index, spec_bucket};
+        } else {
+            std::cerr << "filler miss: no cached clip for size/lang bucket\n";
         }
     }
 
@@ -2997,18 +3049,18 @@ void ServerState::chat_orchestrate(
         last_filler_index = chosen.index;
     };
     auto chain_filler = [&] {
-        const auto seed = static_cast<uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-        int index = filler::pick(filler::Size::Short, filler->chinese, seed, true);
-        if (index == last_filler_index) {
-            // Never the same hesitation twice in a row; the next candidate in
-            // the bucket is guaranteed different.
-            index = filler::pick(filler::Size::Short, filler->chinese, seed + 1, true);
-        }
-        if (index < 0) {
+        // Mid-wait, the character is thinking -- chains draw only from the
+        // Think-kind hesitations, never the same one twice in a row.
+        auto pool = filler::candidates(
+            filler::Size::Short, filler->chinese, filler::Kind::Think, true);
+        pool.erase(std::remove(pool.begin(), pool.end(), last_filler_index), pool.end());
+        if (pool.empty()) {
             filler_chain_open = false;
             return;
         }
+        const auto seed = filler::mix(static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+        const int index = pool[static_cast<size_t>(seed % pool.size())];
         const auto & entry = filler::library()[static_cast<size_t>(index)];
         auto clip = find_filler(filler::clip_key(filler->voice_fp, entry.text));
         if (clip == nullptr || clip->empty()) {
@@ -3202,6 +3254,15 @@ void ServerState::chat_orchestrate(
     }
     abort.store(true);
     llm_thread.join();
+
+    // Feed the measured wait back into the pick: the next turn's hesitation
+    // is chosen to last about this long. Only genuine cold paths count --
+    // speculative replays reach audio at memory speed.
+    if (filler.has_value() && filler->wait_bucket >= 0 && first_audio_ms > 0) {
+        std::lock_guard<std::mutex> lock(filler_mutex_);
+        auto & ema = filler_wait_ms_[filler->wait_bucket];
+        ema = 0.7 * ema + 0.3 * first_audio_ms;
+    }
 
     // The GPU is idle now while the user listens; spend that time re-priming
     // the sidecar's prompt cache with the canonical form of this turn (the

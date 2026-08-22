@@ -12,9 +12,16 @@ namespace minitts::server::filler {
 // much air there is to fill.
 enum class Size { Short, Medium, Long };
 
+// What the hesitation is doing, so it can match the message it answers: a
+// question earns thinking, an excited message earns a reaction, a plain
+// statement earns an acknowledgment. A "good question..." before a
+// non-question is worse than silence.
+enum class Kind { React, Think, Ack };
+
 struct Entry {
     Size size;
     bool chinese;
+    Kind kind;
     std::string text;
     // Whether the line works as a follow-up when the reply outlasts the
     // first hesitation. Realization openers ("Oh!") sound wrong mid-wait.
@@ -22,8 +29,9 @@ struct Entry {
 };
 
 // The library of filler texts, stable across builds: the synthesized PCM is
-// cached on disk keyed by (voice, model, text), so editing a text re-renders
-// only that clip.
+// cached on disk keyed by (voice, text), so editing a text re-renders only
+// that clip. Append new entries at the END -- scripts/filler_qa.py maps
+// cache files to entries by index.
 const std::vector<Entry> & library();
 
 // A stable fingerprint for one filler's synthesized audio: mixes the voice
@@ -31,10 +39,20 @@ const std::vector<Entry> & library();
 // invalidate cleanly.
 uint64_t clip_key(uint64_t voice_fingerprint, const std::string & text);
 
-// Picks a random library index of the wanted size and language; -1 when the
-// library has no such entry. With chain_only, only entries that work as a
-// follow-up hesitation qualify.
-int pick(Size size, bool chinese, uint64_t random_seed, bool chain_only = false);
+// Classifies the user's newest message into the hesitation kind that answers
+// it. Question signals win over excitement (an excited question still wants
+// thinking); everything else is an acknowledgment.
+Kind classify(const std::string & user_text);
+
+// Library indexes matching size and language (and, with chain_only, only
+// entries that work as follow-ups). Entries of the wanted kind are returned
+// when any exist; otherwise the whole size bucket, so a sparse kind never
+// leaves a turn without a hesitation.
+std::vector<int> candidates(Size size, bool chinese, Kind kind, bool chain_only);
+
+// Scrambles a clock-derived seed; tick granularity patterns the low bits,
+// which a bare modulo would turn into favoritism.
+uint64_t mix(uint64_t seed);
 
 // Removes filler texts this server prepended to an assistant reply. The
 // transcript keeps them -- they were really spoken -- but the LLM must not
