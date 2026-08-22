@@ -548,6 +548,10 @@
   let chatSpeculateTimer: ReturnType<typeof setTimeout> | null = null;
   let lastPrewarmedDraft = '';
   let lastSpeculatedDraft = '';
+  // The current reply's text is complete (its audio may still be playing).
+  // From this point the conversation is final enough for the NEXT draft to
+  // prewarm and speculate against — the user can type while she talks.
+  let chatTextFinal = false;
 
   function draftMessages(draft: string) {
     // Mirrors sendChat's history exactly; any divergence would break the
@@ -557,13 +561,20 @@
       .map(({ role, content }) => ({ role, content }));
   }
 
+  // During a reply, drafting is allowed but speculation must wait until the
+  // reply's text is final (llm_done) — before that, the history the server
+  // would speculate against does not exist yet.
+  function chatDraftReady(): boolean {
+    return !chatBusy || chatTextFinal;
+  }
+
   function queueChatPrewarm() {
     if (chatPrewarmTimer !== null) clearTimeout(chatPrewarmTimer);
     if (chatSpeculateTimer !== null) clearTimeout(chatSpeculateTimer);
     chatPrewarmTimer = setTimeout(() => {
       chatPrewarmTimer = null;
       const draft = chatInput.trim();
-      if (!draft || chatBusy || draft === lastPrewarmedDraft) return;
+      if (!draft || !chatDraftReady() || draft === lastPrewarmedDraft) return;
       lastPrewarmedDraft = draft;
       prewarmChat(draftMessages(draft));
     }, 300);
@@ -572,7 +583,7 @@
     chatSpeculateTimer = setTimeout(() => {
       chatSpeculateTimer = null;
       const draft = chatInput.trim();
-      if (!draft || chatBusy || draft === lastSpeculatedDraft) return;
+      if (!draft || !chatDraftReady() || draft === lastSpeculatedDraft) return;
       lastSpeculatedDraft = draft;
       speculateChat(draftMessages(draft));
     }, 850);
@@ -616,6 +627,7 @@
     }
     lastPrewarmedDraft = '';
     lastSpeculatedDraft = '';
+    chatTextFinal = false;
     chatBusy = true;
     chatError = '';
     chatStats = null;
@@ -664,6 +676,12 @@
           chatTrack?.addAudioSeconds(pcm.byteLength / 48000);
         } else if (event.type === 'error') {
           chatError = event.message;
+        } else if (event.type === 'llm_done') {
+          // Her text is final even though she is still speaking: anything
+          // typed into the box so far can start prewarming and speculating
+          // against the finished conversation right now.
+          chatTextFinal = true;
+          if (chatInput.trim()) queueChatPrewarm();
         } else if (event.type === 'done') {
           chatStats = event.stats;
         }
@@ -908,8 +926,7 @@
         <input
           bind:value={chatInput}
           on:input={queueChatPrewarm}
-          disabled={chatBusy}
-          placeholder="Say something…"
+          placeholder={chatBusy ? 'Type your next message while she talks…' : 'Say something…'}
         />
         {#if chatBusy}
           <button class="danger" type="button" on:click={stopChat}>Stop</button>

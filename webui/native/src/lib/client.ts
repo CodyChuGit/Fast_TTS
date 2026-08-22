@@ -206,6 +206,9 @@ export type ChatEvent =
   | { type: 'audio'; audio: string }
   | { type: 'error'; message: string }
   | { type: 'done'; stats: ChatStats }
+  // The reply's text is complete (audio may still be playing): the next
+  // draft can speculate against the finished conversation from here on.
+  | { type: 'llm_done' }
   | { type: 'start' };
 
 export function base64ToBytes(data: string): Uint8Array {

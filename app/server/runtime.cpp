@@ -2506,6 +2506,17 @@ std::shared_ptr<ChatSpeculation> ServerState::take_matching_speculation(
     auto spec = std::move(chat_speculation_);
     chat_speculation_ = nullptr;
     if (spec->key != key || spec->abort.load()) {
+        if (spec->key != key) {
+            size_t diff = 0;
+            while (diff < spec->key.size() && diff < key.size() &&
+                   spec->key[diff] == key[diff]) {
+                ++diff;
+            }
+            std::cerr << "chat speculation key mismatch: spec=" << spec->key.size()
+                      << "B real=" << key.size() << "B first_diff=" << diff
+                      << " spec[..]=" << spec->key.substr(diff, 60)
+                      << " real[..]=" << key.substr(diff, 60) << "\n";
+        }
         spec->abort.store(true);
         // An aborted speculation whose worker died mid-stream is useless; a
         // fresh normal request is both simpler and correct.
@@ -2815,6 +2826,11 @@ void ServerState::chat_orchestrate(
                 llm_finished = true;
                 llm_ok = event.ok;
                 llm_error = event.error;
+                // The reply's text is final here even though audio is still
+                // being synthesized; the client uses this to start
+                // speculating on the user's next draft while the character
+                // is still speaking.
+                write_sse(writer, "{\"type\":\"llm_done\"}");
             }
         }
         if (!llm_ok && !llm_error.empty()) {
