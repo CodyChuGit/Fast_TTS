@@ -568,6 +568,11 @@
     return !chatBusy || chatTextFinal;
   }
 
+  // Sentence-final punctuation (with optional closing quotes/brackets after
+  // it) is the strongest send-intent signal there is: fast typists don't
+  // pause long before Enter, but they do finish the sentence.
+  const SENTENCE_END = /[.!?…~。！？～][)\]"'’”』」]*$/;
+
   function queueChatPrewarm() {
     if (chatPrewarmTimer !== null) clearTimeout(chatPrewarmTimer);
     if (chatSpeculateTimer !== null) clearTimeout(chatSpeculateTimer);
@@ -575,18 +580,22 @@
       chatPrewarmTimer = null;
       const draft = chatInput.trim();
       if (!draft || !chatDraftReady() || draft === lastPrewarmedDraft) return;
+      if (draft === lastSpeculatedDraft) return; // speculation already covers it
       lastPrewarmedDraft = draft;
       prewarmChat(draftMessages(draft));
     }, 300);
-    // A longer pause over a draft usually precedes send: generate the whole
-    // reply ahead of time so pressing Enter attaches to a finished buffer.
+    // A finished-looking sentence speculates almost immediately; an
+    // unpunctuated draft waits for the longer hover. Continued typing resets
+    // the timer either way, so mid-message sentence ends cost at most one
+    // cheaply aborted background generation.
+    const punctuated = SENTENCE_END.test(chatInput.trimEnd());
     chatSpeculateTimer = setTimeout(() => {
       chatSpeculateTimer = null;
       const draft = chatInput.trim();
       if (!draft || !chatDraftReady() || draft === lastSpeculatedDraft) return;
       lastSpeculatedDraft = draft;
       speculateChat(draftMessages(draft));
-    }, 850);
+    }, punctuated ? 180 : 850);
   }
 
   function stopChatCaptionLoop() {
