@@ -568,10 +568,26 @@
     return !chatBusy || chatTextFinal;
   }
 
-  // Sentence-final punctuation (with optional closing quotes/brackets after
-  // it) is the strongest send-intent signal there is: fast typists don't
-  // pause long before Enter, but they do finish the sentence.
+  // Send-intent detection: the speculation delay shrinks with how finished
+  // the draft looks. Sentence-final punctuation, trailing discourse closers
+  // ("lol", "tho", "thanks"), Chinese sentence-final particles (吧/呢/吗…),
+  // and trailing emoji are near-certain end signals; a question-shaped or
+  // very short draft is likely complete the moment typing pauses. A wrong
+  // guess only costs one cheaply aborted background generation, so the bias
+  // is toward firing early.
   const SENTENCE_END = /[.!?…~。！？～][)\]"'’”』」]*$/;
+  const TRAILING_CLOSER =
+    /(?:\b(?:lol|lmao|haha+|hehe+|tho|though|right|pls|please|thanks|thank you|ty|ok|okay|kk|fr|ngl|tbh|imo|btw|you know|i guess|for real|bye|goodnight|night|see ya|cya)|[吧呢吗啊呀嘛啦哦哟咯了]|哈哈+|嘿嘿+|[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}])$/iu;
+  const QUESTION_START =
+    /^(?:what|where|when|why|how|who|which|whose|can|could|do|does|did|is|are|was|were|should|would|will|shall|am|have|has|any|got)\b/i;
+
+  function speculateDelay(raw: string): number {
+    const draft = raw.trimEnd();
+    if (SENTENCE_END.test(draft) || TRAILING_CLOSER.test(draft)) return 180;
+    if (QUESTION_START.test(draft)) return 400;
+    if (draft.split(/\s+/).length <= 3) return 400;
+    return 850;
+  }
 
   function queueChatPrewarm() {
     if (chatPrewarmTimer !== null) clearTimeout(chatPrewarmTimer);
@@ -584,18 +600,13 @@
       lastPrewarmedDraft = draft;
       prewarmChat(draftMessages(draft));
     }, 300);
-    // A finished-looking sentence speculates almost immediately; an
-    // unpunctuated draft waits for the longer hover. Continued typing resets
-    // the timer either way, so mid-message sentence ends cost at most one
-    // cheaply aborted background generation.
-    const punctuated = SENTENCE_END.test(chatInput.trimEnd());
     chatSpeculateTimer = setTimeout(() => {
       chatSpeculateTimer = null;
       const draft = chatInput.trim();
       if (!draft || !chatDraftReady() || draft === lastSpeculatedDraft) return;
       lastSpeculatedDraft = draft;
       speculateChat(draftMessages(draft));
-    }, punctuated ? 180 : 850);
+    }, speculateDelay(chatInput));
   }
 
   function stopChatCaptionLoop() {
