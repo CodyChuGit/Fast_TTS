@@ -2341,7 +2341,7 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     llama_body += "]}";
 
     if (speculate) {
-        start_chat_speculation(llama_body);
+        start_chat_speculation(llama_body, model, tts_seed);
         return json_response("{\"status\":\"speculating\"}");
     }
     if (prewarm) {
@@ -2374,7 +2374,8 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     });
 }
 
-void ServerState::start_chat_speculation(const std::string & llama_body) {
+void ServerState::start_chat_speculation(
+    const std::string & llama_body, LoadedModel * model, long long tts_seed) {
     auto spec = std::make_shared<ChatSpeculation>();
     spec->key = speculation_key(llama_body);
     {
@@ -2388,8 +2389,8 @@ void ServerState::start_chat_speculation(const std::string & llama_body) {
         }
         chat_speculation_ = spec;
     }
-    std::thread([host = config_.llm_host, port = config_.llm_port, spec,
-                 body = llama_body] {
+    std::thread([this, host = config_.llm_host, port = config_.llm_port, spec,
+                 body = llama_body, model, tts_seed] {
         SentenceSegmenter segmenter(SentenceSegmenter::Options{16, 28, 300});
         hygiene::StreamScrubber scrubber;
         auto emit = [&](const std::string & clean) {
@@ -2412,6 +2413,7 @@ void ServerState::start_chat_speculation(const std::string & llama_body) {
                 return !spec->abort.load();
             });
         emit(scrubber.flush());
+        std::string first_sentence;
         {
             std::lock_guard<std::mutex> lock(spec->mutex);
             spec->rest = segmenter.flush();
@@ -2423,6 +2425,72 @@ void ServerState::start_chat_speculation(const std::string & llama_body) {
             spec->predicted_n = result.predicted_n;
             spec->predicted_ms = result.predicted_ms;
             spec->llm_done = true;
+            if (!spec->sentences.empty()) {
+                first_sentence = spec->sentences.front();
+            } else if (!spec->rest.empty()) {
+                first_sentence = spec->rest;
+            }
+        }
+        spec->cv.notify_all();
+
+        // The reply is settled and the GPU is idle while the user hovers:
+        // synthesize the first sentence too, so a hit starts speaking at the
+        // client's buffer speed. A short confirmation delay avoids burning a
+        // synthesis when the user was mid-edit; a run cannot be cancelled
+        // once started, which bounds a miss's extra TTS wait at roughly one
+        // short sentence.
+        if (model == nullptr || !result.ok || spec->abort.load()) {
+            return;
+        }
+        const auto spoken = strip_speech_markup(first_sentence);
+        if (spoken.empty()) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        if (spec->abort.load()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(spec->mutex);
+            spec->audio_state = ChatSpeculation::AudioState::Running;
+        }
+        try {
+            Value::Object fields;
+            fields.emplace("input", Value::make_string(spoken));
+            if (tts_seed >= 0) {
+                fields.emplace("seed", Value::make_number(static_cast<double>(tts_seed)));
+            }
+            const auto speech_body = Value::make_object(std::move(fields));
+            auto request = build_speech_request(*model, speech_body);
+            request.options["stream_accumulate"] = "false";
+            run_streaming_model(*model, request, [&](const engine::runtime::StreamEvent & stream_event) {
+                std::vector<engine::runtime::AudioBuffer> buffers;
+                if (stream_event.audio_output.has_value()) {
+                    buffers.push_back(*stream_event.audio_output);
+                }
+                for (const auto & named : stream_event.named_audio_outputs) {
+                    buffers.push_back(named.audio);
+                }
+                for (const auto & audio : buffers) {
+                    auto pcm = encode_pcm16_samples(audio);
+                    if (pcm.empty()) {
+                        continue;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(spec->mutex);
+                        spec->first_audio_chunks.push_back(std::move(pcm));
+                    }
+                    spec->cv.notify_all();
+                }
+            });
+            {
+                std::lock_guard<std::mutex> lock(spec->mutex);
+                spec->audio_state = ChatSpeculation::AudioState::Done;
+            }
+        } catch (const std::exception &) {
+            std::lock_guard<std::mutex> lock(spec->mutex);
+            spec->audio_state = ChatSpeculation::AudioState::Failed;
+            spec->first_audio_chunks.clear();
         }
         spec->cv.notify_all();
     }).detach();
@@ -2655,10 +2723,65 @@ void ServerState::chat_orchestrate(
                 if (spoken.empty()) {
                     continue;
                 }
+                const bool use_spec_audio = first_sentence_ms < 0 && speculation != nullptr &&
+                    [&] {
+                        std::lock_guard<std::mutex> lock(speculation->mutex);
+                        return speculation->audio_state == ChatSpeculation::AudioState::Running ||
+                               speculation->audio_state == ChatSpeculation::AudioState::Done;
+                    }();
                 if (first_sentence_ms < 0) {
                     first_sentence_ms = elapsed();
                 }
                 write_sse(writer, "{\"type\":\"sentence\",\"text\":" + json_quote(spoken) + "}");
+                if (use_spec_audio) {
+                    // The first sentence's audio was synthesized while the user
+                    // hovered over send: stream the stored chunks (and any that
+                    // are still arriving) instead of synthesizing again.
+                    size_t chunk_pos = 0;
+                    while (true) {
+                        std::vector<std::vector<uint8_t>> chunks;
+                        bool finished = false;
+                        {
+                            std::unique_lock<std::mutex> lock(speculation->mutex);
+                            speculation->cv.wait_for(lock, std::chrono::milliseconds(250), [&] {
+                                return speculation->first_audio_chunks.size() > chunk_pos ||
+                                       speculation->audio_state != ChatSpeculation::AudioState::Running;
+                            });
+                            for (size_t i = chunk_pos; i < speculation->first_audio_chunks.size(); ++i) {
+                                chunks.push_back(speculation->first_audio_chunks[i]);
+                            }
+                            chunk_pos = speculation->first_audio_chunks.size();
+                            finished = speculation->audio_state != ChatSpeculation::AudioState::Running &&
+                                       chunk_pos == speculation->first_audio_chunks.size();
+                            if (speculation->audio_state == ChatSpeculation::AudioState::Failed) {
+                                chunks.clear();
+                                finished = true;
+                            }
+                        }
+                        for (const auto & pcm : chunks) {
+                            drain_tokens();
+                            if (first_audio_ms < 0) {
+                                first_audio_ms = elapsed();
+                            }
+                            audio_bytes += pcm.size();
+                            write_sse(writer, "{\"type\":\"audio\",\"audio\":" + json_quote(base64_encode(pcm)) + "}");
+                        }
+                        if (finished) {
+                            break;
+                        }
+                    }
+                    bool had_audio;
+                    {
+                        std::lock_guard<std::mutex> lock(speculation->mutex);
+                        had_audio = !speculation->first_audio_chunks.empty() &&
+                                    speculation->audio_state == ChatSpeculation::AudioState::Done;
+                    }
+                    if (had_audio) {
+                        continue;
+                    }
+                    // Synthesis failed or produced nothing; fall through and
+                    // synthesize this sentence normally.
+                }
                 Value::Object fields;
                 fields.emplace("input", Value::make_string(spoken));
                 if (tts_seed >= 0) {

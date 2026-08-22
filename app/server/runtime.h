@@ -48,6 +48,12 @@ struct ChatSpeculation {
     std::string error;
     std::string finish_reason;
     double prompt_n = -1, prompt_ms = -1, predicted_n = -1, predicted_ms = -1;
+    // The first sentence's audio, synthesized speculatively once the reply
+    // has settled: raw PCM chunks in emission order. On a hit these stream to
+    // the client instantly, collapsing first audio to the client's buffer.
+    enum class AudioState { None, Running, Done, Failed };
+    AudioState audio_state = AudioState::None;
+    std::vector<std::vector<uint8_t>> first_audio_chunks;
 };
 
 class ServerState final : public IHttpHandler {
@@ -203,8 +209,10 @@ private:
         HttpStreamWriter & writer,
         std::shared_ptr<ChatSpeculation> speculation = nullptr);
     // Launches a detached worker generating the reply for `llama_body` into a
-    // ChatSpeculation buffer, replacing (and aborting) any previous one.
-    void start_chat_speculation(const std::string & llama_body);
+    // ChatSpeculation buffer, replacing (and aborting) any previous one. Once
+    // the reply settles, the worker also synthesizes the first sentence's
+    // audio on `model`.
+    void start_chat_speculation(const std::string & llama_body, LoadedModel * model, long long tts_seed);
     // Hands over the current speculation when its key matches this body's
     // messages; otherwise aborts it. Null when there is nothing to attach to.
     std::shared_ptr<ChatSpeculation> take_matching_speculation(const std::string & llama_body);
