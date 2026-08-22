@@ -2186,7 +2186,7 @@ void ServerState::warm_llm_system_prompt() {
     if (config_.llm_port <= 0) {
         return;
     }
-    std::thread([host = config_.llm_host, port = config_.llm_port,
+    std::thread([this, host = config_.llm_host, port = config_.llm_port,
                  body = fresh_llm_warm_body()] {
         // The sidecar may still be loading its model (startup, or a switch in
         // flight); wait for health quietly, then prime and go away.
@@ -2195,13 +2195,55 @@ void ServerState::warm_llm_system_prompt() {
         while (std::chrono::steady_clock::now() < deadline) {
             std::string health;
             if (llm::http_get_status(host, port, "/health", health) == 200) {
-                std::string response;
-                llm::http_post_status(host, port, "/v1/chat/completions", body, response);
+                queue_llm_warm(body);
                 return;
             }
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }).detach();
+}
+
+void ServerState::queue_llm_warm(std::string body) {
+    std::lock_guard<std::mutex> lock(llm_warm_mutex_);
+    llm_warm_pending_ = std::move(body);
+    llm_warm_cv_.notify_all();
+    if (llm_warm_worker_running_) {
+        return;
+    }
+    llm_warm_worker_running_ = true;
+    std::thread([this] {
+        std::unique_lock<std::mutex> lock(llm_warm_mutex_);
+        while (true) {
+            if (llm_warm_pending_.empty()) {
+                llm_warm_worker_running_ = false;
+                return;
+            }
+            if (llm_generations_active_ > 0) {
+                llm_warm_cv_.wait(lock);
+                continue;
+            }
+            const auto body = std::move(llm_warm_pending_);
+            llm_warm_pending_.clear();
+            lock.unlock();
+            std::string response;
+            llm::http_post_status(config_.llm_host, config_.llm_port,
+                                  "/v1/chat/completions", body, response);
+            lock.lock();
+        }
+    }).detach();
+}
+
+void ServerState::begin_llm_generation() {
+    std::lock_guard<std::mutex> lock(llm_warm_mutex_);
+    ++llm_generations_active_;
+}
+
+void ServerState::end_llm_generation() {
+    {
+        std::lock_guard<std::mutex> lock(llm_warm_mutex_);
+        --llm_generations_active_;
+    }
+    llm_warm_cv_.notify_all();
 }
 
 std::string ServerState::llm_settings_json() const {
@@ -2564,13 +2606,9 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
                 chat_speculation_ = nullptr;
             }
         }
-        // Fire-and-forget: the client debounces these while the user types.
-        // On llama's single slot they queue behind each other cheaply (each
-        // one extends the cached prefix incrementally).
-        std::thread([host = config_.llm_host, port = config_.llm_port, llama_body] {
-            std::string response;
-            llm::http_post_status(host, port, "/v1/chat/completions", llama_body, response);
-        }).detach();
+        // Coalesced: only the newest draft's prefill is worth running, and
+        // never in front of a real generation.
+        queue_llm_warm(llama_body);
         return json_response("{\"status\":\"warming\"}");
     }
 
@@ -2713,11 +2751,13 @@ void ServerState::start_chat_speculation(
             }
             spec->cv.notify_all();
         };
+        begin_llm_generation();
         const auto result = llm::stream_chat(host, port, body,
             [&](const std::string & delta) {
                 emit(scrubber.feed(delta));
                 return !spec->abort.load();
             });
+        end_llm_generation();
         emit(scrubber.flush());
         std::string first_sentence;
         {
@@ -2963,6 +3003,7 @@ void ServerState::chat_orchestrate(
                 push({ChatEvent::Kind::Sentence, std::move(sentence)});
             }
         };
+        begin_llm_generation();
         const auto result = llm::stream_chat(
             config_.llm_host,
             config_.llm_port,
@@ -2971,6 +3012,7 @@ void ServerState::chat_orchestrate(
                 emit(scrubber.feed(delta));
                 return !abort.load();
             });
+        end_llm_generation();
         emit(scrubber.flush());
         llm_prompt_n = result.prompt_n;
         llm_prompt_ms = result.prompt_ms;
@@ -3049,10 +3091,19 @@ void ServerState::chat_orchestrate(
         last_filler_index = chosen.index;
     };
     auto chain_filler = [&] {
-        // Mid-wait, the character is thinking -- chains draw only from the
-        // Think-kind hesitations, never the same one twice in a row.
+        // Mid-wait, thinking and quiet acknowledgment both read naturally;
+        // reactions do not. Drawing from both kinds keeps chains varied --
+        // Think alone has one short entry per language, and real-user runs
+        // chained the same "Uhh..." eleven times. Never the same clip twice
+        // in a row.
         auto pool = filler::candidates(
             filler::Size::Short, filler->chinese, filler::Kind::Think, true);
+        for (const int extra : filler::candidates(
+                 filler::Size::Short, filler->chinese, filler::Kind::Ack, true)) {
+            if (std::find(pool.begin(), pool.end(), extra) == pool.end()) {
+                pool.push_back(extra);
+            }
+        }
         pool.erase(std::remove(pool.begin(), pool.end(), last_filler_index), pool.end());
         if (pool.empty()) {
             filler_chain_open = false;
@@ -3270,13 +3321,9 @@ void ServerState::chat_orchestrate(
     // so the NEXT turn's prefill covers only the user's new message. Skipped
     // for aborted streams: the client did not keep this reply.
     if (completed && llm_ok && !warm_body_prefix.empty() && !reply_text.empty()) {
-        const std::string warm_body = warm_body_prefix +
+        queue_llm_warm(warm_body_prefix +
             ",{\"role\":\"assistant\",\"content\":" +
-            json_quote(hygiene::sanitize_assistant_text(reply_text)) + "}]}";
-        std::thread([host = config_.llm_host, port = config_.llm_port, warm_body] {
-            std::string response;
-            llm::http_post_status(host, port, "/v1/chat/completions", warm_body, response);
-        }).detach();
+            json_quote(hygiene::sanitize_assistant_text(reply_text)) + "}]}");
     }
 }
 

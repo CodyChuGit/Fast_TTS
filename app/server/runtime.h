@@ -244,6 +244,15 @@ private:
     // conversation pays only its own prefill. Called at startup and whenever
     // the system prompt changes (character or settings edits, model switch).
     void warm_llm_system_prompt();
+    // Every fire-and-forget prefill (typing prewarm, post-reply rewarm,
+    // system-prompt warm) funnels through here: only the NEWEST pending body
+    // is kept, at most one is in flight, and none dispatch while a real
+    // generation (send or speculation) needs the sidecar's single slot.
+    // Real-user testing showed a burst of mid-typing prewarms otherwise
+    // queues seconds of prefill in front of the actual send.
+    void queue_llm_warm(std::string body);
+    void begin_llm_generation();
+    void end_llm_generation();
     std::string fresh_llm_warm_body() const;
     mcp::SpeakOutcome run_mcp_speak(const std::string & text, long long seed);
 
@@ -281,6 +290,12 @@ private:
     // voice arrives instead of at a random moment. Seeded from measured
     // prewarmed-path times; guarded by filler_mutex_.
     double filler_wait_ms_[2] = {1600.0, 1200.0};
+    // Prewarm coalescing state; see queue_llm_warm.
+    std::mutex llm_warm_mutex_;
+    std::condition_variable llm_warm_cv_;
+    std::string llm_warm_pending_;
+    bool llm_warm_worker_running_ = false;
+    int llm_generations_active_ = 0;
 };
 
 }  // namespace minitts::server
