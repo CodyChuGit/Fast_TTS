@@ -14,6 +14,7 @@
 #include "engine/framework/runtime/session.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -234,11 +235,14 @@ private:
     // Launches a detached worker generating the reply for `llama_body` into a
     // ChatSpeculation buffer, replacing (and aborting) any previous one. Once
     // the reply settles, the worker also synthesizes the first sentence's
-    // audio on `model`.
-    void start_chat_speculation(const std::string & llama_body, LoadedModel * model, long long tts_seed);
-    // Hands over the current speculation when its key matches this body's
-    // messages; otherwise aborts it. Null when there is nothing to attach to.
-    std::shared_ptr<ChatSpeculation> take_matching_speculation(const std::string & llama_body);
+    // audio on `model`. `spec_key` is the punctuation-tolerant conversation
+    // key the real send will be matched against.
+    void start_chat_speculation(
+        const std::string & llama_body, const std::string & spec_key,
+        LoadedModel * model, long long tts_seed);
+    // Hands over the current speculation when its key matches; otherwise
+    // aborts it. Null when there is nothing to attach to.
+    std::shared_ptr<ChatSpeculation> take_matching_speculation(const std::string & key);
     // Primes the sidecar's prompt cache with the active character's rendered
     // system prompt on a background thread, so the first message of a fresh
     // conversation pays only its own prefill. Called at startup and whenever
@@ -278,6 +282,13 @@ private:
     std::mutex llm_switch_mutex_;
     std::shared_ptr<ChatSpeculation> chat_speculation_;
     std::mutex chat_speculation_mutex_;
+    // The conversation key of the most recent real send. A speculate request
+    // landing at or after its own send (the client's timer racing the enter
+    // key) must be dropped, or it becomes a zombie that generates the same
+    // reply again and steals the sidecar and TTS from the next turn.
+    // Guarded by chat_speculation_mutex_.
+    std::string llm_last_send_key_;
+    std::chrono::steady_clock::time_point llm_last_send_at_{};
     // Hesitation audio spoken the instant a non-speculative send arrives,
     // filling the air until the real first sentence lands.
     std::unordered_map<uint64_t, std::shared_ptr<std::vector<uint8_t>>> filler_pcm_;
@@ -296,6 +307,12 @@ private:
     std::string llm_warm_pending_;
     bool llm_warm_worker_running_ = false;
     int llm_generations_active_ = 0;
+    // One speculative stream at a time, newest wins. A superseded worker
+    // that has not started streaming yet sees its abort flag while waiting
+    // here and never reaches the sidecar; without this, a burst of
+    // mid-typing speculations queues whole prefills in front of the real
+    // send (measured: first token past 8 s for stall-heavy typists).
+    std::mutex llm_spec_stream_mutex_;
 };
 
 }  // namespace minitts::server

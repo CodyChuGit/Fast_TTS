@@ -582,11 +582,21 @@
     /^(?:what|where|when|why|how|who|which|whose|can|could|do|does|did|is|are|was|were|should|would|will|shall|am|have|has|any|got)\b/i;
 
   function speculateDelay(raw: string): number {
+    // Shape-gated: a speculation costs one to two seconds of uninterruptible
+    // sidecar prefill, so it fires fast ONLY when the draft looks sendable
+    // (the pre-enter pause is exactly such a moment) and the server attaches
+    // it even if trailing punctuation is typed afterwards. A mid-thought
+    // draft only speculates on a long deliberate hover -- real-user testing
+    // showed hot tiers on stall-heavy or Chinese typists (no spaces, so a
+    // word count is meaningless) keep the slot permanently busy and push the
+    // real send's first token past five seconds.
     const draft = raw.trimEnd();
-    if (SENTENCE_END.test(draft) || TRAILING_CLOSER.test(draft)) return 180;
-    if (QUESTION_START.test(draft)) return 400;
-    if (draft.split(/\s+/).length <= 3) return 400;
-    return 850;
+    if (SENTENCE_END.test(draft) || TRAILING_CLOSER.test(draft)) return 120;
+    const cjk = /[㐀-鿿]/.test(draft);
+    if (!cjk && QUESTION_START.test(draft)) return 300;
+    if (!cjk && draft.split(/\s+/).length <= 3) return 500;
+    if (cjk && Array.from(draft).length <= 6) return 500;
+    return 1500;
   }
 
   function queueChatPrewarm() {
@@ -599,7 +609,7 @@
       if (draft === lastSpeculatedDraft) return; // speculation already covers it
       lastPrewarmedDraft = draft;
       prewarmChat(draftMessages(draft));
-    }, 300);
+    }, 200);
     chatSpeculateTimer = setTimeout(() => {
       chatSpeculateTimer = null;
       const draft = chatInput.trim();

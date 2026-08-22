@@ -2222,6 +2222,17 @@ void ServerState::queue_llm_warm(std::string body) {
                 llm_warm_cv_.wait(lock);
                 continue;
             }
+            // Let the draft settle before spending sidecar time: a prefill
+            // cannot be interrupted once sent, and the send most often lands
+            // within half a second of the pause that queued this warm. A
+            // newer body or a generation arriving during the wait replaces
+            // or defers this dispatch for free.
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            lock.lock();
+            if (llm_warm_pending_.empty() || llm_generations_active_ > 0) {
+                continue;
+            }
             const auto body = std::move(llm_warm_pending_);
             llm_warm_pending_.clear();
             lock.unlock();
@@ -2394,12 +2405,45 @@ HttpResponse ServerState::handle_llm_settings_set(const std::string & body_text)
 
 namespace {
 
-// The speculation key: the messages portion of a llama body. Prewarm,
-// speculative, and real requests for the same draft build identical message
-// arrays even though their header fields differ.
-std::string speculation_key(const std::string & llama_body) {
-    const auto at = llama_body.find("\"messages\":");
-    return at == std::string::npos ? llama_body : llama_body.substr(at);
+// Trailing whitespace and sentence-final punctuation, ASCII and CJK: the
+// part of a draft most often typed in the last instant before send.
+std::string strip_terminal_tail(std::string text) {
+    static const std::vector<std::string> tails = {
+        " ", "\t", "\n", ".", "!", "?", "~", "…", "。", "！", "？", "～"};
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto & tail : tails) {
+            if (text.size() >= tail.size() &&
+                text.compare(text.size() - tail.size(), tail.size(), tail) == 0) {
+                text.resize(text.size() - tail.size());
+                changed = true;
+                break;
+            }
+        }
+    }
+    return text;
+}
+
+// The speculation key: the conversation's role/content pairs, with the
+// newest user message's terminal punctuation stripped. Predictive fill: a
+// reply generated for "what should i cook tonight" must still attach when
+// the user sends "...tonight?" -- the question mark typed in the last
+// moment does not change what they asked.
+std::string speculation_key(
+    const engine::io::json::Value::Array & list, size_t last_user_index) {
+    std::string key;
+    for (size_t i = 0; i < list.size(); ++i) {
+        key += list[i].find("role")->as_string();
+        key += '\x1f';
+        std::string content = list[i].find("content")->as_string();
+        if (i == last_user_index) {
+            content = strip_terminal_tail(std::move(content));
+        }
+        key += content;
+        key += '\x1e';
+    }
+    return key;
 }
 
 }  // namespace
@@ -2589,9 +2633,10 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
         first_message = false;
     }
     llama_body += "]}";
+    const std::string spec_key = speculation_key(list, last_user_index);
 
     if (speculate) {
-        start_chat_speculation(llama_body, model, tts_seed);
+        start_chat_speculation(llama_body, spec_key, model, tts_seed);
         return json_response("{\"status\":\"speculating\"}");
     }
     if (prewarm) {
@@ -2600,8 +2645,7 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
         // would only hold the llama slot against this prewarm.
         {
             std::lock_guard<std::mutex> lock(chat_speculation_mutex_);
-            if (chat_speculation_ != nullptr &&
-                chat_speculation_->key != speculation_key(llama_body)) {
+            if (chat_speculation_ != nullptr && chat_speculation_->key != spec_key) {
                 chat_speculation_->abort.store(true);
                 chat_speculation_ = nullptr;
             }
@@ -2612,19 +2656,24 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
         return json_response("{\"status\":\"warming\"}");
     }
 
-    auto speculation = take_matching_speculation(llama_body);
+    {
+        // Remember what is being served: a speculate request for this exact
+        // conversation arriving from here on lost its race with the send and
+        // must not run (see llm_last_send_key_).
+        std::lock_guard<std::mutex> lock(chat_speculation_mutex_);
+        llm_last_send_key_ = spec_key;
+        llm_last_send_at_ = std::chrono::steady_clock::now();
+    }
+    auto speculation = take_matching_speculation(spec_key);
 
-    // Fill the air with a hesitation in her voice while the reply starts from
-    // scratch. A speculative hit whose reply has settled (or whose first
-    // sentence is already synthesizing) has instant real audio and needs
-    // none; an early attach that caught the worker before any of that gets
-    // one like a cold turn does. The pick is not random: the kind answers
-    // the message (thinking at a question, a reaction to excitement, an
-    // acknowledgment otherwise) and the length targets the measured wait for
-    // this path, so the hesitation ends about when the real voice arrives.
+    // Hesitation audio is OPT-IN ("filler": true): spoken umm/uhh openers
+    // read as obtuse in real listening, so the default strategy is
+    // predictive -- aggressive speculation with punctuation-tolerant
+    // attachment -- and an uncovered miss simply starts with the fast short
+    // first clause. The filler machinery stays for callers that want it.
     const bool filler_wanted = [&] {
         const auto * flag = body.find("filler");
-        return flag == nullptr || !flag->is_bool() || flag->as_bool();
+        return flag != nullptr && flag->is_bool() && flag->as_bool();
     }();
     std::optional<ChatFiller> filler;
     bool spec_covered = false;
@@ -2715,11 +2764,18 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
 }
 
 void ServerState::start_chat_speculation(
-    const std::string & llama_body, LoadedModel * model, long long tts_seed) {
+    const std::string & llama_body, const std::string & spec_key,
+    LoadedModel * model, long long tts_seed) {
     auto spec = std::make_shared<ChatSpeculation>();
-    spec->key = speculation_key(llama_body);
+    spec->key = spec_key;
     {
         std::lock_guard<std::mutex> lock(chat_speculation_mutex_);
+        if (spec_key == llm_last_send_key_ &&
+            std::chrono::steady_clock::now() - llm_last_send_at_ < std::chrono::seconds(30)) {
+            // The real send for this draft already arrived; this speculate
+            // lost the timer-vs-enter race and would only duplicate it.
+            return;
+        }
         if (chat_speculation_ != nullptr) {
             if (chat_speculation_->key == spec->key) {
                 // Same draft already speculating; keep it.
@@ -2731,11 +2787,13 @@ void ServerState::start_chat_speculation(
     }
     std::thread([this, host = config_.llm_host, port = config_.llm_port, spec,
                  body = llama_body, model, tts_seed] {
-        // The first sentence is synthesized while the user hovers (and an
-        // early attach is covered by a hesitation clip), so the opener can be
-        // a whole sentence with real prosody instead of a latency-scalped
-        // clause.
-        SentenceSegmenter segmenter(SentenceSegmenter::Options{90, 140, 300});
+        // Real users mostly attach EARLY (send lands while this worker is
+        // still generating), and with no hesitation audio covering the air
+        // the first segment sets time-to-first-sound. 28 characters buys a
+        // fuller clause than the miss path's 16 without pushing the first
+        // sound noticeably later; a settled hover-hit plays it instantly
+        // either way.
+        SentenceSegmenter segmenter(SentenceSegmenter::Options{28, 56, 300});
         hygiene::StreamScrubber scrubber;
         auto emit = [&](const std::string & clean) {
             if (clean.empty()) {
@@ -2751,6 +2809,10 @@ void ServerState::start_chat_speculation(
             }
             spec->cv.notify_all();
         };
+        std::unique_lock<std::mutex> stream_lock(llm_spec_stream_mutex_);
+        if (spec->abort.load()) {
+            return;  // superseded while waiting for the stream slot
+        }
         begin_llm_generation();
         const auto result = llm::stream_chat(host, port, body,
             [&](const std::string & delta) {
@@ -2758,6 +2820,7 @@ void ServerState::start_chat_speculation(
                 return !spec->abort.load();
             });
         end_llm_generation();
+        stream_lock.unlock();
         emit(scrubber.flush());
         std::string first_sentence;
         {
@@ -2843,8 +2906,7 @@ void ServerState::start_chat_speculation(
 }
 
 std::shared_ptr<ChatSpeculation> ServerState::take_matching_speculation(
-    const std::string & llama_body) {
-    const auto key = speculation_key(llama_body);
+    const std::string & key) {
     std::lock_guard<std::mutex> lock(chat_speculation_mutex_);
     if (chat_speculation_ == nullptr) {
         return nullptr;

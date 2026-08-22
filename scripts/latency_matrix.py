@@ -83,8 +83,8 @@ def stream(payload):
 
 def measure(messages, filler=True, prewarm=True, speculate_wait=None):
     payload = {"messages": messages}
-    if not filler:
-        payload["filler"] = False
+    if filler:
+        payload["filler"] = True  # hesitation audio is opt-in server-side
     if speculate_wait is not None:
         post({"messages": messages, "speculate": True})
         time.sleep(speculate_wait)

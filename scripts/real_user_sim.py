@@ -20,10 +20,13 @@ QUESTION_START = re.compile(r'^(what|why|how|when|where|who|which|can|could|woul
 
 def speculate_delay(draft):
     if SENT_END.search(draft):
-        return 0.18
-    if QUESTION_START.match(draft) or len(draft.split()) <= 3:
-        return 0.40
-    return 0.85
+        return 0.12
+    cjk = any('㐀' <= c <= '鿿' for c in draft)
+    if not cjk and QUESTION_START.match(draft):
+        return 0.30
+    if (not cjk and len(draft.split()) <= 3) or (cjk and len(draft) <= 6):
+        return 0.50
+    return 1.50
 
 
 def post_async(payload):
@@ -140,18 +143,26 @@ def type_message(persona, history, text, rng):
         return history + [{"role": "user", "content": d.strip()}]
 
     def idle(pause, current):
+        # Timers fire DURING the pause at their offsets, exactly like the
+        # client's setTimeout -- firing them at pause end would (and once
+        # did) hide the speculate-vs-send race behind zero head start.
         nonlocal last_prewarmed, last_speculated, spent
-        time.sleep(pause)
-        spent += pause
         d = current.strip()
-        if not d:
-            return
-        if pause >= speculate_delay(d) and d != last_speculated:
-            last_speculated = d
-            post_async({"messages": draft_messages(d), "speculate": True})
-        elif pause >= 0.30 and d != last_prewarmed and d != last_speculated:
+        elapsed = 0.0
+        if d and pause >= 0.20 and d != last_prewarmed and d != last_speculated:
+            time.sleep(0.20 - elapsed)
+            elapsed = 0.20
             last_prewarmed = d
             post_async({"messages": draft_messages(d), "prewarm": True})
+        if d:
+            delay = speculate_delay(d)
+            if pause >= delay and d != last_speculated:
+                time.sleep(max(0.0, delay - elapsed))
+                elapsed = max(elapsed, delay)
+                last_speculated = d
+                post_async({"messages": draft_messages(d), "speculate": True})
+        time.sleep(pause - elapsed)
+        spent += pause
 
     i = 0
     while i < len(words):
