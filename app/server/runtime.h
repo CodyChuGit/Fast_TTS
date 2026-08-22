@@ -14,6 +14,7 @@
 #include "engine/framework/runtime/session.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -24,6 +25,30 @@
 #include <vector>
 
 namespace minitts::server {
+
+// A reply generated ahead of the user pressing send. While they pause over a
+// finished-looking draft, the whole generation runs in the background; if the
+// draft arrives unchanged, the real request attaches to this buffer and the
+// first token is a memory read. Filled by a detached worker under `mutex`,
+// consumed by chat_orchestrate; `abort` tears the worker down when the draft
+// changes. No thread handle lives here -- workers are detached and hold their
+// own shared_ptr, so whoever drops the last reference frees the state.
+struct ChatSpeculation {
+    // The "messages":[...] portion of the llama body; prewarm, speculative,
+    // and real requests for the same draft share it byte-for-byte.
+    std::string key;
+    std::atomic<bool> abort{false};
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::string text;                    // scrubbed text so far
+    std::vector<std::string> sentences;  // completed speech segments
+    std::string rest;                    // segmenter tail at end of stream
+    bool llm_done = false;
+    bool ok = false;
+    std::string error;
+    std::string finish_reason;
+    double prompt_n = -1, prompt_ms = -1, predicted_n = -1, predicted_ms = -1;
+};
 
 class ServerState final : public IHttpHandler {
 public:
@@ -175,7 +200,14 @@ private:
         const std::string & llama_body,
         const std::string & warm_body_prefix,
         long long tts_seed,
-        HttpStreamWriter & writer);
+        HttpStreamWriter & writer,
+        std::shared_ptr<ChatSpeculation> speculation = nullptr);
+    // Launches a detached worker generating the reply for `llama_body` into a
+    // ChatSpeculation buffer, replacing (and aborting) any previous one.
+    void start_chat_speculation(const std::string & llama_body);
+    // Hands over the current speculation when its key matches this body's
+    // messages; otherwise aborts it. Null when there is nothing to attach to.
+    std::shared_ptr<ChatSpeculation> take_matching_speculation(const std::string & llama_body);
     // Primes the sidecar's prompt cache with the active character's rendered
     // system prompt on a background thread, so the first message of a fresh
     // conversation pays only its own prefill. Called at startup and whenever
@@ -204,6 +236,8 @@ private:
     // sidecar, and two interleaved switches would race the port.
     std::unique_ptr<LlmManager> llm_manager_;
     std::mutex llm_switch_mutex_;
+    std::shared_ptr<ChatSpeculation> chat_speculation_;
+    std::mutex chat_speculation_mutex_;
 };
 
 }  // namespace minitts::server

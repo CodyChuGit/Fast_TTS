@@ -310,3 +310,15 @@ export function prewarmChat(messages: ChatMessage[]): void {
     body: JSON.stringify({ messages, prewarm: true })
   }).catch(() => {});
 }
+
+// One step past prewarming: when the draft looks finished, the server
+// generates the whole reply in the background. If the user sends the draft
+// unchanged, the response streams from that buffer and the first token is
+// nearly instant; an edited draft simply discards it.
+export function speculateChat(messages: ChatMessage[]): void {
+  fetch('/v1/chat/speak', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages, speculate: true })
+  }).catch(() => {});
+}

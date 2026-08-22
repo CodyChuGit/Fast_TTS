@@ -150,6 +150,16 @@ SseDeltaParser::Event SseDeltaParser::parse_payload(const std::string & payload)
             }
             return event;
         }
+        if (const auto * timings = value.find("timings")) {
+            const auto number = [&](const char * key) -> double {
+                const auto * v = timings->find(key);
+                return v != nullptr && v->is_number() ? v->as_number() : -1;
+            };
+            event.prompt_n = number("prompt_n");
+            event.prompt_ms = number("prompt_ms");
+            event.predicted_n = number("predicted_n");
+            event.predicted_ms = number("predicted_ms");
+        }
         if (const auto * choices = value.find("choices");
             choices != nullptr && choices->is_array() && !choices->as_array().empty()) {
             const auto & choice = choices->as_array()[0];
@@ -439,6 +449,12 @@ ChatResult stream_chat(
             }
             if (!event.finish_reason.empty()) {
                 result.finish_reason = event.finish_reason;
+            }
+            if (event.prompt_n >= 0) {
+                result.prompt_n = event.prompt_n;
+                result.prompt_ms = event.prompt_ms;
+                result.predicted_n = event.predicted_n;
+                result.predicted_ms = event.predicted_ms;
             }
             if (event.done) {
                 done = true;

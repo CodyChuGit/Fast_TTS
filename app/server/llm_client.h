@@ -31,6 +31,11 @@ public:
         std::string finish_reason;
         bool done = false;
         std::string error;
+        // llama's per-request timings, present on the final chunk only.
+        double prompt_n = -1;
+        double prompt_ms = -1;
+        double predicted_n = -1;
+        double predicted_ms = -1;
     };
 
     std::vector<Event> feed(const std::string & bytes);
@@ -46,6 +51,12 @@ struct ChatResult {
     bool ok = false;
     std::string error;
     std::string finish_reason;
+    // Telemetry from llama's final chunk: how much prompt was actually
+    // (re)processed for this request and what it cost. -1 when not reported.
+    double prompt_n = -1;
+    double prompt_ms = -1;
+    double predicted_n = -1;
+    double predicted_ms = -1;
 };
 
 // Plain HTTP GET against the sidecar (health polls). Returns the status code,

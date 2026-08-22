@@ -2145,6 +2145,18 @@ HttpResponse ServerState::handle_llm_settings_set(const std::string & body_text)
     return json_response(llm_settings_json());
 }
 
+namespace {
+
+// The speculation key: the messages portion of a llama body. Prewarm,
+// speculative, and real requests for the same draft build identical message
+// arrays even though their header fields differ.
+std::string speculation_key(const std::string & llama_body) {
+    const auto at = llama_body.find("\"messages\":");
+    return at == std::string::npos ? llama_body : llama_body.substr(at);
+}
+
+}  // namespace
+
 HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     if (config_.llm_port <= 0) {
         return error_response(
@@ -2222,6 +2234,13 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     // decode speed on CPU experts -- several hundred milliseconds per turn.
     const bool prewarm = [&] {
         const auto * flag = body.find("prewarm");
+        return flag != nullptr && flag->is_bool() && flag->as_bool();
+    }();
+    // Speculation goes one step past prewarming: generate the WHOLE reply
+    // while the user hovers over a finished-looking draft, so send attaches
+    // to a buffer instead of starting a generation.
+    const bool speculate = [&] {
+        const auto * flag = body.find("speculate");
         return flag != nullptr && flag->is_bool() && flag->as_bool();
     }();
 
@@ -2321,7 +2340,22 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     }
     llama_body += "]}";
 
+    if (speculate) {
+        start_chat_speculation(llama_body);
+        return json_response("{\"status\":\"speculating\"}");
+    }
     if (prewarm) {
+        // A prewarm for a DIFFERENT draft means the user typed past the
+        // speculated text: that speculation is dead, and letting it finish
+        // would only hold the llama slot against this prewarm.
+        {
+            std::lock_guard<std::mutex> lock(chat_speculation_mutex_);
+            if (chat_speculation_ != nullptr &&
+                chat_speculation_->key != speculation_key(llama_body)) {
+                chat_speculation_->abort.store(true);
+                chat_speculation_ = nullptr;
+            }
+        }
         // Fire-and-forget: the client debounces these while the user types.
         // On llama's single slot they queue behind each other cheaply (each
         // one extends the cached prefix incrementally).
@@ -2332,10 +2366,92 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
         return json_response("{\"status\":\"warming\"}");
     }
 
+    auto speculation = take_matching_speculation(llama_body);
     LoadedModel * model_ptr = model;
-    return sse_response([this, model_ptr, llama_body, warm_prefix, tts_seed](HttpStreamWriter & writer) {
-        chat_orchestrate(*model_ptr, llama_body, warm_prefix, tts_seed, writer);
+    return sse_response([this, model_ptr, llama_body, warm_prefix, tts_seed,
+                         speculation](HttpStreamWriter & writer) {
+        chat_orchestrate(*model_ptr, llama_body, warm_prefix, tts_seed, writer, speculation);
     });
+}
+
+void ServerState::start_chat_speculation(const std::string & llama_body) {
+    auto spec = std::make_shared<ChatSpeculation>();
+    spec->key = speculation_key(llama_body);
+    {
+        std::lock_guard<std::mutex> lock(chat_speculation_mutex_);
+        if (chat_speculation_ != nullptr) {
+            if (chat_speculation_->key == spec->key) {
+                // Same draft already speculating; keep it.
+                return;
+            }
+            chat_speculation_->abort.store(true);
+        }
+        chat_speculation_ = spec;
+    }
+    std::thread([host = config_.llm_host, port = config_.llm_port, spec,
+                 body = llama_body] {
+        SentenceSegmenter segmenter(SentenceSegmenter::Options{16, 28, 300});
+        hygiene::StreamScrubber scrubber;
+        auto emit = [&](const std::string & clean) {
+            if (clean.empty()) {
+                return;
+            }
+            auto sentences = segmenter.feed(clean);
+            {
+                std::lock_guard<std::mutex> lock(spec->mutex);
+                spec->text += clean;
+                for (auto & sentence : sentences) {
+                    spec->sentences.push_back(std::move(sentence));
+                }
+            }
+            spec->cv.notify_all();
+        };
+        const auto result = llm::stream_chat(host, port, body,
+            [&](const std::string & delta) {
+                emit(scrubber.feed(delta));
+                return !spec->abort.load();
+            });
+        emit(scrubber.flush());
+        {
+            std::lock_guard<std::mutex> lock(spec->mutex);
+            spec->rest = segmenter.flush();
+            spec->ok = result.ok;
+            spec->error = result.error;
+            spec->finish_reason = result.finish_reason;
+            spec->prompt_n = result.prompt_n;
+            spec->prompt_ms = result.prompt_ms;
+            spec->predicted_n = result.predicted_n;
+            spec->predicted_ms = result.predicted_ms;
+            spec->llm_done = true;
+        }
+        spec->cv.notify_all();
+    }).detach();
+}
+
+std::shared_ptr<ChatSpeculation> ServerState::take_matching_speculation(
+    const std::string & llama_body) {
+    const auto key = speculation_key(llama_body);
+    std::lock_guard<std::mutex> lock(chat_speculation_mutex_);
+    if (chat_speculation_ == nullptr) {
+        return nullptr;
+    }
+    auto spec = std::move(chat_speculation_);
+    chat_speculation_ = nullptr;
+    if (spec->key != key || spec->abort.load()) {
+        spec->abort.store(true);
+        // An aborted speculation whose worker died mid-stream is useless; a
+        // fresh normal request is both simpler and correct.
+        return nullptr;
+    }
+    // A speculation that ran but FAILED (sidecar hiccup) must not silently
+    // become an empty reply; fall back to the normal path.
+    {
+        std::lock_guard<std::mutex> spec_lock(spec->mutex);
+        if (spec->llm_done && !spec->ok) {
+            return nullptr;
+        }
+    }
+    return spec;
 }
 
 void ServerState::chat_orchestrate(
@@ -2343,7 +2459,8 @@ void ServerState::chat_orchestrate(
     const std::string & llama_body,
     const std::string & warm_body_prefix,
     long long tts_seed,
-    HttpStreamWriter & writer) {
+    HttpStreamWriter & writer,
+    std::shared_ptr<ChatSpeculation> speculation) {
     // Producer/consumer: the LLM reader thread turns the sidecar's SSE stream
     // into token and sentence events; this (writer) thread is the only one
     // touching the HTTP stream. Tokens flow out immediately; each completed
@@ -2360,6 +2477,9 @@ void ServerState::chat_orchestrate(
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
     std::atomic<bool> abort{false};
+    // llama's own per-request timings; written by the reader thread before it
+    // pushes LlmDone, read by the writer thread after llm_finished.
+    double llm_prompt_n = -1, llm_prompt_ms = -1, llm_predicted_n = -1, llm_predicted_ms = -1;
     auto push = [&](ChatEvent event) {
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
@@ -2369,6 +2489,72 @@ void ServerState::chat_orchestrate(
     };
 
     std::thread llm_thread([&] {
+        if (speculation != nullptr) {
+            // Speculative hit: the reply was generated (or is being generated)
+            // while the user hovered over send. Replay the buffer and then
+            // follow it live; the first token is a memory read.
+            size_t text_pos = 0;
+            size_t sentence_pos = 0;
+            while (!abort.load()) {
+                std::string new_text;
+                std::vector<std::string> new_sentences;
+                std::string rest;
+                std::string finish;
+                bool finished = false;
+                {
+                    std::unique_lock<std::mutex> lock(speculation->mutex);
+                    speculation->cv.wait_for(lock, std::chrono::milliseconds(250), [&] {
+                        return speculation->text.size() > text_pos ||
+                               speculation->sentences.size() > sentence_pos ||
+                               speculation->llm_done;
+                    });
+                    if (speculation->text.size() > text_pos) {
+                        new_text = speculation->text.substr(text_pos);
+                        text_pos = speculation->text.size();
+                    }
+                    for (size_t i = sentence_pos; i < speculation->sentences.size(); ++i) {
+                        new_sentences.push_back(speculation->sentences[i]);
+                    }
+                    sentence_pos = speculation->sentences.size();
+                    if (speculation->llm_done &&
+                        text_pos == speculation->text.size() &&
+                        sentence_pos == speculation->sentences.size()) {
+                        finished = true;
+                        rest = speculation->rest;
+                        finish = speculation->finish_reason;
+                        llm_prompt_n = speculation->prompt_n;
+                        llm_prompt_ms = speculation->prompt_ms;
+                        llm_predicted_n = speculation->predicted_n;
+                        llm_predicted_ms = speculation->predicted_ms;
+                    }
+                }
+                if (!new_text.empty()) {
+                    push({ChatEvent::Kind::Token, std::move(new_text)});
+                }
+                for (auto & sentence : new_sentences) {
+                    push({ChatEvent::Kind::Sentence, std::move(sentence)});
+                }
+                if (finished) {
+                    const bool truncated_tail = finish == "length" &&
+                        !ends_with_sentence_terminal(strip_speech_markup(rest));
+                    if (!rest.empty() && !truncated_tail) {
+                        push({ChatEvent::Kind::Sentence, std::move(rest)});
+                    }
+                    bool ok;
+                    std::string error;
+                    {
+                        std::lock_guard<std::mutex> lock(speculation->mutex);
+                        ok = speculation->ok;
+                        error = speculation->error;
+                    }
+                    push({ChatEvent::Kind::LlmDone, finish, ok, error});
+                    return;
+                }
+            }
+            // The client went away mid-replay; release the worker too.
+            speculation->abort.store(true);
+            return;
+        }
         // Chat cuts the opening clause earlier than the default: with decode
         // at ~58 t/s the difference between 28 and 16 buffered characters is
         // ~50 ms of silence before the first sound, and a short first clause
@@ -2397,6 +2583,10 @@ void ServerState::chat_orchestrate(
                 return !abort.load();
             });
         emit(scrubber.flush());
+        llm_prompt_n = result.prompt_n;
+        llm_prompt_ms = result.prompt_ms;
+        llm_predicted_n = result.predicted_n;
+        llm_predicted_ms = result.predicted_ms;
         auto rest = segmenter.flush();
         // A reply cut off by the token ceiling ends mid-thought. The dangling
         // fragment still displays as text, but speaking it would stop the
@@ -2514,6 +2704,14 @@ void ServerState::chat_orchestrate(
              << ",\"first_audio_ms\":" << first_audio_ms
              << ",\"wall_ms\":" << elapsed()
              << ",\"audio_seconds\":" << (static_cast<double>(audio_bytes) / 48000.0)
+             // Per-stage telemetry: how much prompt llama actually reprocessed
+             // this turn and what each stage cost. The waterfall that guides
+             // every latency decision.
+             << ",\"llm_prompt_n\":" << llm_prompt_n
+             << ",\"llm_prompt_ms\":" << llm_prompt_ms
+             << ",\"llm_predicted_n\":" << llm_predicted_n
+             << ",\"llm_predicted_ms\":" << llm_predicted_ms
+             << ",\"speculative_hit\":" << (speculation != nullptr ? "true" : "false")
              << "}}";
         write_sse(writer, done.str());
         write_sse_done(writer);

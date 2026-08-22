@@ -17,6 +17,7 @@
     character as fetchCharacter,
     chatSpeak,
     prewarmChat,
+    speculateChat,
     deleteCharacter,
     health,
     listCharacters,
@@ -32,7 +33,12 @@
     type ServerHealth,
     type SpeakStats
   } from '$lib/client';
-  import { CaptionTimeline } from '$lib/karaoke';
+  import {
+    CaptionTimeline,
+    SentenceCaptionTrack,
+    type CaptionWord,
+    type SentenceCaption
+  } from '$lib/karaoke';
   import '../app.css';
 
   let view: 'speak' | 'chat' | 'settings' | 'live' = 'speak';
@@ -60,7 +66,8 @@
   let liveAborter: AbortController | null = null;
   let livePlayer: Pcm16StreamPlayer | null = null;
   let liveTimeline: CaptionTimeline | null = null;
-  let liveWords: string[] = [];
+  let liveWords: CaptionWord[] = [];
+  // Counts syllables, not words -- the reveal advances syllable by syllable.
   let liveVisible = 0;
   let liveRaf = 0;
   let liveStage: HTMLElement | null = null;
@@ -98,6 +105,11 @@
   let chatPlayer: Pcm16StreamPlayer | null = null;
   let chatLog: HTMLElement | null = null;
   let chatScrollQueued = false;
+  // Spoken-sync subtitles for the reply: the server sends each sentence's text
+  // before its audio, so the caption bar tracks the voice exactly.
+  let chatTrack: SentenceCaptionTrack | null = null;
+  let chatCaption: SentenceCaption | null = null;
+  let chatRaf = 0;
 
   // Roleplay engine settings.
   let llm: LlmSettings | null = null;
@@ -298,8 +310,11 @@
       liveScrollQueued = false;
       const stage = liveStage;
       if (!stage) return;
-      const current = stage.querySelector<HTMLElement>('.live-word.current') ??
-        stage.querySelector<HTMLElement>('.live-word.shown:last-of-type');
+      let current = stage.querySelector<HTMLElement>('.syl.current');
+      if (!current) {
+        const shown = stage.querySelectorAll<HTMLElement>('.syl.shown');
+        current = shown.length ? shown[shown.length - 1] : null;
+      }
       if (!current) return;
       const target = current.offsetTop - stage.clientHeight * 0.45;
       if (Math.abs(stage.scrollTop - target) > 8) {
@@ -334,7 +349,7 @@
       liveWavUrl = '';
     }
     liveTimeline = new CaptionTimeline(input);
-    liveWords = liveTimeline.words.map((word) => word.text);
+    liveWords = liveTimeline.words;
     liveVisible = 0;
     liveStage?.scrollTo({ top: 0 });
     liveAborter = new AbortController();
@@ -530,22 +545,62 @@
   // prompt cache on a debounce, so send finds the prompt already resident
   // and the first token is one decode step away.
   let chatPrewarmTimer: ReturnType<typeof setTimeout> | null = null;
+  let chatSpeculateTimer: ReturnType<typeof setTimeout> | null = null;
   let lastPrewarmedDraft = '';
+  let lastSpeculatedDraft = '';
+
+  function draftMessages(draft: string) {
+    // Mirrors sendChat's history exactly; any divergence would break the
+    // cached prefix instead of extending it.
+    return [...chatMessages, { role: 'user' as const, content: draft }]
+      .slice(-24)
+      .map(({ role, content }) => ({ role, content }));
+  }
 
   function queueChatPrewarm() {
     if (chatPrewarmTimer !== null) clearTimeout(chatPrewarmTimer);
+    if (chatSpeculateTimer !== null) clearTimeout(chatSpeculateTimer);
     chatPrewarmTimer = setTimeout(() => {
       chatPrewarmTimer = null;
       const draft = chatInput.trim();
       if (!draft || chatBusy || draft === lastPrewarmedDraft) return;
       lastPrewarmedDraft = draft;
-      // Mirrors sendChat's history exactly; any divergence would break the
-      // cached prefix instead of extending it.
-      const messages = [...chatMessages, { role: 'user' as const, content: draft }]
-        .slice(-24)
-        .map(({ role, content }) => ({ role, content }));
-      prewarmChat(messages);
+      prewarmChat(draftMessages(draft));
     }, 300);
+    // A longer pause over a draft usually precedes send: generate the whole
+    // reply ahead of time so pressing Enter attaches to a finished buffer.
+    chatSpeculateTimer = setTimeout(() => {
+      chatSpeculateTimer = null;
+      const draft = chatInput.trim();
+      if (!draft || chatBusy || draft === lastSpeculatedDraft) return;
+      lastSpeculatedDraft = draft;
+      speculateChat(draftMessages(draft));
+    }, 850);
+  }
+
+  function stopChatCaptionLoop() {
+    if (chatRaf) cancelAnimationFrame(chatRaf);
+    chatRaf = 0;
+  }
+
+  function startChatCaptionLoop() {
+    stopChatCaptionLoop();
+    const step = () => {
+      if (chatPlayer && chatTrack) {
+        const next = chatTrack.captionAt(chatPlayer.playedSeconds());
+        if (!next) {
+          if (chatCaption) chatCaption = null;
+        } else if (
+          !chatCaption ||
+          chatCaption.index !== next.index ||
+          chatCaption.visible !== next.visible
+        ) {
+          chatCaption = next;
+        }
+      }
+      chatRaf = requestAnimationFrame(step);
+    };
+    chatRaf = requestAnimationFrame(step);
   }
 
   async function sendChat() {
@@ -555,7 +610,12 @@
       clearTimeout(chatPrewarmTimer);
       chatPrewarmTimer = null;
     }
+    if (chatSpeculateTimer !== null) {
+      clearTimeout(chatSpeculateTimer);
+      chatSpeculateTimer = null;
+    }
     lastPrewarmedDraft = '';
+    lastSpeculatedDraft = '';
     chatBusy = true;
     chatError = '';
     chatStats = null;
@@ -575,6 +635,8 @@
         startMaxWaitMs: 250
       });
       await chatPlayer.start();
+      chatTrack = new SentenceCaptionTrack();
+      startChatCaptionLoop();
       // The full visible history goes up each turn; the sidecar's prompt cache
       // makes re-sending the prefix nearly free.
       const history = chatMessages
@@ -593,8 +655,13 @@
               chatLog?.scrollTo({ top: chatLog.scrollHeight });
             });
           }
+        } else if (event.type === 'sentence') {
+          chatTrack?.addSentence(event.text);
         } else if (event.type === 'audio') {
-          chatPlayer?.push(base64ToBytes(event.audio));
+          const pcm = base64ToBytes(event.audio);
+          chatPlayer?.push(pcm);
+          // 24 kHz mono s16le: 48000 bytes per second of speech.
+          chatTrack?.addAudioSeconds(pcm.byteLength / 48000);
         } else if (event.type === 'error') {
           chatError = event.message;
         } else if (event.type === 'done') {
@@ -607,6 +674,9 @@
         chatError = error instanceof Error ? error.message : String(error);
       }
     } finally {
+      stopChatCaptionLoop();
+      chatCaption = null;
+      chatTrack = null;
       await chatPlayer?.stop();
       chatPlayer = null;
       const last = chatMessages[chatMessages.length - 1];
@@ -645,6 +715,7 @@
     aborter?.abort();
     liveAborter?.abort();
     stopLiveLoop();
+    stopChatCaptionLoop();
     if (recorder?.state === 'recording') recorder.stop();
     recordingStream?.getTracks().forEach((track) => track.stop());
     if (lastWavUrl) URL.revokeObjectURL(lastWavUrl);
@@ -753,12 +824,16 @@
       <div class="live-caption" bind:this={liveStage}>
         {#if liveWords.length}
           <p class="live-line">
-            {#each liveWords as word, index}
-              <span
-                class="live-word"
-                class:shown={index < liveVisible}
-                class:current={liveSpeaking && index === liveVisible - 1}
-              >{word}</span>
+            {#each liveWords as word (word.offset)}
+              <span class="live-word">
+                {#each word.syllables as syllable, part}
+                  <span
+                    class="syl"
+                    class:shown={word.offset + part < liveVisible}
+                    class:current={liveSpeaking && word.offset + part === liveVisible - 1}
+                  >{syllable.text}</span>
+                {/each}
+              </span>
             {/each}
           </p>
         {:else}
@@ -812,6 +887,23 @@
           </div>
         {/each}
       </div>
+      {#if chatCaption && chatCaption.words.length}
+        <div class="chat-caption">
+          {#key chatCaption.index}
+            {#each chatCaption.words as word (word.offset)}
+              <span class="live-word">
+                {#each word.syllables as syllable, part}
+                  <span
+                    class="syl"
+                    class:shown={word.offset + part < chatCaption.visible}
+                    class:current={word.offset + part === chatCaption.visible - 1}
+                  >{syllable.text}</span>
+                {/each}
+              </span>
+            {/each}
+          {/key}
+        </div>
+      {/if}
       <form class="chat-input" on:submit|preventDefault={sendChat}>
         <input
           bind:value={chatInput}
