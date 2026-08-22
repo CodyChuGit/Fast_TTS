@@ -5,6 +5,7 @@
 #include "segmenter.h"
 #include "multipart.h"
 #include "chat_hygiene.h"
+#include "filler.h"
 #include "ui_assets.h"
 
 #include "../cli/request.h"
@@ -1640,6 +1641,120 @@ void ServerState::apply_character(LoadedModel & model, const CharacterConfig & c
         preset = it->second;
     }
     model.default_voice_preset = std::move(preset);
+    metadata_lock.unlock();
+
+    // The character voice defines the filler audio; refingerprint and rebuild
+    // the hesitation library in the new voice.
+    uint64_t fp = 1469598103934665603ull;
+    {
+        std::shared_lock<std::shared_mutex> read_lock(model.metadata_mutex);
+        if (model.default_voice_preset.has_value() && model.default_voice_preset->audio.has_value()) {
+            for (const float sample : model.default_voice_preset->audio->samples) {
+                uint32_t bits;
+                std::memcpy(&bits, &sample, sizeof(bits));
+                fp ^= bits;
+                fp *= 1099511628211ull;
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(filler_mutex_);
+        if (filler_voice_fp_ == fp) {
+            return;
+        }
+        filler_voice_fp_ = fp;
+        filler_pcm_.clear();
+    }
+    start_filler_build(model);
+}
+
+void ServerState::start_filler_build(LoadedModel & model) {
+    bool expected = false;
+    if (!filler_build_running_.compare_exchange_strong(expected, true)) {
+        return;  // a build is already running; it re-checks the fp per clip
+    }
+    std::thread([this, &model] {
+        // Let startup warmups finish before competing for the model.
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+        const auto dir = character_dir_ / "fillers";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        for (size_t i = 0; i < filler::library().size(); ++i) {
+            uint64_t fp;
+            {
+                std::lock_guard<std::mutex> lock(filler_mutex_);
+                fp = filler_voice_fp_;
+            }
+            const auto & entry = filler::library()[i];
+            const uint64_t key = filler::clip_key(fp, entry.text);
+            {
+                std::lock_guard<std::mutex> lock(filler_mutex_);
+                if (filler_pcm_.count(key) != 0) {
+                    continue;
+                }
+            }
+            char name[32];
+            std::snprintf(name, sizeof(name), "%016llx.pcm",
+                          static_cast<unsigned long long>(key));
+            const auto path = dir / name;
+            auto clip = std::make_shared<std::vector<uint8_t>>();
+            std::ifstream in(path, std::ios::binary);
+            if (in) {
+                clip->assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            } else {
+                try {
+                    Value::Object fields;
+                    fields.emplace("input", Value::make_string(entry.text));
+                    fields.emplace("seed", Value::make_number(777));
+                    const auto body = Value::make_object(std::move(fields));
+                    auto request = build_speech_request(model, body);
+                    request.options["stream_accumulate"] = "false";
+                    const int64_t cap = entry.size == filler::Size::Short ? 48
+                        : entry.size == filler::Size::Medium ? 96 : 160;
+                    request.options["max_tokens"] = std::to_string(cap);
+                    run_streaming_model(model, request, [&](const engine::runtime::StreamEvent & event) {
+                        if (event.audio_output.has_value()) {
+                            const auto pcm = encode_pcm16_samples(*event.audio_output);
+                            clip->insert(clip->end(), pcm.begin(), pcm.end());
+                        }
+                        for (const auto & named : event.named_audio_outputs) {
+                            const auto pcm = encode_pcm16_samples(named.audio);
+                            clip->insert(clip->end(), pcm.begin(), pcm.end());
+                        }
+                    });
+                } catch (const std::exception & ex) {
+                    std::cerr << "filler synthesis skipped (" << ex.what() << ")\n";
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    continue;
+                }
+                if (!clip->empty()) {
+                    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+                    out.write(reinterpret_cast<const char *>(clip->data()),
+                              static_cast<std::streamsize>(clip->size()));
+                }
+            }
+            if (!clip->empty()) {
+                std::lock_guard<std::mutex> lock(filler_mutex_);
+                if (filler_voice_fp_ == fp) {
+                    filler_pcm_[key] = std::move(clip);
+                } else {
+                    std::cerr << "filler build: fp changed mid-build, clip dropped\n";
+                }
+            } else {
+                std::cerr << "filler build: empty clip for entry " << i << "\n";
+            }
+            // Yield between clips so a live chat never queues behind more
+            // than one short synthesis.
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+        filler_build_running_.store(false);
+    }).detach();
+}
+
+std::shared_ptr<std::vector<uint8_t>> ServerState::find_filler(uint64_t key) const {
+    std::lock_guard<std::mutex> lock(filler_mutex_);
+    const auto it = filler_pcm_.find(key);
+    return it == filler_pcm_.end() ? nullptr : it->second;
 }
 
 HttpResponse ServerState::handle_character_get() {
@@ -2367,10 +2482,41 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     }
 
     auto speculation = take_matching_speculation(llama_body);
+
+    // No speculation to attach to means the reply starts from scratch: fill
+    // the air with a hesitation in her voice while it does. Speculative hits
+    // have instant audio and need none. Size by how cold the turn is,
+    // language by the user's newest message.
+    std::shared_ptr<std::vector<uint8_t>> filler_clip;
+    if (speculation == nullptr && last_user_index < list.size()) {
+        const auto & latest_user = list[last_user_index].find("content")->as_string();
+        const bool zh = hygiene::mostly_cjk(latest_user);
+        const auto size = assistant_turns == 0 ? filler::Size::Medium : filler::Size::Short;
+        const auto seed = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const int index = filler::pick(size, zh, seed);
+        if (index >= 0) {
+            uint64_t fp;
+            size_t cached;
+            {
+                std::lock_guard<std::mutex> lock(filler_mutex_);
+                fp = filler_voice_fp_;
+                cached = filler_pcm_.size();
+            }
+            filler_clip = find_filler(
+                filler::clip_key(fp, filler::library()[static_cast<size_t>(index)].text));
+            if (filler_clip == nullptr) {
+                std::cerr << "filler miss: index=" << index << " cached=" << cached
+                          << " fp=" << fp << "\n";
+            }
+        }
+    }
+
     LoadedModel * model_ptr = model;
     return sse_response([this, model_ptr, llama_body, warm_prefix, tts_seed,
-                         speculation](HttpStreamWriter & writer) {
-        chat_orchestrate(*model_ptr, llama_body, warm_prefix, tts_seed, writer, speculation);
+                         speculation, filler_clip](HttpStreamWriter & writer) {
+        chat_orchestrate(*model_ptr, llama_body, warm_prefix, tts_seed, writer,
+                         speculation, filler_clip);
     });
 }
 
@@ -2539,7 +2685,8 @@ void ServerState::chat_orchestrate(
     const std::string & warm_body_prefix,
     long long tts_seed,
     HttpStreamWriter & writer,
-    std::shared_ptr<ChatSpeculation> speculation) {
+    std::shared_ptr<ChatSpeculation> speculation,
+    std::shared_ptr<std::vector<uint8_t>> filler_pcm) {
     // Producer/consumer: the LLM reader thread turns the sidecar's SSE stream
     // into token and sentence events; this (writer) thread is the only one
     // touching the HTTP stream. Tokens flow out immediately; each completed
@@ -2716,6 +2863,13 @@ void ServerState::chat_orchestrate(
 
     try {
         write_sse(writer, "{\"type\":\"start\"}");
+        if (filler_pcm != nullptr && !filler_pcm->empty()) {
+            // The hesitation clip goes out immediately: the character starts
+            // making sound while the reply is still being generated, and the
+            // real audio queues behind it seamlessly in the client player.
+            audio_bytes += filler_pcm->size();
+            write_sse(writer, "{\"type\":\"audio\",\"audio\":" + json_quote(base64_encode(*filler_pcm)) + "}");
+        }
         while (true) {
             ChatEvent event;
             {

@@ -207,7 +207,13 @@ private:
         const std::string & warm_body_prefix,
         long long tts_seed,
         HttpStreamWriter & writer,
-        std::shared_ptr<ChatSpeculation> speculation = nullptr);
+        std::shared_ptr<ChatSpeculation> speculation = nullptr,
+        std::shared_ptr<std::vector<uint8_t>> filler_pcm = nullptr);
+    // Pre-synthesizes the filler library in the active character's voice on a
+    // background thread, disk-cached per (voice, text) so later boots just
+    // load. Restarted whenever the character voice changes.
+    void start_filler_build(LoadedModel & model);
+    std::shared_ptr<std::vector<uint8_t>> find_filler(uint64_t key) const;
     // Launches a detached worker generating the reply for `llama_body` into a
     // ChatSpeculation buffer, replacing (and aborting) any previous one. Once
     // the reply settles, the worker also synthesizes the first sentence's
@@ -246,6 +252,12 @@ private:
     std::mutex llm_switch_mutex_;
     std::shared_ptr<ChatSpeculation> chat_speculation_;
     std::mutex chat_speculation_mutex_;
+    // Hesitation audio spoken the instant a non-speculative send arrives,
+    // filling the air until the real first sentence lands.
+    std::unordered_map<uint64_t, std::shared_ptr<std::vector<uint8_t>>> filler_pcm_;
+    mutable std::mutex filler_mutex_;
+    uint64_t filler_voice_fp_ = 0;
+    std::atomic<bool> filler_build_running_{false};
 };
 
 }  // namespace minitts::server
