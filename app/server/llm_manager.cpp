@@ -69,11 +69,18 @@ bool LlmManager::start(const LlmModelSpec & spec, std::string & error) {
         "--cache-reuse", "256",
         "--parallel", "1",
         "-t", "6",
-        // CPU-resident tensors (MoE expert offload) load as real memory, not
-        // mmap: mapped pages get evicted whenever a game or browser wants
-        // RAM, and the next chat then page-faults experts back from disk.
-        // The host has RAM to spare; llama itself recommends this.
-        "--load-mode", "none",
+        // CPU-resident tensors (MoE expert offload) load as real memory and
+        // are PINNED: mapped or unpinned pages get evicted whenever a game
+        // or browser wants RAM, and the next chat then page-faults experts
+        // back from disk. The host has 128 GB; measured +4% decode from
+        // mlock alone on the CPU-expert path.
+        "--load-mode", "mlock",
+        // Flash attention plus q8_0 KV: ~300 MB of VRAM back at 8k context
+        // with no measured speed or quality cost, spent on keeping more MoE
+        // expert layers on the GPU (see start.ps1 --n-cpu-moe values).
+        "-fa", "on",
+        "-ctk", "q8_0",
+        "-ctv", "q8_0",
     };
     for (const auto & extra : spec.extra_args) {
         args.push_back(extra);

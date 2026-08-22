@@ -211,20 +211,25 @@ if (Test-Path -LiteralPath $LlmModelPath -PathType Leaf) {
 }
 if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
     # All 16.8 GB of Q4_K_M cannot sit beside the resident TTS model on a
-    # 24 GB card, but most of it can: only the first 9 layers' MoE experts
-    # stay in system RAM, and a 1024-token micro-batch keeps the split
-    # prefill efficient (measured on this 3090: prompt 590 t/s and decode
-    # 47 t/s versus 129/17 with everything on the CPU, at 14.5 GB beside
-    # the trimmed TTS caches). Gemma 4 is a reasoning model, and a voice
-    # conversation cannot wait through a hidden think phase -- a zero
+    # 24 GB card, but most of it can: only the first few layers' MoE experts
+    # stay in system RAM. Flash attention + q8_0 KV (llm_manager base args)
+    # freed ~300 MB, spent here on two more GPU expert layers, and a
+    # 2048-token micro-batch speeds the split bulk prefill (grid-measured on
+    # this 3090 beside the Q4-mix TTS: prefill 1060 -> 1749 t/s, decode
+    # 53.8 -> ~60 t/s, 22.9 GB total). Gemma 4 is a reasoning model, and a
+    # voice conversation cannot wait through a hidden think phase -- a zero
     # reasoning budget makes it answer directly.
     $llmModels += , [ordered]@{
         id = "gemma"
         name = "Gemma 4 26B heretic"
         path = ($gemmaModelPath -replace "\\", "/")
-        # Two expert layers deeper when the small TTS model frees the VRAM.
-        extra_args = @("--n-cpu-moe", $(if ($ModelPath -match '0\.6b|q4_k-mix') { "5" } else { "7" }),
-            "-ub", "1024", "--reasoning-budget", "0")
+        # Deeper on the GPU when the small TTS model frees the VRAM; the
+        # larger-TTS branch stays conservative (one layer from KV savings).
+        extra_args = @($(if ($ModelPath -match '0\.6b|q4_k-mix') {
+                @("--n-cpu-moe", "3", "-ub", "2048")
+            } else {
+                @("--n-cpu-moe", "6", "-ub", "1024")
+            }) + @("--reasoning-budget", "0"))
     }
 }
 $vanillaGemmaPath = Join-Path $repoRoot "models\gemma-4-26B-A4B-it-qat-GGUF\gemma-4-26B_q4_0-it.gguf"
@@ -236,7 +241,7 @@ if (Test-Path -LiteralPath $vanillaGemmaPath -PathType Leaf) {
         id = "gemma-vanilla"
         name = "Gemma 4 26B (vanilla)"
         path = ($vanillaGemmaPath -replace "\\", "/")
-        extra_args = @("--n-cpu-moe", $(if ($ModelPath -match '0\.6b|q4_k-mix') { "7" } else { "10" }),
+        extra_args = @("--n-cpu-moe", $(if ($ModelPath -match '0\.6b|q4_k-mix') { "6" } else { "9" }),
             "-ub", "1024", "--reasoning-budget", "0")
     }
 }
