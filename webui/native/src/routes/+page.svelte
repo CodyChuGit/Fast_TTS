@@ -922,6 +922,7 @@
         <p class="status bad">{chatError}</p>
       {:else if chatStats}
         <p class="status">
+          {#if chatStats.speculative_hit}⚡ instant (reply was ready before send) · {/if}
           First token {chatStats.first_token_ms < 0 ? '—' : `${chatStats.first_token_ms.toFixed(0)} ms`}
           · first audio {chatStats.first_audio_ms < 0 ? '—' : `${chatStats.first_audio_ms.toFixed(0)} ms`}
           · {chatStats.audio_seconds.toFixed(1)} s spoken in {(chatStats.wall_ms / 1000).toFixed(1)} s

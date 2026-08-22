@@ -194,6 +194,10 @@ export interface ChatStats {
   first_audio_ms: number;
   wall_ms: number;
   audio_seconds: number;
+  // True when the reply attached to a speculation generated while typing.
+  speculative_hit?: boolean;
+  llm_prompt_n?: number;
+  llm_prompt_ms?: number;
 }
 
 export type ChatEvent =
