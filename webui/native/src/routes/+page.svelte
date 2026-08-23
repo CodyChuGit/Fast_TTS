@@ -41,7 +41,7 @@
   } from '$lib/karaoke';
   import '../app.css';
 
-  let view: 'speak' | 'chat' | 'settings' | 'live' = 'speak';
+  let view: 'speak' | 'chat' | 'settings' | 'live' | 'voice' = 'speak';
   let server: ServerHealth | null = null;
   let active: Character | null = null;
 
@@ -54,6 +54,169 @@
   let lastWavUrl = '';
   let aborter: AbortController | null = null;
   let player: Pcm16StreamPlayer | null = null;
+
+  // Voice view: live streaming STT. The mic is captured at 16 kHz through an
+  // AudioWorklet, shipped to the server as small sequential PCM posts (a
+  // browser cannot stream a request body over HTTP/1.1), and the transcript
+  // events come back over one SSE connection. Solid text has stabilized
+  // across ASR re-decodes; dimmed text is the still-revising tail.
+  type VoiceTurn = {
+    id: number;
+    stable: string;
+    tentative: string;
+    final?: string;
+    timing?: { first_partial_ms: number; eot_to_final_ms: number };
+  };
+  let voiceActive = false;
+  let voiceSpeechActive = false;
+  let voiceError = '';
+  let voiceTurns: VoiceTurn[] = [];
+  let voiceSessionId = '';
+  let voiceEvents: EventSource | null = null;
+  let voiceStream: MediaStream | null = null;
+  let voiceContext: AudioContext | null = null;
+  let voiceNode: AudioWorkletNode | null = null;
+  let voicePending: Float32Array[] = [];
+  let voiceFlushTimer: ReturnType<typeof setInterval> | null = null;
+  let voicePostChain: Promise<unknown> = Promise.resolve();
+
+  function voiceTurn(id: number): VoiceTurn {
+    let turn = voiceTurns.find((t) => t.id === id);
+    if (!turn) {
+      turn = { id, stable: '', tentative: '' };
+      voiceTurns = [...voiceTurns, turn];
+      if (voiceTurns.length > 12) voiceTurns = voiceTurns.slice(-12);
+    }
+    return turn;
+  }
+
+  async function startVoice() {
+    voiceError = '';
+    voiceTurns = [];
+    try {
+      const created = await fetch('/v1/voice/sessions', { method: 'POST' });
+      if (!created.ok) throw new Error(`voice session: ${created.status} ${await created.text()}`);
+      voiceSessionId = (await created.json()).id;
+
+      voiceEvents = new EventSource(`/v1/voice/sessions/events?id=${voiceSessionId}`);
+      voiceEvents.onmessage = (message) => {
+        if (message.data === '[DONE]') return;
+        try {
+          const event = JSON.parse(message.data);
+          if (event.type === 'speech_started') {
+            voiceSpeechActive = true;
+            voiceTurn(event.utterance_id);
+          } else if (event.type === 'stable_transcript') {
+            voiceTurn(event.utterance_id).stable = event.text;
+            voiceTurns = voiceTurns;
+          } else if (event.type === 'partial_transcript') {
+            voiceTurn(event.utterance_id).tentative = event.text;
+            voiceTurns = voiceTurns;
+          } else if (event.type === 'speech_ended') {
+            voiceSpeechActive = false;
+          } else if (event.type === 'final_transcript') {
+            const turn = voiceTurn(event.utterance_id);
+            turn.final = event.text;
+            turn.tentative = '';
+            turn.timing = event.timings;
+            voiceTurns = voiceTurns;
+          } else if (event.type === 'error') {
+            voiceError = event.message;
+          }
+        } catch {
+          // Malformed frame; keep listening.
+        }
+      };
+
+      voiceStream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+      });
+      voiceContext = new AudioContext({ sampleRate: 16000 });
+      const workletUrl = URL.createObjectURL(
+        new Blob(
+          [
+            `class VoiceCapture extends AudioWorkletProcessor {
+               process(inputs) {
+                 const ch = inputs[0] && inputs[0][0];
+                 if (ch) this.port.postMessage(ch.slice(0));
+                 return true;
+               }
+             }
+             registerProcessor('voice-capture', VoiceCapture);`
+          ],
+          { type: 'application/javascript' }
+        )
+      );
+      await voiceContext.audioWorklet.addModule(workletUrl);
+      URL.revokeObjectURL(workletUrl);
+      const source = voiceContext.createMediaStreamSource(voiceStream);
+      voiceNode = new AudioWorkletNode(voiceContext, 'voice-capture');
+      voiceNode.port.onmessage = (message) => {
+        voicePending.push(message.data as Float32Array);
+      };
+      source.connect(voiceNode);
+
+      // Ship ~128 ms batches, strictly in order.
+      voiceFlushTimer = setInterval(() => {
+        if (voicePending.length === 0 || !voiceSessionId) return;
+        const chunks = voicePending;
+        voicePending = [];
+        const total = chunks.reduce((n, c) => n + c.length, 0);
+        const pcm = new Int16Array(total);
+        let offset = 0;
+        for (const chunk of chunks) {
+          for (let i = 0; i < chunk.length; i += 1) {
+            const v = Math.max(-1, Math.min(1, chunk[i]));
+            pcm[offset + i] = v < 0 ? v * 32768 : v * 32767;
+          }
+          offset += chunk.length;
+        }
+        const id = voiceSessionId;
+        voicePostChain = voicePostChain.then(() =>
+          fetch(`/v1/voice/sessions/audio?id=${id}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: pcm.buffer
+          }).catch(() => {})
+        );
+      }, 128);
+      voiceActive = true;
+    } catch (error) {
+      voiceError = error instanceof Error ? error.message : String(error);
+      await stopVoice();
+    }
+  }
+
+  async function stopVoice() {
+    voiceActive = false;
+    voiceSpeechActive = false;
+    if (voiceFlushTimer !== null) {
+      clearInterval(voiceFlushTimer);
+      voiceFlushTimer = null;
+    }
+    voiceNode?.disconnect();
+    voiceNode = null;
+    voiceStream?.getTracks().forEach((track) => track.stop());
+    voiceStream = null;
+    if (voiceContext) {
+      try {
+        await voiceContext.close();
+      } catch {
+        // Already closed.
+      }
+      voiceContext = null;
+    }
+    if (voiceSessionId) {
+      const id = voiceSessionId;
+      voiceSessionId = '';
+      // Let queued audio land, then close the turn server-side.
+      voicePostChain.then(() => fetch(`/v1/voice/sessions/stop?id=${id}`, { method: 'POST' }).catch(() => {}));
+    }
+    // Keep the SSE open briefly so the last final_transcript arrives.
+    const events = voiceEvents;
+    voiceEvents = null;
+    if (events) setTimeout(() => events.close(), 4000);
+  }
 
   // Live view: the minimalist sing-along stage. Words of the input light up
   // exactly as the voice reaches them, driven by the player's playback clock
@@ -762,6 +925,7 @@
   onDestroy(() => {
     aborter?.abort();
     liveAborter?.abort();
+    void stopVoice();
     stopLiveLoop();
     stopChatCaptionLoop();
     if (recorder?.state === 'recording') recorder.stop();
@@ -787,6 +951,7 @@
   <nav>
     <button class:active={view === 'speak'} on:click={() => (view = 'speak')}>Speak</button>
     <button class:active={view === 'live'} on:click={() => (view = 'live')}>Live</button>
+    <button class:active={view === 'voice'} on:click={() => (view = 'voice')}>Voice</button>
     {#if server?.llm}
       <button class:active={view === 'chat'} on:click={() => (view = 'chat')}>Chat</button>
     {/if}
@@ -909,6 +1074,43 @@
             <a class="ghost" href={liveWavUrl} download="speech.wav">WAV</a>
           {/if}
           <button class="ghost" on:click={liveClear}>Clear</button>
+        {/if}
+      </div>
+    </section>
+  {:else if view === 'voice'}
+    <section class="panel" style="display:flex;flex-direction:column;gap:14px;">
+      <h2 style="margin:0;">Voice — live transcription</h2>
+      <p style="margin:0;opacity:.75;">
+        Speak into the microphone; words appear while you talk. Solid text is the stable
+        transcript, dimmed text is still being revised, and each turn finalizes the moment
+        you pause.
+      </p>
+      <div class="speak-actions">
+        {#if !voiceActive}
+          <button class="primary" on:click={startVoice}>Start listening</button>
+        {:else}
+          <button class="danger" on:click={stopVoice}>Stop</button>
+          <span class="status" style="align-self:center;">
+            {voiceSpeechActive ? '● listening — speech detected' : '○ listening'}
+          </span>
+        {/if}
+      </div>
+      {#if voiceError}
+        <p class="status bad">{voiceError}</p>
+      {/if}
+      <div style="display:flex;flex-direction:column;gap:10px;min-height:120px;">
+        {#each voiceTurns as turn (turn.id)}
+          <div style="padding:10px 12px;border-radius:10px;background:rgba(127,127,127,.08);">
+            <span>{turn.final ?? turn.stable}</span>{#if !turn.final && turn.tentative}<span style="opacity:.45;font-style:italic;"> {turn.tentative}</span>{/if}
+            {#if turn.final && turn.timing}
+              <div style="margin-top:4px;font-size:.78em;opacity:.55;">
+                first partial {turn.timing.first_partial_ms} ms · end-of-turn → final {turn.timing.eot_to_final_ms} ms
+              </div>
+            {/if}
+          </div>
+        {/each}
+        {#if voiceActive && voiceTurns.length === 0}
+          <p class="status" style="opacity:.6;">Say something…</p>
         {/if}
       </div>
     </section>

@@ -211,7 +211,9 @@ bool is_chunked_only(std::string_view value) {
 }
 
 bool wants_incremental_body(const HttpRequest & request) {
-    if (request.path != kLiveIngestPath) {
+    // The live-voice route shares the transcription route's incremental-body
+    // contract: raw PCM streamed while the response SSE flows back.
+    if (request.path != kLiveIngestPath && request.path != "/v1/voice/live") {
         return false;
     }
     const auto it = request.headers.find("transfer-encoding");

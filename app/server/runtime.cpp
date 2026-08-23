@@ -1014,7 +1014,21 @@ ServerState::ServerState(
     }
 }
 
-ServerState::~ServerState() = default;
+ServerState::~ServerState() {
+    // Voice browser sessions own detachable-looking but joined threads;
+    // close them all so shutdown cannot race a live transcription.
+    std::vector<std::shared_ptr<VoiceBrowserSession>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(voice_sessions_mutex_);
+        for (auto & [id, session] : voice_sessions_) {
+            sessions.push_back(session);
+        }
+        voice_sessions_.clear();
+    }
+    for (auto & session : sessions) {
+        close_voice_session(*session);
+    }
+}
 
 HttpResponse ServerState::handle(const HttpRequest & request) {
   HttpResponse response;
@@ -1090,6 +1104,21 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
     }
     else if (request.method == "POST" && request.path == "/v1/audio/speech") {
         response = handle_speech(request.body);
+    }
+    else if (request.method == "POST" && request.path == "/v1/voice/live") {
+        response = handle_voice_live(request);
+    }
+    else if (request.method == "POST" && request.path == "/v1/voice/sessions") {
+        response = handle_voice_session_create(request);
+    }
+    else if (request.method == "POST" && request.path == "/v1/voice/sessions/audio") {
+        response = handle_voice_session_audio(request);
+    }
+    else if (request.method == "GET" && request.path == "/v1/voice/sessions/events") {
+        response = handle_voice_session_events(request);
+    }
+    else if (request.method == "POST" && request.path == "/v1/voice/sessions/stop") {
+        response = handle_voice_session_stop(request);
     }
     else {
         response = error_response(404, "unknown endpoint: " + request.path, "not_found");
@@ -3437,6 +3466,356 @@ void ServerState::chat_orchestrate(
             ",{\"role\":\"assistant\",\"content\":" +
             json_quote(hygiene::sanitize_assistant_text(reply_text)) + "}]}");
     }
+}
+
+// ============================== Live voice (STT) ==============================
+
+namespace {
+
+std::unordered_map<std::string, std::string> parse_query_params(const std::string & query) {
+    std::unordered_map<std::string, std::string> out;
+    size_t start = 0;
+    while (start < query.size()) {
+        size_t end = query.find('&', start);
+        if (end == std::string::npos) {
+            end = query.size();
+        }
+        const auto pair = query.substr(start, end - start);
+        start = end + 1;
+        const auto eq = pair.find('=');
+        if (eq != std::string::npos) {
+            out[pair.substr(0, eq)] = pair.substr(eq + 1);
+        }
+    }
+    return out;
+}
+
+// The bundled Silero VAD ships under assets/; the server may be launched
+// from the repo root or with paths resolved against the request base.
+std::filesystem::path voice_asset_root(const std::filesystem::path & request_base) {
+    const auto bundled = std::filesystem::path("assets") / "framework" / "models" / "silero_vad";
+    std::error_code ec;
+    if (std::filesystem::exists(request_base / bundled, ec)) {
+        return request_base;
+    }
+    return std::filesystem::current_path();
+}
+
+}  // namespace
+
+ServerState::LoadedModel * ServerState::find_asr_model() {
+    for (auto & model : models_) {
+        if (model->config.task == "asr") {
+            std::lock_guard<std::mutex> lock(models_mutex_);
+            ensure_model_loaded_locked(*model);
+            return model.get();
+        }
+    }
+    return nullptr;
+}
+
+voice::TranscribeResult ServerState::run_voice_transcribe(
+    LoadedModel & model,
+    const engine::runtime::AudioBuffer & audio,
+    const std::string & language) {
+    engine::runtime::TaskRequest request;
+    request.audio_input = audio;
+    request.options["audio_chunk_mode"] = "none";
+    if (!language.empty()) {
+        request.options["language"] = language;
+        request.text_input = engine::runtime::Transcript{"", language};
+    }
+    auto timed = run_model(model, request);
+    voice::TranscribeResult out;
+    if (timed.result.text_output.has_value()) {
+        out.text = timed.result.text_output->text;
+        out.language = timed.result.text_output->language;
+    }
+    return out;
+}
+
+HttpResponse ServerState::handle_voice_live(const HttpRequest & request) {
+    auto * asr = find_asr_model();
+    if (asr == nullptr) {
+        return error_response(
+            503, "no ASR model is configured; add a model with task \"asr\"", "voice_unavailable");
+    }
+    if (request.body_stream == nullptr) {
+        return error_response(
+            400,
+            "voice live requires a raw PCM body sent with Transfer-Encoding: chunked",
+            "invalid_request_error");
+    }
+    const auto q = parse_query_params(request.query);
+    const int sample_rate = q.count("sample_rate") != 0 ? std::atoi(q.at("sample_rate").c_str()) : 16000;
+    const int channels = q.count("channels") != 0 ? std::atoi(q.at("channels").c_str()) : 1;
+    const std::string sample_format = q.count("sample_format") != 0 ? q.at("sample_format") : "s16le";
+    if (sample_rate != 16000 || channels != 1) {
+        return error_response(
+            400, "voice live requires sample_rate=16000 and channels=1", "invalid_request_error");
+    }
+    const auto params = voice::turn_params_from_query(request.query);
+    auto * body_stream = request.body_stream;
+    const auto asset_root = voice_asset_root(request_base_);
+    return sse_response([this, asr, params, body_stream, sample_format, asset_root](HttpStreamWriter & writer) {
+        std::mutex emit_mutex;
+        auto aborted = std::make_shared<std::atomic<bool>>(false);
+        auto emit = [&writer, &emit_mutex, aborted](const std::string & json) {
+            if (aborted->load()) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(emit_mutex);
+            try {
+                write_sse(writer, json);
+            } catch (...) {
+                aborted->store(true);
+            }
+        };
+        voice::VoiceHooks hooks;
+        hooks.emit = emit;
+        hooks.aborted = [aborted] { return aborted->load(); };
+        hooks.transcribe = [this, asr, language = params.language](const engine::runtime::AudioBuffer & audio) {
+            return run_voice_transcribe(*asr, audio, language);
+        };
+        try {
+            auto vad = voice::make_vad_session(asset_root, params);
+            const auto stream = minitts::app::make_pcm_chunk_stream(
+                *body_stream,
+                minitts::app::AudioStreamFormat{16000, 1},
+                minitts::app::parse_pcm_sample_format(sample_format));
+            voice::VoiceLiveRunner runner(params, std::move(hooks), std::move(vad));
+            emit("{\"type\":\"session\"}");
+            runner.run(stream);
+        } catch (const std::exception & ex) {
+            emit(std::string("{\"type\":\"error\",\"message\":") + json_quote(ex.what()) + "}");
+        }
+        if (!aborted->load()) {
+            std::lock_guard<std::mutex> lock(emit_mutex);
+            try {
+                write_sse_done(writer);
+            } catch (...) {
+            }
+        }
+    });
+}
+
+// One browser voice session: the mic tab cannot stream a request body over
+// HTTP/1.1, so audio arrives as small sequential POSTs into this queue while
+// a long-lived runner consumes it, and events leave over a separate SSE
+// connection. The runner thread is always joined (stop, events-reader loss,
+// or server shutdown), never detached.
+struct ServerState::VoiceBrowserSession {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<float> audio;
+    bool closed = false;
+    std::deque<std::string> events;
+    bool done = false;
+    std::thread thread;
+    std::chrono::steady_clock::time_point created = std::chrono::steady_clock::now();
+};
+
+void ServerState::close_voice_session(VoiceBrowserSession & session) {
+    {
+        std::lock_guard<std::mutex> lock(session.mutex);
+        session.closed = true;
+    }
+    session.cv.notify_all();
+    if (session.thread.joinable()) {
+        session.thread.join();
+    }
+}
+
+HttpResponse ServerState::handle_voice_session_create(const HttpRequest & request) {
+    auto * asr = find_asr_model();
+    if (asr == nullptr) {
+        return error_response(
+            503, "no ASR model is configured; add a model with task \"asr\"", "voice_unavailable");
+    }
+    const auto params = voice::turn_params_from_query(request.query);
+    const auto asset_root = voice_asset_root(request_base_);
+    auto session = std::make_shared<VoiceBrowserSession>();
+    std::string id;
+    {
+        std::lock_guard<std::mutex> lock(voice_sessions_mutex_);
+        // Sweep sessions that finished and were drained (or abandoned).
+        for (auto it = voice_sessions_.begin(); it != voice_sessions_.end();) {
+            bool expired = false;
+            {
+                std::lock_guard<std::mutex> slock(it->second->mutex);
+                const auto age = std::chrono::steady_clock::now() - it->second->created;
+                expired = (it->second->done && it->second->events.empty()) ||
+                          age > std::chrono::minutes(30);
+            }
+            if (expired) {
+                close_voice_session(*it->second);
+                it = voice_sessions_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        id = "v" + std::to_string(++voice_session_counter_);
+        voice_sessions_[id] = session;
+    }
+
+    voice::VoiceHooks hooks;
+    hooks.emit = [session](const std::string & json) {
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->events.push_back(json);
+            if (session->events.size() > 512) {
+                session->events.pop_front();
+            }
+        }
+        session->cv.notify_all();
+    };
+    hooks.aborted = [session] {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        return session->closed && session->audio.empty();
+    };
+    hooks.transcribe = [this, asr, language = params.language](const engine::runtime::AudioBuffer & audio) {
+        return run_voice_transcribe(*asr, audio, language);
+    };
+
+    session->thread = std::thread([session, params, hooks, asset_root] {
+        try {
+            auto vad = voice::make_vad_session(asset_root, params);
+            minitts::app::AudioChunkStream stream;
+            stream.format = minitts::app::AudioStreamFormat{16000, 1};
+            stream.read = [session](int64_t max_samples, std::vector<float> & out) {
+                std::unique_lock<std::mutex> lock(session->mutex);
+                session->cv.wait(lock, [&] { return session->closed || !session->audio.empty(); });
+                if (session->audio.empty()) {
+                    return false;
+                }
+                const size_t take = std::min<size_t>(
+                    static_cast<size_t>(std::max<int64_t>(1, max_samples)), session->audio.size());
+                out.assign(session->audio.begin(), session->audio.begin() + static_cast<std::ptrdiff_t>(take));
+                session->audio.erase(session->audio.begin(), session->audio.begin() + static_cast<std::ptrdiff_t>(take));
+                return true;
+            };
+            voice::VoiceLiveRunner runner(params, hooks, std::move(vad));
+            runner.run(stream);
+        } catch (const std::exception & ex) {
+            hooks.emit(std::string("{\"type\":\"error\",\"message\":") + json_quote(ex.what()) + "}");
+        }
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->done = true;
+        }
+        session->cv.notify_all();
+    });
+    return json_response("{\"id\":\"" + id + "\"}");
+}
+
+HttpResponse ServerState::handle_voice_session_audio(const HttpRequest & request) {
+    const auto q = parse_query_params(request.query);
+    const auto id = q.count("id") != 0 ? q.at("id") : "";
+    std::shared_ptr<VoiceBrowserSession> session;
+    {
+        std::lock_guard<std::mutex> lock(voice_sessions_mutex_);
+        const auto it = voice_sessions_.find(id);
+        if (it != voice_sessions_.end()) {
+            session = it->second;
+        }
+    }
+    if (session == nullptr) {
+        return error_response(404, "unknown voice session: " + id, "not_found");
+    }
+    const auto & body = request.body;  // raw s16le mono 16 kHz
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->closed) {
+            return error_response(409, "voice session is closed", "invalid_request_error");
+        }
+        for (size_t i = 0; i + 1 < body.size(); i += 2) {
+            const int16_t sample = static_cast<int16_t>(
+                static_cast<uint8_t>(body[i]) | (static_cast<uint8_t>(body[i + 1]) << 8));
+            session->audio.push_back(static_cast<float>(sample) / 32768.0F);
+        }
+        // A stalled runner must not let a chatty client grow this unbounded:
+        // cap at ~30 s of queued audio.
+        while (session->audio.size() > 16000u * 30u) {
+            session->audio.pop_front();
+        }
+    }
+    session->cv.notify_all();
+    return json_response("{\"ok\":true}");
+}
+
+HttpResponse ServerState::handle_voice_session_events(const HttpRequest & request) {
+    const auto q = parse_query_params(request.query);
+    const auto id = q.count("id") != 0 ? q.at("id") : "";
+    std::shared_ptr<VoiceBrowserSession> session;
+    {
+        std::lock_guard<std::mutex> lock(voice_sessions_mutex_);
+        const auto it = voice_sessions_.find(id);
+        if (it != voice_sessions_.end()) {
+            session = it->second;
+        }
+    }
+    if (session == nullptr) {
+        return error_response(404, "unknown voice session: " + id, "not_found");
+    }
+    return sse_response([session](HttpStreamWriter & writer) {
+        try {
+            while (true) {
+                std::vector<std::string> batch;
+                bool finished = false;
+                {
+                    std::unique_lock<std::mutex> lock(session->mutex);
+                    session->cv.wait_for(lock, std::chrono::seconds(15), [&] {
+                        return session->done || !session->events.empty();
+                    });
+                    while (!session->events.empty()) {
+                        batch.push_back(std::move(session->events.front()));
+                        session->events.pop_front();
+                    }
+                    finished = session->done && session->events.empty();
+                }
+                for (const auto & event : batch) {
+                    write_sse(writer, event);
+                }
+                if (batch.empty() && !finished) {
+                    writer.write(": ping\n\n");
+                }
+                if (finished) {
+                    break;
+                }
+            }
+            write_sse_done(writer);
+        } catch (...) {
+            // The browser went away; release the runner so the session can
+            // be swept.
+            {
+                std::lock_guard<std::mutex> lock(session->mutex);
+                session->closed = true;
+            }
+            session->cv.notify_all();
+        }
+    });
+}
+
+HttpResponse ServerState::handle_voice_session_stop(const HttpRequest & request) {
+    const auto q = parse_query_params(request.query);
+    const auto id = q.count("id") != 0 ? q.at("id") : "";
+    std::shared_ptr<VoiceBrowserSession> session;
+    {
+        std::lock_guard<std::mutex> lock(voice_sessions_mutex_);
+        const auto it = voice_sessions_.find(id);
+        if (it != voice_sessions_.end()) {
+            session = it->second;
+        }
+    }
+    if (session == nullptr) {
+        return error_response(404, "unknown voice session: " + id, "not_found");
+    }
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        session->closed = true;
+    }
+    session->cv.notify_all();
+    return json_response("{\"ok\":true}");
 }
 
 // Cached-voice discovery for the "voice"/cached_voice_id request field. Families that

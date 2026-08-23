@@ -225,8 +225,10 @@ if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
         path = ($gemmaModelPath -replace "\\", "/")
         # Deeper on the GPU when the small TTS model frees the VRAM; the
         # larger-TTS branch stays conservative (one layer from KV savings).
+        # When the streaming-STT model is registered, two expert layers go
+        # back to the CPU so its ~1.5 GB fits beside everything else.
         extra_args = @($(if ($ModelPath -match '0\.6b|q4_k-mix') {
-                @("--n-cpu-moe", "3", "-ub", "2048")
+                @("--n-cpu-moe", $(if (Test-Path -LiteralPath (Join-Path $repoRoot "models\Qwen3-ASR-0.6B-GGUF\qwen3-asr-0.6b-q8_0.gguf") -PathType Leaf) { "5" } else { "3" }), "-ub", "2048")
             } else {
                 @("--n-cpu-moe", "6", "-ub", "1024")
             }) + @("--reasoning-budget", "0"))
@@ -288,6 +290,12 @@ if (-not $SkipLlm) {
 }
 # ------------------------------------------------------------------------------
 
+# Streaming STT (the Voice tab): registered whenever the converted ASR
+# weights exist. Lazy, so boot stays fast and the ~1.5 GB VRAM is only spent
+# once voice is actually used; after the first use the model stays warm.
+$asrModelPath = Join-Path $repoRoot "models\Qwen3-ASR-0.6B-GGUF\qwen3-asr-0.6b-q8_0.gguf"
+$voiceAvailable = Test-Path -LiteralPath $asrModelPath -PathType Leaf
+
 $effectiveConfig = [ordered]@{
     host = "127.0.0.1"
     port = $Port
@@ -329,6 +337,16 @@ $effectiveConfig = [ordered]@{
             }
         }
     )
+}
+if ($voiceAvailable) {
+    $effectiveConfig["models"] = @($effectiveConfig["models"]) + , [ordered]@{
+        id = "qwen3-asr"
+        family = "qwen3_asr"
+        path = ($asrModelPath -replace "\\", "/")
+        task = "asr"
+        mode = "offline"
+        lazy = $true
+    }
 }
 if ($llmAvailable) {
     $effectiveConfig["llm_host"] = "127.0.0.1"

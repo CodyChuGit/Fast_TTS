@@ -6,6 +6,7 @@
 #include "http.h"
 #include "llm_manager.h"
 #include "mcp.h"
+#include "voice.h"
 
 #include "../streaming/streaming.h"
 
@@ -264,6 +265,27 @@ private:
     std::string fresh_llm_warm_body() const;
     mcp::SpeakOutcome run_mcp_speak(const std::string & text, long long seed);
 
+    // Live voice (streaming STT). Two transports over one core:
+    // /v1/voice/live streams chunked PCM in and SSE events out on a single
+    // connection (ffmpeg, CLI); the /v1/voice/sessions endpoints carry the
+    // same events for browsers, which cannot stream a request body over
+    // HTTP/1.1 -- audio arrives as small sequential POSTs instead.
+    HttpResponse handle_voice_live(const HttpRequest & request);
+    HttpResponse handle_voice_session_create(const HttpRequest & request);
+    HttpResponse handle_voice_session_audio(const HttpRequest & request);
+    HttpResponse handle_voice_session_events(const HttpRequest & request);
+    HttpResponse handle_voice_session_stop(const HttpRequest & request);
+    // The configured ASR model (task "asr"), loaded; null when voice is not
+    // configured.
+    LoadedModel * find_asr_model();
+    voice::TranscribeResult run_voice_transcribe(
+        LoadedModel & model,
+        const engine::runtime::AudioBuffer & audio,
+        const std::string & language);
+    struct VoiceBrowserSession;
+    // Marks the session closed, wakes its runner, and joins its thread.
+    void close_voice_session(VoiceBrowserSession & session);
+
     std::string models_json() const;
     std::string get_allowed_origin(const HttpRequest & request) const;
 
@@ -317,6 +339,10 @@ private:
     // mid-typing speculations queues whole prefills in front of the real
     // send (measured: first token past 8 s for stall-heavy typists).
     std::mutex llm_spec_stream_mutex_;
+    // Browser voice sessions; see handle_voice_session_create.
+    std::unordered_map<std::string, std::shared_ptr<VoiceBrowserSession>> voice_sessions_;
+    std::mutex voice_sessions_mutex_;
+    uint64_t voice_session_counter_ = 0;
 };
 
 }  // namespace minitts::server

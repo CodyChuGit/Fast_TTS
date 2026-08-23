@@ -1439,6 +1439,8 @@ add_executable(audiocpp_server
     app/server/chat_hygiene.cpp
     app/server/config.cpp
     app/server/filler.cpp
+    app/server/voice.cpp
+    app/server/voice_stability.cpp
     app/server/http.cpp
     app/server/llm_client.cpp
     app/server/llm_manager.cpp
@@ -2282,6 +2284,17 @@ if (ENGINE_BUILD_TESTS)
     add_test(
         NAME server_chat_hygiene_test
         COMMAND server_chat_hygiene_test
+    )
+
+    add_executable(server_voice_stability_test
+        tests/unittests/test_server_voice_stability.cpp
+        app/server/voice_stability.cpp
+    )
+    target_include_directories(server_voice_stability_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/app/server)
+
+    add_test(
+        NAME server_voice_stability_test
+        COMMAND server_voice_stability_test
     )
 
     add_executable(server_base64_test

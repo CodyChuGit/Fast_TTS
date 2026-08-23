@@ -1,0 +1,93 @@
+#pragma once
+
+#include "voice_stability.h"
+
+#include "../streaming/streaming.h"
+
+#include "engine/framework/runtime/model.h"
+#include "engine/framework/runtime/session.h"
+
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace minitts::server::voice {
+
+// ---------------------------------------------------------------------------
+// One live voice connection: PCM in, transcript events out.
+// ---------------------------------------------------------------------------
+
+struct TurnParams {
+    float vad_threshold = 0.5F;
+    int min_speech_ms = 100;
+    int min_silence_ms = 250;    // conversational endpoint, per turn
+    int max_utterance_ms = 30000;
+    int partial_interval_ms = 280;
+    // Below this much captured speech, partial decodes are skipped: the ASR
+    // hallucinates on sub-second snippets and returns fragments the tracker
+    // would just have to disbelieve.
+    int min_partial_audio_ms = 700;
+    int speech_pad_ms = 240;     // audio retained from before the VAD trigger
+    StabilityParams stability;
+    std::string language;        // empty = auto-detect
+};
+
+// Parses `key=value&...` query text into TurnParams overrides; unknown keys
+// are ignored so transport-level parameters can share the query string.
+TurnParams turn_params_from_query(const std::string & query);
+
+struct TranscribeResult {
+    std::string text;
+    std::string language;
+};
+
+struct VoiceHooks {
+    // Runs the ASR model on one utterance-so-far snapshot (16 kHz mono).
+    // Called from the runner's decode worker thread.
+    std::function<TranscribeResult(const engine::runtime::AudioBuffer &)> transcribe;
+    // Emits one SSE payload (the `data:` JSON). Must be thread-safe: the
+    // audio loop and the decode worker both emit.
+    std::function<void(const std::string & json)> emit;
+    // True once the client is gone; the runner unwinds promptly.
+    std::function<bool()> aborted;
+};
+
+// Drives one connection: reads 16 kHz mono float PCM off `stream`, gates it
+// with streaming Silero VAD, re-decodes the growing utterance on a worker
+// thread at `partial_interval_ms`, tracks hypothesis stability, and emits
+// typed events. Handles any number of utterances until the stream ends.
+//
+// Events (all carry "t_ms" on the connection's monotonic clock):
+//   speech_started    {utterance_id}
+//   partial_transcript{utterance_id, text}          -- tentative tail
+//   stable_transcript {utterance_id, text}          -- full committed prefix
+//   speech_ended      {utterance_id}
+//   final_transcript  {utterance_id, text, language, timings{...}}
+//   error             {message}
+class VoiceLiveRunner {
+public:
+    VoiceLiveRunner(
+        TurnParams params,
+        VoiceHooks hooks,
+        std::unique_ptr<engine::runtime::IStreamingVoiceTaskSession> vad);
+    ~VoiceLiveRunner();
+
+    // Blocks until the input stream ends or the connection aborts.
+    void run(const minitts::app::AudioChunkStream & stream);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Loads the bundled streaming Silero VAD (CPU backend; the model is tiny and
+// keeping it off the GPU costs nothing). `asset_root` is the directory that
+// holds assets/framework/models/silero_vad.
+std::unique_ptr<engine::runtime::IStreamingVoiceTaskSession> make_vad_session(
+    const std::filesystem::path & asset_root,
+    const TurnParams & params);
+
+}  // namespace minitts::server::voice
