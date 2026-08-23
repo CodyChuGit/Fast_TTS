@@ -1184,6 +1184,12 @@ public:
     }
 
     ~TalkerPrefillGraph() {
+        // The backend may still have async work referencing this graph's
+        // buffers (the K/V transfer into the step cache runs device-side).
+        // Freeing under in-flight work wedges the CUDA context -- every
+        // later capture hangs -- so drain the backend first, exactly as the
+        // ASR thinker and the codec encoder destructors do.
+        ggml_backend_synchronize(weights_->backend());
         engine::core::release_backend_graph_resources(weights_->backend(), graph_);
         if (buffer_ != nullptr) {
             ggml_backend_buffer_free(buffer_);

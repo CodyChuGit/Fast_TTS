@@ -1040,6 +1040,9 @@ public:
     }
 
     ~Qwen3SpeechTokenizerDecoderGraph() {
+        // Same discipline as the talker prefill graph: drain async backend
+        // work before releasing, or an eviction under load wedges CUDA.
+        ggml_backend_synchronize(backend_);
         engine::core::release_backend_graph_resources(backend_, graph_);
         if (gallocr_ != nullptr) {
             ggml_gallocr_free(gallocr_);

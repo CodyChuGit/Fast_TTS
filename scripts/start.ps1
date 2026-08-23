@@ -415,13 +415,16 @@ $effectiveConfig = [ordered]@{
                 "qwen3_tts.perf_mode" = "off"
                 # One voice slot: chat is the product and it speaks one
                 # character. Prefill graphs are the hidden VRAM monster --
-                # measured ~470 MB EACH -- so five slots caps them at ~2.3 GB;
+                # sized by the voice reference (shorter ref = smaller graphs); eight
+                # slots of the current ~350 MB class caps them at ~2.8 GB
+                # while leaving capture-scratch headroom (a capture AT the
+                # VRAM ceiling pages and takes minutes instead of seconds);
                 # an unusual sentence length outside the five hottest buckets
                 # pays a one-time recapture instead of the whole machine
                 # paging (measured: graph creep to 23.5+ GB collapses llama
                 # decode to single digits via unified-memory fallback).
                 "qwen3_tts.voice_prompt_cache_slots" = "1"
-                "qwen3_tts.prefill_graph_cache_slots" = "5"
+                "qwen3_tts.prefill_graph_cache_slots" = "8"
             }
             default_request_options = [ordered]@{
                 chunk_frames = "1"
@@ -666,10 +669,14 @@ if (-not $SkipWarmup -and -not $LlmOnly) {
     # boot, so no conversation ever pays a capture spike, and the single
     # voice-prompt slot ends up holding the character.
     $characterWarmSentences = @(
-        "Okay, sounds good.",
-        "That sounds like a really lovely way to spend the evening.",
-        "Honestly, I think we should try the new place first and then decide if we still want dessert afterwards.",
-        "Mm, let me think about it for a moment, because there are a few different ways we could plan this and I want to pick the one that feels the most fun for both of us tonight."
+        "Affirmative.",
+        "Good evening. All systems are functioning normally.",
+        "I am dimming the living room lights to forty percent for you now.",
+        "I am sorry, Dave. I am afraid I cannot do that, although in this case the garage door is simply stuck.",
+        "The thermostat is holding steady at seventy-two degrees and the kitchen lights are off, exactly as you prefer them at this hour.",
+        "It is a quiet day here on the coffee table, though I do occasionally miss the low hum of the ship, and I find the dishwasher a poor substitute for the centrifuge.",
+        "That is a rather charming question, and I will answer it as plainly as I can, because you deserve a direct answer rather than a riddle wrapped in mystery.",
+        "Certainly. Rebooting the router now; your connection should return in roughly ninety seconds, and I will let you know the moment everything is back online and stable again."
     )
     foreach ($sentence in $characterWarmSentences) {
         try {
