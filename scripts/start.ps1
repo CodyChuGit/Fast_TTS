@@ -303,6 +303,20 @@ if (Test-Path -LiteralPath $orcaModelPath -PathType Leaf) {
         }
     }
 }
+$orcaIq3Path = Join-Path $repoRoot "models\Qwen3.8-27B-OrcaRouter-GGUF\Qwen3.8-27B-Uncensored-OrcaRouter-Q3_K_M.gguf"
+if (Test-Path -LiteralPath $orcaIq3Path -PathType Leaf) {
+    # The shootout's quality king, shrunk until it fits: Q3_K_M (13.5 GB,
+    # requantized locally from the mirror's near-lossless Q8_0)
+    # putting the dense 27B FULLY on the GPU beside the whole voice stack,
+    # where the Q4_K_M could only crawl at 4 t/s on CPU-spilled layers.
+    $llmModels += , [ordered]@{
+        id = "orca-qwen-fast"
+        name = "Qwen3.8 27B OrcaRouter (Q3, fast)"
+        path = ($orcaIq3Path -replace "\\", "/")
+        extra_args = @("-ngl", "99", "-ub", "2048",
+            "--chat-template-kwargs", '{"enable_thinking":false}')
+    }
+}
 $huihuiModelPath = Join-Path $repoRoot "models\Huihui-Qwen3.8-27B-abliterated-GGUF\Huihui-Qwen3.8-27B-abliterated.Q4_K_M.gguf"
 if (Test-Path -LiteralPath $huihuiModelPath -PathType Leaf) {
     # A DENSE 27B: there is no expert-offload trick, so fitting beside the
