@@ -209,7 +209,9 @@ export type ChatEvent =
   // The reply's text is complete (audio may still be playing): the next
   // draft can speculate against the finished conversation from here on.
   | { type: 'llm_done' }
-  | { type: 'start' };
+  // reserve_ms, when present, asks the player for a deeper startup buffer:
+  // the active LLM decodes slowly and audio will arrive with thin margins.
+  | { type: 'start'; reserve_ms?: number };
 
 export function base64ToBytes(data: string): Uint8Array {
   const binary = atob(data);

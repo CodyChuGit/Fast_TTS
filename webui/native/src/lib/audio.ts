@@ -96,8 +96,8 @@ export function encodePcm16BytesWav(
 export class Pcm16StreamPlayer {
   private readonly sampleRate: number;
   private readonly channels: number;
-  private readonly startBufferSeconds: number;
-  private readonly startMaxWaitMs: number;
+  private startBufferSeconds: number;
+  private startMaxWaitMs: number;
   private context: AudioContext | null = null;
   private nextStartTime = 0;
   private carry = new Uint8Array(0);
@@ -113,6 +113,9 @@ export class Pcm16StreamPlayer {
   private underruns = 0;
   private rebuffering = false;
   private rebufferTargetSeconds = 0;
+  private rebufferStepSeconds = REBUFFER_STEP_SECONDS;
+  private maxRebufferSeconds = MAX_REBUFFER_SECONDS;
+  private rebufferMaxWaitMs = REBUFFER_MAX_WAIT_MS;
   // Caption sync: each scheduled buffer records where it starts on the
   // context clock and where it falls in the pushed PCM stream, so the UI can
   // ask which stream second is at the speakers right now.
@@ -136,6 +139,26 @@ export class Pcm16StreamPlayer {
     if (this.context) return;
     this.context = await primePcm16Playback();
     this.nextStartTime = this.context.currentTime;
+  }
+
+  // Deepen the startup jitter reserve before any audio has been pushed --
+  // used when the producer announces it will pace slowly (a slow-decoding
+  // LLM feeding the TTS), where one deeper hold beats many small underruns.
+  // Paced mode also raises the rebuffer profile: a slow producer's long
+  // replies accumulate a thin-margin deficit, and the default 480 ms
+  // ceiling (tuned for fast producers) re-drains within seconds.
+  setStartBuffer(seconds: number, maxWaitMs: number): void {
+    if (!Number.isFinite(seconds) || seconds < 0) {
+      throw new Error('PCM start reserve must be a non-negative finite number.');
+    }
+    if (this.begun || this.sources.size) {
+      throw new Error('PCM start reserve must be set before the first audio chunk.');
+    }
+    this.startBufferSeconds = seconds;
+    this.startMaxWaitMs = maxWaitMs;
+    this.rebufferStepSeconds = 0.35;
+    this.maxRebufferSeconds = 1.2;
+    this.rebufferMaxWaitMs = 1500;
   }
 
   setInitialPlaybackLeadSeconds(seconds: number): void {
@@ -187,8 +210,8 @@ export class Pcm16StreamPlayer {
       this.underruns += 1;
       this.rebuffering = true;
       this.rebufferTargetSeconds = Math.min(
-        REBUFFER_STEP_SECONDS * this.underruns,
-        MAX_REBUFFER_SECONDS
+        this.rebufferStepSeconds * this.underruns,
+        this.maxRebufferSeconds
       );
     }
 
@@ -203,7 +226,7 @@ export class Pcm16StreamPlayer {
       this.pending.push(audio);
       this.pendingSeconds += frames / this.sampleRate;
       const targetSeconds = this.begun ? this.rebufferTargetSeconds : this.startBufferSeconds;
-      const maxWaitMs = this.begun ? REBUFFER_MAX_WAIT_MS : this.startMaxWaitMs;
+      const maxWaitMs = this.begun ? this.rebufferMaxWaitMs : this.startMaxWaitMs;
       if (this.pendingSeconds >= targetSeconds) {
         this.flushPending();
       } else if (this.startTimer === null) {

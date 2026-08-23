@@ -2992,15 +2992,30 @@ void ServerState::chat_orchestrate(
         // the history the model re-reads all stay free of roleplay markup.
         // The opening clause is cut early: every buffered character is
         // audible silence at decode speed, and only the first segment is
-        // compromised -- every later one is a whole sentence. How early
-        // depends on how fast the active model writes: at 50 t/s a 16-char
-        // clause exists in ~110 ms, but a dense 27B at 17 t/s needs ~300 ms
-        // for the same clause, so slow decoders get an 8-char cut to keep
-        // opener generation near a constant ~150 ms.
+        // compromised -- every later one is a whole sentence. The cut
+        // adapts to the active model's decode rate, and the constraint is
+        // CONTINUITY, not just latency: the opener's spoken duration must
+        // outlast the time the model needs to write what follows it -- and
+        // once synthesis starts, a dense model's decode drops further from
+        // GPU contention with the TTS (measured 17 -> 10.6 t/s), so short
+        // openers drain into an audible gap right after the first words.
+        // Tried and rejected for slow decoders: 8-char cuts (half a second
+        // of runway, fragment prosody -- the TTS's worst case) and 24-char
+        // cuts (still outrun at the contended rate). What works is no cut
+        // at all: the first COMPLETE sentence generates at full speed
+        // before synthesis exists to contend with, plays ~4 s of runway,
+        // and carries natural prosody. ~1 s later to first sound, clean
+        // from the first word on.
+        // Before the first generation has measured anything (EMA zero), the
+        // cache_rollback flag stands in: the models that cannot rewind are
+        // exactly the dense slow decoders, so their very first turn after a
+        // boot or switch gets the safe pacing instead of two pauses.
         const double decode_tps = llm_decode_tps_ema_.load();
-        const bool slow_decoder = decode_tps > 0.0 && decode_tps < 30.0;
+        const bool slow_decoder = decode_tps > 0.0
+            ? decode_tps < 30.0
+            : !active_llm_cache_rollback();
         SentenceSegmenter segmenter(slow_decoder
-            ? SentenceSegmenter::Options{8, 14, 300}
+            ? SentenceSegmenter::Options{120, 160, 300}
             : SentenceSegmenter::Options{16, 28, 300});
         hygiene::StreamScrubber scrubber;
         auto emit = [&](const std::string & clean) {
@@ -3077,7 +3092,19 @@ void ServerState::chat_orchestrate(
     };
 
     try {
-        write_sse(writer, "{\"type\":\"start\"}");
+        // A slow decoder cannot keep the TTS fed at full surplus: sentence
+        // handoffs arrive with less margin, and dozens of small underruns
+        // beat one deeper client reserve. Tell the client to hold ~600 ms
+        // of audio before the first sample instead of its default 120.
+        {
+            const double pace_tps = llm_decode_tps_ema_.load();
+            const bool slow_pace = pace_tps > 0.0
+                ? pace_tps < 30.0
+                : !active_llm_cache_rollback();
+            write_sse(writer, slow_pace
+                ? "{\"type\":\"start\",\"reserve_ms\":600}"
+                : "{\"type\":\"start\"}");
+        }
         while (true) {
             ChatEvent event;
             {
