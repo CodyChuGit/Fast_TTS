@@ -320,6 +320,21 @@ if (Test-Path -LiteralPath $huihuiModelPath -PathType Leaf) {
             @("--chat-template-kwargs", '{"enable_thinking":false}'))
     }
 }
+$bonsaiModelPath = Join-Path $repoRoot "models\Ternary-Bonsai-27B-heretic-ja-GGUF\Ternary-Bonsai-27B-heretic-ja-Q2_g64.gguf"
+if (Test-Path -LiteralPath $bonsaiModelPath -PathType Leaf) {
+    # Ternary 2-bit dense 27B (PrismML Bonsai, group-64 packing -- the g128
+    # file in the same repo does NOT load on this fork). Small enough to sit
+    # fully on the GPU even beside the whole voice stack: measured standalone
+    # 63 t/s decode / 791 t/s prefill at 9.4 GB total. Thinking must be off
+    # via the template kwarg or every reply hides inside <think>.
+    $llmModels += , [ordered]@{
+        id = "bonsai"
+        name = "Ternary Bonsai 27B (2-bit)"
+        path = ($bonsaiModelPath -replace "\\", "/")
+        extra_args = @("-ngl", "99", "-ub", "2048",
+            "--chat-template-kwargs", '{"enable_thinking":false}')
+    }
+}
 $llmAvailable = $false
 if (-not $SkipLlm) {
     if (-not (Test-Path -LiteralPath $llmExe -PathType Leaf)) {
