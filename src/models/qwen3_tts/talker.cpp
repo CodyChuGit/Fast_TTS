@@ -1319,6 +1319,11 @@ public:
         if (buffer_ == nullptr) {
             throw std::runtime_error("failed to allocate Qwen3 talker cached step graph");
         }
+        // Freshly allocated VRAM can hold recycled garbage, including NaN bit
+        // patterns. Masked attention zeroes stale rows arithmetically, but
+        // 0 * NaN is NaN -- the host import used to zero-fill the whole
+        // cache, and the GPU-side transfer path relies on this clear instead.
+        ggml_backend_buffer_clear(buffer_, 0);
         attention_mask_buffer_.assign(static_cast<size_t>(cache_steps_), ggml_fp32_to_fp16(-INFINITY));
     }
 

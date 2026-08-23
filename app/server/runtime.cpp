@@ -2828,9 +2828,13 @@ void ServerState::start_chat_speculation(
             try {
                 Value::Object fields;
                 fields.emplace("input", Value::make_string(spoken));
-                if (tts_seed >= 0) {
-                    fields.emplace("seed", Value::make_number(static_cast<double>(tts_seed)));
-                }
+                // Never roll a random seed for the character's speech: short
+                // chat sentences are a per-seed quality lottery (muffle,
+                // noise, off-voice deliveries), and a different roll per
+                // sentence makes her timbre drift within one reply. 777 is
+                // the seed the filler QA library was curated with.
+                fields.emplace("seed", Value::make_number(
+                    static_cast<double>(tts_seed >= 0 ? tts_seed : 777)));
                 const auto speech_body = Value::make_object(std::move(fields));
                 auto request = build_speech_request(*model, speech_body);
                 request.options["stream_accumulate"] = "false";
@@ -3344,9 +3348,10 @@ void ServerState::chat_orchestrate(
                 }
                 Value::Object fields;
                 fields.emplace("input", Value::make_string(spoken));
-                if (tts_seed >= 0) {
-                    fields.emplace("seed", Value::make_number(static_cast<double>(tts_seed)));
-                }
+                // Pinned for the same reason as the speculative synthesis
+                // above: random seeds make short sentences a quality lottery.
+                fields.emplace("seed", Value::make_number(
+                    static_cast<double>(tts_seed >= 0 ? tts_seed : 777)));
                 const auto speech_body = Value::make_object(std::move(fields));
                 auto request = build_speech_request(model, speech_body);
                 request.options["stream_accumulate"] = "false";
