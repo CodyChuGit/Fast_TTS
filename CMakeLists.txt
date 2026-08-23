@@ -412,574 +412,12 @@ add_library(engine_model_silero_vad OBJECT
 set_target_properties(engine_model_silero_vad PROPERTIES EXCLUDE_FROM_ALL TRUE)
 audiocpp_configure_runtime_object(engine_model_silero_vad)
 
-add_library(engine_model_marblenet_vad OBJECT
-    src/models/marblenet_vad/assets.cpp
-    src/models/marblenet_vad/runtime.cpp
-    src/models/marblenet_vad/session.cpp
-)
-set_target_properties(engine_model_marblenet_vad PROPERTIES EXCLUDE_FROM_ALL TRUE)
-audiocpp_configure_runtime_object(engine_model_marblenet_vad)
-
-audiocpp_add_model(roformer
-    SOURCES
-        src/models/roformer/assets.cpp
-        src/models/roformer/runtime.cpp
-        src/models/roformer/session.cpp
-    INCLUDES
-        engine/models/roformer/session.h
-    LOADERS
-        engine::models::roformer::make_mel_band_roformer_loader
-        engine::models::roformer::make_bs_roformer_loader
-    ALIASES
-        mel_band_roformer
-        bs_roformer
-)
-
-audiocpp_add_model(demucs
-    SOURCES
-        src/models/demucs/assets.cpp
-        src/models/demucs/frontend.cpp
-        src/models/demucs/pipeline.cpp
-        src/models/demucs/postprocess.cpp
-        src/models/demucs/session.cpp
-    INCLUDES
-        engine/models/demucs/session.h
-    LOADERS
-        engine::models::demucs::make_htdemucs_loader
-    ALIASES
-        htdemucs
-)
-
-audiocpp_add_model(omnivoice
-    SOURCES
-        src/models/omnivoice/assets.cpp
-        src/models/omnivoice/tokenizer_text.cpp
-        src/models/omnivoice/audio_tokenizer.cpp
-        src/models/omnivoice/prompt_builder.cpp
-        src/models/omnivoice/generator.cpp
-        src/models/omnivoice/postprocess.cpp
-        src/models/omnivoice/session.cpp
-        src/models/omnivoice/loader.cpp
-    INCLUDES
-        engine/models/omnivoice/loader.h
-    LOADERS
-        engine::models::omnivoice::make_omnivoice_loader
-)
-
-audiocpp_add_model(glm_tts
-    SOURCES
-        src/community_models/glm_tts/assets.cpp
-        src/community_models/glm_tts/flow.cpp
-        src/community_models/glm_tts/frontend.cpp
-        src/community_models/glm_tts/llama.cpp
-        src/community_models/glm_tts/session.cpp
-        src/community_models/glm_tts/prompt.cpp
-        src/community_models/glm_tts/speech_tokenizer.cpp
-        src/community_models/glm_tts/tokenizer_text.cpp
-    INCLUDES
-        engine/community_models/glm_tts/session.h
-    LOADERS
-        engine::models::glm_tts::make_glm_tts_loader
-    DEPENDS
-        outetts
-)
-
-audiocpp_add_model(kroko_asr
-    SOURCES
-        src/community_models/kroko_asr/assets.cpp
-        src/community_models/kroko_asr/decoder.cpp
-        src/community_models/kroko_asr/encoder.cpp
-        src/community_models/kroko_asr/frontend.cpp
-        src/community_models/kroko_asr/session.cpp
-        src/community_models/kroko_asr/tokenizer.cpp
-        src/community_models/kroko_asr/zipformer.cpp
-    INCLUDES
-        engine/community_models/kroko_asr/session.h
-    LOADERS
-        engine::models::kroko_asr::make_kroko_asr_loader
-)
-
-audiocpp_add_model(outetts
-    SOURCES
-        src/community_models/outetts/assets.cpp
-        src/community_models/outetts/dac.cpp
-        src/community_models/outetts/llama.cpp
-        src/community_models/outetts/session.cpp
-        src/community_models/outetts/tokenizer.cpp
-    INCLUDES
-        engine/community_models/outetts/session.h
-    LOADERS
-        engine::models::outetts::make_outetts_loader
-    DEPENDS
-        qwen3_asr
-        qwen3_forced_aligner
-)
-
-audiocpp_add_model(parakeet_tdt
-    SOURCES
-        src/community_models/parakeet_tdt/assets.cpp
-        src/community_models/parakeet_tdt/session.cpp
-        src/community_models/parakeet_tdt/encoder.cpp
-        src/community_models/parakeet_tdt/decoder.cpp
-        src/community_models/parakeet_tdt/frontend.cpp
-        src/community_models/parakeet_tdt/weights.cpp
-    INCLUDES
-        engine/community_models/parakeet_tdt/session.h
-    LOADERS
-        engine::community_models::parakeet_tdt::make_parakeet_tdt_loader
-)
-
-audiocpp_add_model(inflect_v2
-    SOURCES
-        src/community_models/inflect_v2/assets.cpp
-        src/community_models/inflect_v2/frontend.cpp
-        src/community_models/inflect_v2/runtime.cpp
-        src/community_models/inflect_v2/session.cpp
-    INCLUDES
-        engine/community_models/inflect_v2/session.h
-    LOADERS
-        engine::models::inflect_v2::make_inflect_v2_loader
-)
-
-audiocpp_add_model(minimax_h3
-    SOURCES
-        src/community_models/minimax_h3/assets.cpp
-        src/community_models/minimax_h3/audio_vae_decoder.cpp
-        src/community_models/minimax_h3/dit_acceleration.cpp
-        src/community_models/minimax_h3/dit_denoiser.cpp
-        src/community_models/minimax_h3/generation_plan.cpp
-        src/community_models/minimax_h3/pipeline.cpp
-        src/community_models/minimax_h3/sampler.cpp
-        src/community_models/minimax_h3/session.cpp
-        src/community_models/minimax_h3/video_vae_decoder.cpp
-    INCLUDES
-        engine/community_models/minimax_h3/session.h
-    LOADERS
-        engine::models::minimax_h3::make_minimax_h3_loader
-)
-
-audiocpp_add_model(minimax_music3
-    SOURCES
-        src/community_models/minimax_music3/assets.cpp
-        src/community_models/minimax_music3/prompt.cpp
-        src/community_models/minimax_music3/global_lm.cpp
-        src/community_models/minimax_music3/depth_decoder.cpp
-        src/community_models/minimax_music3/ar_runtime.cpp
-        src/community_models/minimax_music3/condition_encoder.cpp
-        src/community_models/minimax_music3/flow_transformer.cpp
-        src/community_models/minimax_music3/flow_sampler.cpp
-        src/community_models/minimax_music3/vocoder.cpp
-        src/community_models/minimax_music3/pipeline.cpp
-        src/community_models/minimax_music3/session.cpp
-    INCLUDES
-        engine/community_models/minimax_music3/session.h
-    LOADERS
-        engine::models::minimax_music3::make_minimax_music3_loader
-)
-
-audiocpp_add_model(neutts
-    SOURCES
-        src/models/neutts/ar.cpp
-        src/models/neutts/assets.cpp
-        src/models/neutts/backbone.cpp
-        src/models/neutts/codec.cpp
-        src/models/neutts/prompt.cpp
-        src/models/neutts/session.cpp
-    INCLUDES
-        engine/models/neutts/ar.h
-        engine/models/neutts/assets.h
-        engine/models/neutts/backbone.h
-        engine/models/neutts/codec.h
-        engine/models/neutts/prompt.h
-        engine/models/neutts/session.h
-    LOADERS
-        engine::models::neutts::make_neutts_loader
-)
-
 if (MSVC)
     set_source_files_properties(
         src/community_models/inflect_v2/frontend.cpp
         PROPERTIES COMPILE_OPTIONS /utf-8
     )
 endif()
-
-audiocpp_add_model(pocket_tts
-    SOURCES
-        src/models/pocket_tts/assets.cpp
-        src/models/pocket_tts/backend_weights.cpp
-        src/models/pocket_tts/acoustic_model.cpp
-        src/models/pocket_tts/audio_decoder.cpp
-        src/models/pocket_tts/flow_lm.cpp
-        src/models/pocket_tts/mimi_decoder.cpp
-        src/models/pocket_tts/mimi_encoder.cpp
-        src/models/pocket_tts/text_conditioner.cpp
-        src/models/pocket_tts/voice_state_assets.cpp
-        src/models/pocket_tts/voice_conditioner.cpp
-        src/models/pocket_tts/loader.cpp
-        src/models/pocket_tts/session.cpp
-    INCLUDES
-        engine/models/pocket_tts/loader.h
-    LOADERS
-        engine::models::pocket_tts::make_pocket_tts_loader
-)
-
-audiocpp_add_model(miocodec
-    SOURCES
-        src/models/miocodec/assets.cpp
-        src/models/miocodec/weights.cpp
-        src/models/miocodec/audio_pipeline.cpp
-        src/models/miocodec/graph_ops.cpp
-        src/models/miocodec/graphs.cpp
-        src/models/miocodec/session.cpp
-        src/models/miocodec/loader.cpp
-    INCLUDES
-        engine/models/miocodec/loader.h
-    LOADERS
-        engine::models::miocodec::make_miocodec_loader
-)
-
-audiocpp_add_model(miotts
-    SOURCES
-        src/models/miotts/assets.cpp
-        src/models/miotts/tokenizer.cpp
-        src/models/miotts/causal_lm.cpp
-        src/models/miotts/session.cpp
-        src/models/miotts/loader.cpp
-    INCLUDES
-        engine/models/miotts/loader.h
-    LOADERS
-        engine::models::miotts::make_miotts_loader
-    DEPENDS
-        miocodec
-        qwen3_asr
-)
-
-audiocpp_add_model(moss
-    SOURCES
-        src/models/moss/moss_tts_local/assets.cpp
-        src/models/moss/moss_tts_local/backbone.cpp
-        src/models/moss/moss_tts_nano/assets.cpp
-        src/models/moss/moss_tts_nano/generator.cpp
-        src/models/moss/moss_tts_nano/global_transformer.cpp
-        src/models/moss/moss_tts_nano/local_frame_decoder.cpp
-        src/models/moss/moss_tts_nano/loader.cpp
-        src/models/moss/moss_tts_nano/prompt_builder.cpp
-        src/models/moss/moss_tts_nano/session.cpp
-        src/models/moss/moss_tts_nano/tokenizer_text.cpp
-        src/models/moss/shared/audio_tokenizer_decoder.cpp
-        src/models/moss/shared/audio_tokenizer_encoder.cpp
-        src/models/moss/shared/audio_tokenizer_config.cpp
-        src/models/moss/shared/audio_tokenizer_quantizer.cpp
-        src/models/moss/shared/sampling.cpp
-        src/models/moss/shared/token_rows.cpp
-        src/models/moss/moss_tts_local/depth_transformer.cpp
-        src/models/moss/moss_tts_local/generator.cpp
-        src/models/moss/moss_tts_local/loader.cpp
-        src/models/moss/moss_tts_local/tokenizer_text.cpp
-        src/models/moss/moss_tts_local/session.cpp
-    INCLUDES
-        engine/models/moss/moss_tts_local/loader.h
-        engine/models/moss/moss_tts_nano/loader.h
-    LOADERS
-        engine::models::moss_tts_local::make_moss_tts_local_loader
-        engine::models::moss_tts_nano::make_moss_tts_nano_loader
-    ALIASES
-        moss_tts_local
-        moss_tts_nano
-)
-
-audiocpp_add_model(muscriptor
-    SOURCES
-        src/models/muscriptor/assets.cpp
-        src/models/muscriptor/frontend.cpp
-        src/models/muscriptor/tokenizer.cpp
-        src/models/muscriptor/decoder.cpp
-        src/models/muscriptor/session.cpp
-    INCLUDES
-        engine/models/muscriptor/session.h
-    LOADERS
-        engine::models::muscriptor::make_muscriptor_loader
-)
-
-audiocpp_add_model(voxcpm2
-    SOURCES
-        src/models/voxcpm2/assets.cpp
-        src/models/voxcpm2/audiovae.cpp
-        src/models/voxcpm2/generator.cpp
-        src/models/voxcpm2/loader.cpp
-        src/models/voxcpm2/minicpm.cpp
-        src/models/voxcpm2/session.cpp
-        src/models/voxcpm2/tokenizer_text.cpp
-    INCLUDES
-        engine/models/voxcpm2/loader.h
-    LOADERS
-        engine::models::voxcpm2::make_voxcpm2_loader
-)
-
-audiocpp_add_model(vibevoice
-    SOURCES
-        src/models/vibevoice/assets.cpp
-        src/models/vibevoice/connector.cpp
-        src/models/vibevoice/decoder.cpp
-        src/models/vibevoice/diffusion_head.cpp
-        src/models/vibevoice/diffusion_sampler.cpp
-        src/models/vibevoice/generator.cpp
-        src/models/vibevoice/loader.cpp
-        src/models/vibevoice/lora.cpp
-        src/models/vibevoice/scheduler.cpp
-        src/models/vibevoice/session.cpp
-        src/models/vibevoice/tokenizer_audio.cpp
-        src/models/vibevoice/tokenizer_text.cpp
-    INCLUDES
-        engine/models/vibevoice/loader.h
-    LOADERS
-        engine::models::vibevoice::make_vibevoice_loader
-)
-
-audiocpp_add_model(vibevoice_asr
-    SOURCES
-        src/models/vibevoice_asr/assets.cpp
-        src/models/vibevoice_asr/connector.cpp
-        src/models/vibevoice_asr/frontend.cpp
-        src/models/vibevoice_asr/loader.cpp
-        src/models/vibevoice_asr/postprocess.cpp
-        src/models/vibevoice_asr/session.cpp
-        src/models/vibevoice_asr/speech_encoder.cpp
-        src/models/vibevoice_asr/speech_tokenizer.cpp
-        src/models/vibevoice_asr/text_decoder.cpp
-        src/models/vibevoice_asr/tokenizer_text.cpp
-    INCLUDES
-        engine/models/vibevoice_asr/loader.h
-    LOADERS
-        engine::models::vibevoice_asr::make_vibevoice_asr_loader
-)
-
-audiocpp_add_model(voxtral_realtime
-    SOURCES
-        src/models/voxtral_realtime/assets.cpp
-        src/models/voxtral_realtime/tokenizer_text.cpp
-        src/models/voxtral_realtime/frontend.cpp
-        src/models/voxtral_realtime/audio_encoder.cpp
-        src/models/voxtral_realtime/text_decoder.cpp
-        src/models/voxtral_realtime/session.cpp
-        src/models/voxtral_realtime/loader.cpp
-    INCLUDES
-        engine/models/voxtral_realtime/loader.h
-    LOADERS
-        engine::models::voxtral_realtime::make_voxtral_realtime_loader
-)
-
-audiocpp_add_model(fish_audio
-    SOURCES
-        src/models/fish_audio/ar.cpp
-        src/models/fish_audio/assets.cpp
-        src/models/fish_audio/codec.cpp
-        src/models/fish_audio/generator.cpp
-        src/models/fish_audio/loader.cpp
-        src/models/fish_audio/prompt_builder.cpp
-        src/models/fish_audio/session.cpp
-        src/models/fish_audio/tokenizer_text.cpp
-    INCLUDES
-        engine/models/fish_audio/loader.h
-    LOADERS
-        engine::models::fish_audio::make_fish_audio_loader
-)
-
-audiocpp_add_model(confucius4_tts
-    SOURCES
-        src/models/confucius4_tts/assets.cpp
-        src/models/confucius4_tts/audio_features.cpp
-        src/models/confucius4_tts/request.cpp
-        src/models/confucius4_tts/s2a.cpp
-        src/models/confucius4_tts/semantic_encoder.cpp
-        src/models/confucius4_tts/session.cpp
-        src/models/confucius4_tts/style_encoder.cpp
-        src/models/confucius4_tts/t2s.cpp
-        src/models/confucius4_tts/tokenizer_text.cpp
-        src/models/confucius4_tts/vocoder.cpp
-    INCLUDES
-        engine/models/confucius4_tts/session.h
-    LOADERS
-        engine::models::confucius4_tts::make_confucius4_tts_loader
-)
-
-audiocpp_add_model(dots_tts
-    SOURCES
-        src/models/dots_tts/assets.cpp
-        src/models/dots_tts/audio_features.cpp
-        src/models/dots_tts/audio_vae.cpp
-        src/models/dots_tts/flow.cpp
-        src/models/dots_tts/flow_meanflow.cpp
-        src/models/dots_tts/flow_soar.cpp
-        src/models/dots_tts/latent.cpp
-        src/models/dots_tts/llm.cpp
-        src/models/dots_tts/patch_encoder.cpp
-        src/models/dots_tts/request.cpp
-        src/models/dots_tts/session.cpp
-        src/models/dots_tts/tokenizer.cpp
-    INCLUDES
-        engine/models/dots_tts/session.h
-    LOADERS
-        engine::models::dots_tts::make_dots_tts_loader
-)
-
-audiocpp_add_model(dramabox
-    SOURCES
-        src/models/dramabox/assets.cpp
-        src/models/dramabox/audio_vae.cpp
-        src/models/dramabox/dit.cpp
-        src/models/dramabox/gemma_tokenizer.cpp
-        src/models/dramabox/gemma3_encoder.cpp
-        src/models/dramabox/latent_state.cpp
-        src/models/dramabox/prompt_connector.cpp
-        src/models/dramabox/session.cpp
-        src/models/dramabox/vocoder.cpp
-    INCLUDES
-        engine/models/dramabox/session.h
-    LOADERS
-        engine::models::dramabox::make_dramabox_loader
-)
-
-audiocpp_add_model(fun_asr_nano
-    SOURCES
-        src/models/fun_asr_nano/assets.cpp
-        src/models/fun_asr_nano/frontend.cpp
-        src/models/fun_asr_nano/encoder.cpp
-        src/models/fun_asr_nano/adaptor.cpp
-        src/models/fun_asr_nano/tokenizer_text.cpp
-        src/models/fun_asr_nano/prompt.cpp
-        src/models/fun_asr_nano/decoder.cpp
-        src/models/fun_asr_nano/session.cpp
-        src/models/fun_asr_nano/loader.cpp
-    INCLUDES
-        engine/models/fun_asr_nano/loader.h
-    LOADERS
-        engine::models::fun_asr_nano::make_fun_asr_nano_loader
-)
-
-audiocpp_add_model(sense_asr
-    SOURCES
-        src/community_models/sense_asr/assets.cpp
-        src/community_models/sense_asr/frontend.cpp
-        src/community_models/sense_asr/encoder.cpp
-        src/community_models/sense_asr/session.cpp
-    INCLUDES
-        engine/community_models/sense_asr/session.h
-    LOADERS
-        engine::community_models::sense_asr::make_sense_asr_loader
-)
-
-audiocpp_add_model(heartmula
-    SOURCES
-        src/models/heartmula/assets.cpp
-        src/models/heartmula/codec.cpp
-        src/models/heartmula/generator.cpp
-        src/models/heartmula/mula.cpp
-        src/models/heartmula/session.cpp
-        src/models/heartmula/tokenizer_text.cpp
-    INCLUDES
-        engine/models/heartmula/session.h
-    LOADERS
-        engine::models::heartmula::make_heartmula_loader
-)
-
-audiocpp_add_model(higgs_audio_stt
-    SOURCES
-        src/models/higgs_audio_stt/assets.cpp
-        src/models/higgs_audio_stt/tokenizer_text.cpp
-        src/models/higgs_audio_stt/frontend_whisper.cpp
-        src/models/higgs_audio_stt/audio_encoder.cpp
-        src/models/higgs_audio_stt/text_decoder.cpp
-        src/models/higgs_audio_stt/prompt_asr.cpp
-        src/models/higgs_audio_stt/postprocess.cpp
-        src/models/higgs_audio_stt/session.cpp
-    INCLUDES
-        engine/models/higgs_audio_stt/session.h
-    LOADERS
-        engine::models::higgs_audio_stt::make_higgs_audio_stt_loader
-)
-
-audiocpp_add_model(higgs_audio_tts
-    SOURCES
-        src/models/higgs_audio_tts/ar.cpp
-        src/models/higgs_audio_tts/assets.cpp
-        src/models/higgs_audio_tts/codec.cpp
-        src/models/higgs_audio_tts/codebooks.cpp
-        src/models/higgs_audio_tts/generator.cpp
-        src/models/higgs_audio_tts/loader.cpp
-        src/models/higgs_audio_tts/sampler.cpp
-        src/models/higgs_audio_tts/session.cpp
-        src/models/higgs_audio_tts/tokenizer_text.cpp
-    INCLUDES
-        engine/models/higgs_audio_tts/loader.h
-    LOADERS
-        engine::models::higgs_audio_tts::make_higgs_audio_tts_loader
-)
-
-audiocpp_add_model(hviske_asr
-    SOURCES
-        src/models/hviske_asr/assets.cpp
-        src/models/hviske_asr/frontend.cpp
-        src/models/hviske_asr/encoder.cpp
-        src/models/hviske_asr/decoder.cpp
-        src/models/hviske_asr/session.cpp
-        src/models/hviske_asr/weights.cpp
-    INCLUDES
-        engine/models/hviske_asr/session.h
-    LOADERS
-        engine::models::hviske_asr::make_hviske_asr_loader
-)
-
-audiocpp_add_model(irodori_tts
-    SOURCES
-        src/models/irodori_tts/assets.cpp
-        src/models/irodori_tts/codec.cpp
-        src/models/irodori_tts/condition_encoder.cpp
-        src/models/irodori_tts/duration.cpp
-        src/models/irodori_tts/rf_dit.cpp
-        src/models/irodori_tts/session.cpp
-        src/models/irodori_tts/tokenizer_text.cpp
-    INCLUDES
-        engine/models/irodori_tts/session.h
-    LOADERS
-        engine::models::irodori_tts::make_irodori_tts_loader
-)
-
-audiocpp_add_model(index_tts2
-    SOURCES
-        src/models/index_tts2/assets.cpp
-        src/models/index_tts2/audio_features.cpp
-        src/models/index_tts2/gpt.cpp
-        src/models/index_tts2/loader.cpp
-        src/models/index_tts2/qwen_emotion.cpp
-        src/models/index_tts2/request.cpp
-        src/models/index_tts2/s2mel.cpp
-        src/models/index_tts2/semantic_codec.cpp
-        src/models/index_tts2/semantic_encoder.cpp
-        src/models/index_tts2/session.cpp
-        src/models/index_tts2/style_encoder.cpp
-        src/models/index_tts2/tokenizer_text.cpp
-        src/models/index_tts2/vocoder.cpp
-    INCLUDES
-        engine/models/index_tts2/loader.h
-    LOADERS
-        engine::models::index_tts2::make_index_tts2_loader
-)
-
-audiocpp_add_model(nemotron_asr
-    SOURCES
-        src/models/nemotron_asr/assets.cpp
-        src/models/nemotron_asr/frontend.cpp
-        src/models/nemotron_asr/encoder.cpp
-        src/models/nemotron_asr/decoder.cpp
-        src/models/nemotron_asr/session.cpp
-        src/models/nemotron_asr/loader.cpp
-        src/models/nemotron_asr/weights.cpp
-    INCLUDES
-        engine/models/nemotron_asr/loader.h
-    LOADERS
-        engine::models::nemotron_asr::make_nemotron_asr_loader
-)
 
 audiocpp_add_model(qwen3_tts
     SOURCES
@@ -999,25 +437,6 @@ audiocpp_add_model(qwen3_tts
         engine/models/qwen3_tts/loader.h
     LOADERS
         engine::models::qwen3_tts::make_qwen3_tts_loader
-)
-
-audiocpp_add_model(vietneu_tts
-    SOURCES
-        src/community_models/vietneu_tts/assets.cpp
-        src/community_models/vietneu_tts/tokenizer_text.cpp
-        src/community_models/vietneu_tts/tokenizer_speech_encoder.cpp
-        src/community_models/vietneu_tts/tokenizer_speech_decoder.cpp
-        src/community_models/vietneu_tts/speaker_encoder.cpp
-        src/community_models/vietneu_tts/talker.cpp
-        src/community_models/vietneu_tts/prompt_tts_voice_clone.cpp
-        src/community_models/vietneu_tts/session.cpp
-        src/community_models/vietneu_tts/loader.cpp
-    INCLUDES
-        engine/community_models/vietneu_tts/loader.h
-    LOADERS
-        engine::models::vietneu_tts::make_vietneu_tts_loader
-    DEPENDS
-        moss
 )
 
 audiocpp_add_model(qwen3_asr
@@ -1050,169 +469,6 @@ audiocpp_add_model(qwen3_forced_aligner
         engine::models::qwen3_forced_aligner::make_qwen3_forced_aligner_loader
     DEPENDS
         qwen3_asr
-)
-
-audiocpp_add_model(sortformer_diar
-    SOURCES
-        src/models/sortformer_diar/assets.cpp
-        src/models/sortformer_diar/frontend.cpp
-        src/models/sortformer_diar/graph.cpp
-        src/models/sortformer_diar/modules.cpp
-        src/models/sortformer_diar/postprocess.cpp
-        src/models/sortformer_diar/session.cpp
-    INCLUDES
-        engine/models/sortformer_diar/session.h
-    LOADERS
-        engine::models::sortformer_diar::make_sortformer_diar_loader
-)
-
-audiocpp_add_model(stable_audio
-    SOURCES
-        src/models/stable_audio/assets.cpp
-        src/models/stable_audio/conditioner.cpp
-        src/models/stable_audio/conditioner_runtime.cpp
-        src/models/stable_audio/foundation/conditioner.cpp
-        src/models/stable_audio/foundation/oobleck_autoencoder.cpp
-        src/models/stable_audio/foundation/rf_dit.cpp
-        src/models/stable_audio/foundation/session.cpp
-        src/models/stable_audio/loader.cpp
-        src/models/stable_audio/request.cpp
-        src/models/stable_audio/rf_dit.cpp
-        src/models/stable_audio/same_autoencoder.cpp
-        src/models/stable_audio/sampler.cpp
-        src/models/stable_audio/session.cpp
-        src/models/stable_audio/t5gemma.cpp
-    INCLUDES
-        engine/models/stable_audio/loader.h
-    LOADERS
-        engine::models::stable_audio::make_stable_audio_loader
-)
-
-audiocpp_add_model(supertonic
-    SOURCES
-        src/models/supertonic/assets.cpp
-        src/models/supertonic/loader.cpp
-        src/models/supertonic/runtime.cpp
-        src/models/supertonic/session.cpp
-        src/models/supertonic/tokenizer_text.cpp
-    INCLUDES
-        engine/models/supertonic/loader.h
-    LOADERS
-        engine::models::supertonic::make_supertonic_loader
-)
-
-audiocpp_add_model(citrinet_asr
-    SOURCES
-        src/models/citrinet_asr/assets.cpp
-        src/models/citrinet_asr/runtime.cpp
-        src/models/citrinet_asr/session.cpp
-    INCLUDES
-        engine/models/citrinet_asr/session.h
-    LOADERS
-        engine::models::citrinet_asr::make_citrinet_asr_loader
-)
-
-audiocpp_add_model(vevo2
-    SOURCES
-        src/models/vevo2/ar.cpp
-        src/models/vevo2/assets.cpp
-        src/models/vevo2/components.cpp
-        src/models/vevo2/fm.cpp
-        src/models/vevo2/prompt_builder.cpp
-        src/models/vevo2/session.cpp
-        src/models/vevo2/tokenizer_ar.cpp
-        src/models/vevo2/vocoder.cpp
-        src/models/vevo2/loader.cpp
-    INCLUDES
-        engine/models/vevo2/loader.h
-    LOADERS
-        engine::models::vevo2::make_vevo2_loader
-)
-
-audiocpp_add_model(seed_vc
-    SOURCES
-        src/models/seed_vc/assets.cpp
-        src/models/seed_vc/audio_features.cpp
-        src/models/seed_vc/length_regulator.cpp
-        src/models/seed_vc/astral_quantizer.cpp
-        src/models/seed_vc/content_features.cpp
-        src/models/seed_vc/rmvpe.cpp
-        src/models/seed_vc/whisper_content.cpp
-        src/models/seed_vc/v1_cfm.cpp
-        src/models/seed_vc/v2_cfm.cpp
-        src/models/seed_vc/session.cpp
-    INCLUDES
-        engine/models/seed_vc/session.h
-    LOADERS
-        engine::models::seed_vc::make_seed_vc_loader
-)
-
-audiocpp_add_model(rvc
-    SOURCES
-        src/models/rvc/assets.cpp
-        src/models/rvc/hubert.cpp
-        src/models/rvc/native_pipeline.cpp
-        src/models/rvc/rmvpe.cpp
-        src/models/rvc/retrieval_index.cpp
-        src/models/rvc/session.cpp
-        src/models/rvc/synthesizer.cpp
-        src/models/rvc/voice_model.cpp
-    INCLUDES
-        engine/models/rvc/session.h
-    LOADERS
-        engine::models::rvc::make_rvc_loader
-)
-
-audiocpp_add_model(chatterbox
-    SOURCES
-        src/models/chatterbox/assets.cpp
-        src/models/chatterbox/campplus_encoder_impl.cpp
-        src/models/chatterbox/audio_features.cpp
-        src/models/chatterbox/audio_processing.cpp
-        src/models/chatterbox/component_weights.cpp
-        src/models/chatterbox/conditionals.cpp
-        src/models/chatterbox/hift_vocoder_impl.cpp
-        src/models/chatterbox/loader.cpp
-        src/models/chatterbox/s3_tokenizer_impl.cpp
-        src/models/chatterbox/s3gen_flow.cpp
-        src/models/chatterbox/s3gen_inference.cpp
-        src/models/chatterbox/session.cpp
-        src/models/chatterbox/t3_component.cpp
-        src/models/chatterbox/t3_weights.cpp
-        src/models/chatterbox/text_tokenizer.cpp
-        src/models/chatterbox/tts.cpp
-        src/models/chatterbox/vc.cpp
-        src/models/chatterbox/voice_encoder_impl.cpp
-    INCLUDES
-        engine/models/chatterbox/loader.h
-    LOADERS
-        engine::models::chatterbox::make_chatterbox_loader
-)
-
-audiocpp_add_model(ace_step
-    SOURCES
-        src/models/ace_step/assets.cpp
-        src/models/ace_step/condition_encoder.cpp
-        src/models/ace_step/cover_tokenizer.cpp
-        src/models/ace_step/detokenizer.cpp
-        src/models/ace_step/diffusion.cpp
-        src/models/ace_step/dit_weights_runtime.cpp
-        src/models/ace_step/loader.cpp
-        src/models/ace_step/planner.cpp
-        src/models/ace_step/pre_dit.cpp
-        src/models/ace_step/prompt_builder.cpp
-        src/models/ace_step/repaint.cpp
-        src/models/ace_step/request_parser.cpp
-        src/models/ace_step/session.cpp
-        src/models/ace_step/task_route.cpp
-        src/models/ace_step/text_encoder.cpp
-        src/models/ace_step/tokenizer_text.cpp
-        src/models/ace_step/vae_decoder.cpp
-        src/models/ace_step/vae_encoder.cpp
-    INCLUDES
-        engine/models/ace_step/loader.h
-    LOADERS
-        engine::models::ace_step::make_ace_step_loader
 )
 
 set(AUDIOCPP_ENABLED_MODELS "")
@@ -1275,7 +531,6 @@ file(GENERATE
 set(AUDIOCPP_RUNTIME_OBJECTS
     $<TARGET_OBJECTS:engine_core>
     $<TARGET_OBJECTS:engine_model_silero_vad>
-    $<TARGET_OBJECTS:engine_model_marblenet_vad>
 )
 foreach(model_name IN LISTS AUDIOCPP_LINKED_MODELS)
     list(APPEND AUDIOCPP_RUNTIME_OBJECTS $<TARGET_OBJECTS:engine_model_${model_name}>)
@@ -1500,68 +755,34 @@ if (ENGINE_ENABLE_OPENMP)
     target_link_libraries(model_perf PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
-add_executable(miocodec_wavlm_parity
-    tests/miocodec/miocodec_wavlm_parity.cpp
-)
 
-target_link_libraries(miocodec_wavlm_parity PRIVATE engine_runtime ggml)
 
-add_executable(torch_bin_parity
-    tests/vibevoice/torch_bin_parity.cpp
-)
 
-target_link_libraries(torch_bin_parity PRIVATE engine_runtime ggml)
 if (ENGINE_ENABLE_OPENMP)
-    target_link_libraries(torch_bin_parity PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 # Only build this parity check when the vibevoice model is linked, since it
 # directly references model-internal symbols (load_vibevoice_assets etc.).
 if (vibevoice IN_LIST AUDIOCPP_LINKED_MODELS)
-    add_executable(vibevoice_finetune_overlay_check
-        tests/vibevoice/finetune_overlay_check.cpp
-    )
-    target_link_libraries(vibevoice_finetune_overlay_check PRIVATE engine_runtime ggml)
     if (ENGINE_ENABLE_OPENMP)
-        target_link_libraries(vibevoice_finetune_overlay_check PRIVATE OpenMP::OpenMP_CXX)
     endif()
 endif()
 
 if (ENGINE_BUILD_TESTS)
-    add_executable(moss_tts_local_smoke
-        tests/moss_tts_local/moss_tts_local_smoke.cpp
-    )
 
-    target_link_libraries(moss_tts_local_smoke PRIVATE engine_runtime ggml)
     if (ENGINE_ENABLE_OPENMP)
-        target_link_libraries(moss_tts_local_smoke PRIVATE OpenMP::OpenMP_CXX)
     endif()
 
-    add_executable(codec_dequant_parity
-        tests/moss_tts_local/codec_dequant_parity.cpp
-    )
 
-    target_link_libraries(codec_dequant_parity PRIVATE engine_runtime ggml)
     if (ENGINE_ENABLE_OPENMP)
-        target_link_libraries(codec_dequant_parity PRIVATE OpenMP::OpenMP_CXX)
     endif()
 
-    add_executable(codec_decode_parity
-        tests/moss_tts_local/codec_decode_parity.cpp
-    )
 
-    target_link_libraries(codec_decode_parity PRIVATE engine_runtime ggml)
     if (ENGINE_ENABLE_OPENMP)
-        target_link_libraries(codec_decode_parity PRIVATE OpenMP::OpenMP_CXX)
     endif()
 
-    add_executable(codec_encode_parity
-        tests/moss_tts_local/codec_encode_parity.cpp
-    )
 
-    target_link_libraries(codec_encode_parity PRIVATE engine_runtime ggml)
     if (ENGINE_ENABLE_OPENMP)
-        target_link_libraries(codec_encode_parity PRIVATE OpenMP::OpenMP_CXX)
     endif()
 endif()
 
@@ -1576,55 +797,12 @@ if (ENGINE_BUILD_WARMBENCH)
         endif()
     endfunction()
 
-    add_engine_warmbench(campplus_shared_default_probe tests/glm_tts/campplus_shared_default_probe.cpp)
-    add_engine_warmbench(chatterbox_warm_bench tests/chatterbox/chatterbox_warm_bench.cpp)
-    add_engine_warmbench(citrinet_asr_warm_bench tests/citrinet_asr/citrinet_asr_warm_bench.cpp)
-    add_engine_warmbench(confucius4_tts_warm_bench tests/confucius4_tts/confucius4_tts_warm_bench.cpp)
-    add_engine_warmbench(dramabox_warm_bench tools/dramabox/dramabox_warm_bench.cpp)
-    add_engine_warmbench(fun_asr_nano_warm_bench tests/fun_asr_nano/fun_asr_nano_warm_bench.cpp)
-    add_engine_warmbench(higgs_audio_stt_warm_bench tests/higgs_audio_stt/higgs_audio_stt_warm_bench.cpp)
-    add_engine_warmbench(higgs_audio_tts_warm_bench tests/higgs_audio_tts/higgs_audio_tts_warm_bench.cpp)
-    add_engine_warmbench(hviske_asr_warm_bench tests/hviske_asr/hviske_asr_warm_bench.cpp)
-    add_engine_warmbench(index_tts2_warm_bench tests/index_tts2/index_tts2_warm_bench.cpp)
-    add_engine_warmbench(irodori_tts_warm_bench tests/irodori_tts/irodori_tts_warm_bench.cpp)
-    add_engine_warmbench(marblenet_vad_warm_bench tests/marblenet_vad/marblenet_vad_warm_bench.cpp)
-    add_engine_warmbench(miocodec_warm_bench tests/miocodec/miocodec_warm_bench.cpp)
-    add_engine_warmbench(muscriptor_warm_bench tests/muscriptor/muscriptor_warm_bench.cpp)
-    add_engine_warmbench(moss_tts_nano_warm_bench tests/moss_tts_nano/moss_tts_nano_warm_bench.cpp)
-    add_engine_warmbench(moss_tts_local_warm_bench tests/moss_tts_local/moss_tts_local_warm_bench.cpp)
-    add_engine_warmbench(nemotron_asr_warm_bench tests/nemotron_asr/nemotron_asr_warm_bench.cpp)
-    add_engine_warmbench(neutts_warm_bench tests/neutts/neutts_warm_bench.cpp)
-    add_engine_warmbench(omnivoice_warm_bench tests/omnivoice/omnivoice_warm_bench.cpp)
-    add_engine_warmbench(outetts_warm_bench tests/outetts/outetts_warm_bench.cpp)
-    add_engine_warmbench(parakeet_warm_bench tests/parakeet_tdt/parakeet_warm_bench.cpp)
-    add_engine_warmbench(glm_tts_tokenizer_probe tests/glm_tts/glm_tts_tokenizer_probe.cpp)
-    add_engine_warmbench(glm_tts_assets_probe tests/glm_tts/glm_tts_assets_probe.cpp)
-    add_engine_warmbench(glm_tts_prompt_probe tests/glm_tts/glm_tts_prompt_probe.cpp)
-    add_engine_warmbench(glm_tts_speech_tokenizer_probe tests/glm_tts/glm_tts_speech_tokenizer_probe.cpp)
-    add_engine_warmbench(glm_tts_flow_probe tests/glm_tts/glm_tts_flow_probe.cpp)
-    add_engine_warmbench(glm_tts_flow_conditioned_probe tests/glm_tts/glm_tts_flow_conditioned_probe.cpp)
-    add_engine_warmbench(glm_tts_frontend_probe tests/glm_tts/glm_tts_frontend_probe.cpp)
-    add_engine_warmbench(glm_tts_campplus_probe tests/glm_tts/glm_tts_campplus_probe.cpp)
-    add_engine_warmbench(glm_tts_llama_probe tests/glm_tts/glm_tts_llama_probe.cpp)
-    add_engine_warmbench(glm_tts_warm_bench tests/glm_tts/glm_tts_warm_bench.cpp)
-    add_engine_warmbench(kroko_asr_encoder_probe tests/kroko_asr/kroko_asr_encoder_probe.cpp)
-    add_engine_warmbench(kroko_asr_frontend_probe tests/kroko_asr/kroko_asr_frontend_probe.cpp)
-    add_engine_warmbench(kroko_asr_streaming_probe tests/kroko_asr/kroko_asr_streaming_probe.cpp)
-    add_engine_warmbench(kroko_asr_zipformer_probe tests/kroko_asr/kroko_asr_zipformer_probe.cpp)
-    add_engine_warmbench(pocket_tts_warm_bench tests/pocket_tts/pocket_tts_warm_bench.cpp)
     add_engine_warmbench(qwen3_asr_warm_bench tests/qwen3_asr/qwen3_asr_warm_bench.cpp)
     add_engine_warmbench(qwen3_forced_aligner_warm_bench tests/qwen3_forced_aligner/qwen3_forced_aligner_warm_bench.cpp)
     add_engine_warmbench(qwen3_tts_warm_bench tests/qwen3_tts/qwen3_tts_warm_bench.cpp)
     add_engine_warmbench(qwen3_tts_stream_latency benchmarks/stream_latency/main.cpp)
     add_engine_warmbench(qwen3_tts_streaming_integration tests/qwen3_tts/qwen3_tts_streaming_integration.cpp)
-    add_engine_warmbench(seed_vc_warm_bench tests/seed_vc/seed_vc_warm_bench.cpp)
     add_engine_warmbench(silero_vad_warm_bench tests/silero_vad/silero_vad_warm_bench.cpp)
-    add_engine_warmbench(sortformer_diar_warm_bench tests/sortformer_diar/sortformer_diar_warm_bench.cpp)
-    add_engine_warmbench(supertonic_warm_bench tests/supertonic/supertonic_warm_bench.cpp)
-    add_engine_warmbench(vevo2_warm_bench tests/vevo2/vevo2_warm_bench.cpp)
-    add_engine_warmbench(vibevoice_asr_warm_bench tests/vibevoice_asr/vibevoice_asr_warm_bench.cpp)
-    add_engine_warmbench(voxtral_realtime_warm_bench tests/voxtral_realtime/voxtral_realtime_warm_bench.cpp)
-    add_engine_warmbench(voxcpm2_warm_bench tests/voxcpm2/voxcpm2_warm_bench.cpp)
 endif()
 
 if (ENGINE_BUILD_TESTS)
@@ -1668,7 +846,6 @@ if (ENGINE_BUILD_TESTS)
         COMMAND audio_dsp_test
     )
 
-    add_engine_unittest(dots_tts_vocoder_parity tests/dots_tts/dots_tts_vocoder_parity.cpp)
 
     add_engine_unittest(midi_file_test tests/unittests/test_midi_file.cpp)
 
@@ -1712,21 +889,9 @@ if (ENGINE_BUILD_TESTS)
         COMMAND audio_chunking_test
     )
 
-    add_engine_unittest(inflect_v2_frontend_test tests/unittests/test_inflect_v2_frontend.cpp)
-    target_include_directories(inflect_v2_frontend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
 
-    add_test(
-        NAME inflect_v2_frontend_test
-        COMMAND inflect_v2_frontend_test
-    )
 
-    add_engine_unittest(voxtral_realtime_stream_chunking_test tests/unittests/test_voxtral_realtime_stream_chunking.cpp)
-    target_include_directories(voxtral_realtime_stream_chunking_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
 
-    add_test(
-        NAME voxtral_realtime_stream_chunking_test
-        COMMAND voxtral_realtime_stream_chunking_test
-    )
 
     add_engine_unittest(chinese_normalization_test tests/unittests/test_chinese_normalization.cpp)
 
@@ -1745,12 +910,7 @@ if (ENGINE_BUILD_TESTS)
         COMMAND index_tts_tn_corpus_test
     )
 
-    add_engine_unittest(unicode_normalization_test tests/unittests/test_unicode_normalization.cpp)
 
-    add_test(
-        NAME unicode_normalization_test
-        COMMAND unicode_normalization_test
-    )
 
     add_engine_unittest(text_normalization_test tests/unittests/test_text_normalization.cpp)
 
@@ -1759,13 +919,7 @@ if (ENGINE_BUILD_TESTS)
         COMMAND text_normalization_test
     )
 
-    add_engine_unittest(outetts_generation_budget_test tests/unittests/test_outetts_generation_budget.cpp)
-    target_include_directories(outetts_generation_budget_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
 
-    add_test(
-        NAME outetts_generation_budget_test
-        COMMAND outetts_generation_budget_test
-    )
 
 
     add_engine_unittest(subtitle_formatter_test tests/unittests/test_subtitle_formatter.cpp)
@@ -1897,10 +1051,6 @@ if (ENGINE_BUILD_TESTS)
         tests/unittests/test_qwen_decoder_packed_projections.cpp
     )
 
-    add_test(
-        NAME qwen_decoder_packed_projection_test
-        COMMAND qwen_decoder_packed_projection_test
-    )
 
     add_engine_unittest(conv_transpose_fast_path_test tests/unittests/test_conv_transpose_fast_path.cpp)
 
@@ -1909,12 +1059,7 @@ if (ENGINE_BUILD_TESTS)
         COMMAND conv_transpose_fast_path_test
     )
 
-    add_engine_unittest(supertonic_vector_convnext_exp_test tests/unittests/test_supertonic_vector_convnext_exp.cpp)
 
-    add_test(
-        NAME supertonic_vector_convnext_exp_test
-        COMMAND supertonic_vector_convnext_exp_test
-    )
 
     add_engine_unittest(depthwise_conv1d_lowering_test tests/unittests/test_depthwise_conv1d_lowering.cpp)
 
@@ -1933,21 +1078,9 @@ if (ENGINE_BUILD_TESTS)
         COMMAND conv_lowering_matrix_test
     )
 
-    add_engine_unittest(gguf_tensor_source_test tests/unittests/test_gguf_tensor_source.cpp)
-    target_include_directories(gguf_tensor_source_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
 
-    add_test(
-        NAME gguf_tensor_source_test
-        COMMAND gguf_tensor_source_test
-    )
 
-    add_engine_unittest(model_spec_system_test tests/unittests/test_model_spec_system.cpp)
-    target_include_directories(model_spec_system_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
 
-    add_test(
-        NAME model_spec_system_test
-        COMMAND model_spec_system_test
-    )
 
     add_engine_unittest(qwen3_forced_aligner_processor_test tests/unittests/test_qwen3_forced_aligner_processor.cpp)
     target_include_directories(qwen3_forced_aligner_processor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
@@ -1965,43 +1098,12 @@ if (ENGINE_BUILD_TESTS)
         COMMAND qwen3_tts_stream_decoder_test
     )
 
-    add_engine_unittest(fun_asr_nano_assets_test tests/unittests/test_fun_asr_nano_assets.cpp)
-    target_sources(fun_asr_nano_assets_test PRIVATE src/models/fun_asr_nano/assets.cpp)
-    target_include_directories(fun_asr_nano_assets_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
 
-    add_test(
-        NAME fun_asr_nano_assets_test
-        COMMAND fun_asr_nano_assets_test
-    )
 
-    add_engine_unittest(fun_asr_nano_frontend_probe tests/fun_asr_nano/fun_asr_nano_frontend_probe.cpp)
 
-    add_test(
-        NAME fun_asr_nano_frontend_probe
-        COMMAND fun_asr_nano_frontend_probe
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/frontend_reference.json
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/frontend_reference.bin
-            ${CMAKE_CURRENT_SOURCE_DIR}/assets/resources/sample_16k.wav
-    )
 
-    add_engine_unittest(fun_asr_nano_sanm_probe tests/fun_asr_nano/sanm_probe.cpp)
 
-    add_test(
-        NAME fun_asr_nano_sanm_probe
-        COMMAND fun_asr_nano_sanm_probe
-            --backend cpu
-            --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/sanm_reference.json
-            --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/sanm_reference.bin
-    )
 
-    add_engine_unittest(fun_asr_nano_encoder_probe tests/fun_asr_nano/fun_asr_nano_encoder_probe.cpp)
-    target_sources(
-        fun_asr_nano_encoder_probe
-        PRIVATE
-            src/models/fun_asr_nano/assets.cpp
-            src/models/fun_asr_nano/frontend.cpp
-            src/models/fun_asr_nano/encoder.cpp
-    )
     set(
         AUDIOCPP_FUN_ASR_NANO_TEST_MODEL
         ""
@@ -2015,41 +1117,10 @@ if (ENGINE_BUILD_TESTS)
         "Optional standalone Fun-ASR-Nano GGUF for full CLI transcript tests"
     )
     if (AUDIOCPP_FUN_ASR_NANO_TEST_MODEL)
-        add_test(
-            NAME fun_asr_nano_encoder_probe_cpu
-            COMMAND fun_asr_nano_encoder_probe
-                --backend cpu
-                --model ${AUDIOCPP_FUN_ASR_NANO_TEST_MODEL}
-                --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/encoder_reference.json
-                --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/encoder_reference.bin
-        )
         if (GGML_CUDA)
-            add_test(
-                NAME fun_asr_nano_encoder_probe_cuda
-                COMMAND fun_asr_nano_encoder_probe
-                    --backend cuda
-                    --model ${AUDIOCPP_FUN_ASR_NANO_TEST_MODEL}
-                    --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/encoder_reference.json
-                    --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/encoder_reference.bin
-            )
         endif()
 
-        add_engine_unittest(fun_asr_nano_session_probe tests/fun_asr_nano/fun_asr_nano_session_probe.cpp)
-        add_test(
-            NAME fun_asr_nano_session_probe_cpu
-            COMMAND fun_asr_nano_session_probe
-                --backend cpu
-                --model ${AUDIOCPP_FUN_ASR_NANO_TEST_MODEL}
-                --audio ${CMAKE_CURRENT_SOURCE_DIR}/assets/resources/sample_16k.wav
-        )
         if (GGML_CUDA)
-            add_test(
-                NAME fun_asr_nano_session_probe_cuda
-                COMMAND fun_asr_nano_session_probe
-                    --backend cuda
-                    --model ${AUDIOCPP_FUN_ASR_NANO_TEST_MODEL}
-                    --audio ${CMAKE_CURRENT_SOURCE_DIR}/assets/resources/sample_16k.wav
-            )
         endif()
     endif()
     if (AUDIOCPP_FUN_ASR_NANO_TEST_GGUF)
@@ -2115,61 +1186,13 @@ if (ENGINE_BUILD_TESTS)
         endif()
     endif()
 
-    add_engine_unittest(fun_asr_nano_adaptor_probe tests/fun_asr_nano/fun_asr_nano_adaptor_probe.cpp)
-    target_sources(
-        fun_asr_nano_adaptor_probe
-        PRIVATE
-            src/models/fun_asr_nano/assets.cpp
-            src/models/fun_asr_nano/adaptor.cpp
-    )
     if (AUDIOCPP_FUN_ASR_NANO_TEST_MODEL)
-        add_test(
-            NAME fun_asr_nano_adaptor_probe_cpu
-            COMMAND fun_asr_nano_adaptor_probe
-                --backend cpu
-                --model ${AUDIOCPP_FUN_ASR_NANO_TEST_MODEL}
-                --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/adaptor_reference.json
-                --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/adaptor_reference.bin
-        )
         if (GGML_CUDA)
-            add_test(
-                NAME fun_asr_nano_adaptor_probe_cuda
-                COMMAND fun_asr_nano_adaptor_probe
-                    --backend cuda
-                    --model ${AUDIOCPP_FUN_ASR_NANO_TEST_MODEL}
-                    --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/adaptor_reference.json
-                    --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/adaptor_reference.bin
-            )
         endif()
     endif()
 
-    add_engine_unittest(fun_asr_nano_decoder_probe tests/fun_asr_nano/fun_asr_nano_decoder_probe.cpp)
-    target_sources(
-        fun_asr_nano_decoder_probe
-        PRIVATE
-            src/models/fun_asr_nano/assets.cpp
-            src/models/fun_asr_nano/tokenizer_text.cpp
-            src/models/fun_asr_nano/prompt.cpp
-            src/models/fun_asr_nano/decoder.cpp
-    )
     if (AUDIOCPP_FUN_ASR_NANO_TEST_MODEL)
-        add_test(
-            NAME fun_asr_nano_decoder_probe_cpu
-            COMMAND fun_asr_nano_decoder_probe
-                --backend cpu
-                --model ${AUDIOCPP_FUN_ASR_NANO_TEST_MODEL}
-                --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/decoder_reference.json
-                --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/decoder_reference.bin
-        )
         if (GGML_CUDA)
-            add_test(
-                NAME fun_asr_nano_decoder_probe_cuda
-                COMMAND fun_asr_nano_decoder_probe
-                    --backend cuda
-                    --model ${AUDIOCPP_FUN_ASR_NANO_TEST_MODEL}
-                    --reference ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/decoder_reference.json
-                    --data ${CMAKE_CURRENT_SOURCE_DIR}/tests/fun_asr_nano/decoder_reference.bin
-            )
         endif()
     endif()
 
@@ -2188,16 +1211,7 @@ if (ENGINE_BUILD_TESTS)
         COMMAND scaled_dot_product_attention_test
     )
 
-    add_engine_unittest(asr_standalone_gguf_test tests/unittests/test_asr_standalone_gguf.cpp)
-    target_include_directories(asr_standalone_gguf_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
-    target_compile_definitions(asr_standalone_gguf_test PRIVATE
-        ENGINE_TEST_ASSET_ROOT="${ENGINE_UNITTEST_ASSET_ROOT}"
-    )
 
-    add_test(
-        NAME asr_standalone_gguf_test
-        COMMAND asr_standalone_gguf_test
-    )
 
     add_executable(cli_request_options_test
         tests/unittests/test_cli_request_options.cpp
@@ -2323,76 +1337,22 @@ if (ENGINE_BUILD_TESTS)
     # regression that reintroduces unbounded queuing fails instead of hanging CI.
     set_tests_properties(server_busy_guard_test PROPERTIES TIMEOUT 60)
 
-    add_executable(server_config_test
-        tests/unittests/test_server_config.cpp
-        app/server/config.cpp
-        app/cli/args.cpp
-        app/cli/request.cpp
-    )
-    target_include_directories(server_config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/app/server)
-    target_link_libraries(server_config_test PRIVATE engine_runtime ggml)
     if (ENGINE_ENABLE_OPENMP)
-        target_link_libraries(server_config_test PRIVATE OpenMP::OpenMP_CXX)
     endif()
 
-    add_test(
-        NAME server_config_test
-        COMMAND server_config_test
-    )
 
-    add_engine_unittest(parakeet_golden_transcription_test tests/parakeet_tdt/test_golden_transcription.cpp)
-    target_compile_definitions(parakeet_golden_transcription_test PRIVATE
-        ENGINE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
-    )
 
-    add_test(
-        NAME parakeet_golden_transcription_test
-        COMMAND parakeet_golden_transcription_test
-    )
     # Requires the real (multi-GB) Parakeet-TDT weights, which aren't
     # downloaded as part of a normal checkout/CI build; the test itself
     # detects this and exits with kExitSkip (125) rather than failing.
-    set_tests_properties(parakeet_golden_transcription_test PROPERTIES
-        SKIP_RETURN_CODE 125
-        TIMEOUT 120
-    )
 
-    add_engine_unittest(parakeet_streaming_transcription_test tests/parakeet_tdt/test_streaming_transcription.cpp)
-    target_compile_definitions(parakeet_streaming_transcription_test PRIVATE
-        ENGINE_REPO_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
-    )
 
-    add_test(
-        NAME parakeet_streaming_transcription_test
-        COMMAND parakeet_streaming_transcription_test
-    )
-    set_tests_properties(parakeet_streaming_transcription_test PROPERTIES
-        SKIP_RETURN_CODE 125
-        TIMEOUT 180
-    )
 
     # Numerical parity dump tool (not registered as an add_test — it's a
     # manual/pre-release check, not a CI gate). Run it against a NeMo
     # reference dump via compare_parity.py; see tests/parakeet_tdt/parity/README.md.
-    add_executable(parakeet_parity_dump
-        tests/parakeet_tdt/parity/dump_cpp_reference.cpp
-    )
-    target_include_directories(parakeet_parity_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/parakeet_tdt/parity)
-    target_link_libraries(parakeet_parity_dump PRIVATE engine_runtime ggml)
     if (ENGINE_ENABLE_OPENMP)
-        target_link_libraries(parakeet_parity_dump PRIVATE OpenMP::OpenMP_CXX)
     endif()
-
-    add_executable(server_model_installer_test
-        tests/unittests/test_server_model_installer.cpp
-        )
-    target_include_directories(server_model_installer_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/app/server)
-    target_link_libraries(server_model_installer_test PRIVATE Threads::Threads)
-
-    add_test(
-        NAME server_model_installer_test
-        COMMAND server_model_installer_test
-    )
 endif()
 
 if (ENGINE_BUILD_EXAMPLES)
