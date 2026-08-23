@@ -11,14 +11,9 @@ param(
     [int]$CudaKeepaliveWorkMs = 20,
     [string]$LogFile = "",
     [switch]$DisableGgmlCudaGraphCapture,
-    [string[]]$WarmVoices = @(
-        "demo_2_man",
-        "demo_3_woman",
-        "demo_4_woman",
-        # Keep the first quick-start voice's CUDA graph active when startup
-        # finishes; the WebUI prewarms other voices when they are selected.
-        "demo_1_man"
-    ),
+    # Demo-voice warms are opt-in now: with a single voice-prompt cache slot,
+    # warming demos would evict the character the pipeline actually speaks.
+    [string[]]$WarmVoices = @(),
     [switch]$SkipWarmup,
     # The llama.cpp chat sidecar. The speech server owns the process and can
     # switch between the registered models from Settings; -LlmModelPath
@@ -347,7 +342,9 @@ if ($voiceAvailable) {
         path = ($asrModelPath -replace "\\", "/")
         task = "asr"
         mode = "offline"
-        lazy = $true
+        # Eager: the ~2.6 GB loads at boot so the first spoken turn never
+        # pays a ten-second model load.
+        lazy = $false
     }
 }
 if ($llmAvailable) {
@@ -549,46 +546,55 @@ if ($llmAvailable) {
 }
 
 $warmupResults = @()
-if (-not $SkipWarmup -and $WarmVoices.Count -gt 0) {
-    Add-Type -AssemblyName System.Net.Http
-    $client = [System.Net.Http.HttpClient]::new()
-    $client.Timeout = [TimeSpan]::FromSeconds(90)
-    try {
-        foreach ($voice in $WarmVoices) {
-            Write-Host "Warming voice $voice..."
-            $warmupResults += Invoke-StreamingWarmup `
-                -Client $client `
-                -Endpoint "$baseUrl/v1/audio/speech" `
-                -Voice $voice
+if (-not $SkipWarmup) {
+    if ($WarmVoices.Count -gt 0) {
+        Add-Type -AssemblyName System.Net.Http
+        $client = [System.Net.Http.HttpClient]::new()
+        $client.Timeout = [TimeSpan]::FromSeconds(90)
+        try {
+            foreach ($voice in $WarmVoices) {
+                Write-Host "Warming voice $voice..."
+                $warmupResults += Invoke-StreamingWarmup `
+                    -Client $client `
+                    -Endpoint "$baseUrl/v1/audio/speech" `
+                    -Voice $voice
+            }
+        } finally {
+            $client.Dispose()
         }
-    } finally {
-        $client.Dispose()
+        $warmupResults | Format-Table -AutoSize
     }
-    $warmupResults | Format-Table -AutoSize
 
-    # The active character's voice is the one chat and MCP actually use; a
-    # request that names no voice resolves to it. Warm it last so its CUDA
-    # graphs and voice prompt stay the freshest entries in the caches.
-    Write-Host "Warming the active character voice..."
-    try {
-        $characterWarm = [ordered]@{
-            model = "qwen3-tts"
-            input = "The system is warmed and ready for immediate natural speech."
-            response_format = "pcm"
-            stream_format = "audio"
-            stream = $true
-            chunk_frames = 1
-            decoder_context_frames = 25
-            stream_accumulate = $false
-            max_tokens = 128
-            seed = 1234
+    # Warm the ACTIVE CHARACTER across the sentence-length buckets chat
+    # actually produces: each length captures its ~470 MB prefill graph at
+    # boot, so no conversation ever pays a capture spike, and the single
+    # voice-prompt slot ends up holding the character.
+    $characterWarmSentences = @(
+        "Okay, sounds good.",
+        "That sounds like a really lovely way to spend the evening.",
+        "Honestly, I think we should try the new place first and then decide if we still want dessert afterwards.",
+        "Mm, let me think about it for a moment, because there are a few different ways we could plan this and I want to pick the one that feels the most fun for both of us tonight."
+    )
+    foreach ($sentence in $characterWarmSentences) {
+        try {
+            $characterWarm = [ordered]@{
+                model = "qwen3-tts"
+                input = $sentence
+                response_format = "pcm"
+                stream_format = "audio"
+                stream = $true
+                chunk_frames = 1
+                decoder_context_frames = 25
+                stream_accumulate = $false
+                seed = 777
+            }
+            $characterResponse = Invoke-WebRequest -Uri "$baseUrl/v1/audio/speech" -Method Post `
+                -ContentType "application/json" -Body ($characterWarm | ConvertTo-Json -Compress) `
+                -TimeoutSec 180 -UseBasicParsing
+            Write-Host ("Character warm ({0} chars -> {1} bytes)." -f $sentence.Length, $characterResponse.RawContentLength)
+        } catch {
+            Write-Warning "Character warmup failed: $($_.Exception.Message)"
         }
-        $characterResponse = Invoke-WebRequest -Uri "$baseUrl/v1/audio/speech" -Method Post `
-            -ContentType "application/json" -Body ($characterWarm | ConvertTo-Json -Compress) `
-            -TimeoutSec 120 -UseBasicParsing
-        Write-Host ("Character voice warmed ({0} bytes of PCM)." -f $characterResponse.RawContentLength)
-    } catch {
-        Write-Warning "Character voice warmup failed: $($_.Exception.Message)"
     }
 }
 
