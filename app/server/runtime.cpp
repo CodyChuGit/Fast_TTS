@@ -1023,6 +1023,9 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
     else if (request.method == "POST" && request.path == "/v1/chat/speak") {
         response = handle_chat_speak(request.body);
     }
+    else if (request.method == "POST" && request.path == "/v1/llm/chat") {
+        response = handle_llm_chat(request.body);
+    }
     else if (request.method == "GET" && request.path == "/v1/llm-settings") {
         response = handle_llm_settings_get();
     }
@@ -2497,6 +2500,145 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     return sse_response([this, model_ptr, llama_body, warm_prefix, tts_seed,
                          speculation](HttpStreamWriter & writer) {
         chat_orchestrate(*model_ptr, llama_body, warm_prefix, tts_seed, writer, speculation);
+    });
+}
+
+HttpResponse ServerState::handle_llm_chat(const std::string & body_text) {
+    if (config_.llm_port <= 0) {
+        return error_response(
+            503,
+            "no LLM sidecar is configured; start the server with --llm-port",
+            "llm_unavailable");
+    }
+    const auto body = engine::io::json::parse(body_text);
+    const auto * messages = body.find("messages");
+    if (messages == nullptr || !messages->is_array() || messages->as_array().empty()) {
+        return error_response(400, "chat requires a non-empty 'messages' array", "invalid_request_error");
+    }
+    const auto & list = messages->as_array();
+    size_t total_content = 0;
+    for (const auto & message : list) {
+        const auto * role = message.find("role");
+        const auto * content = message.find("content");
+        if (role == nullptr || !role->is_string() || content == nullptr || !content->is_string()) {
+            return error_response(400, "each message needs string 'role' and 'content'", "invalid_request_error");
+        }
+        const auto & role_name = role->as_string();
+        if (role_name != "system" && role_name != "user" && role_name != "assistant") {
+            return error_response(400, "message roles must be system, user, or assistant", "invalid_request_error");
+        }
+        total_content += content->as_string().size();
+    }
+    if (total_content > 24000) {
+        return error_response(
+            400,
+            "chat history is too large (" + std::to_string(total_content) +
+                " characters; the limit is 24000) -- trim older messages",
+            "invalid_request_error");
+    }
+
+    CharacterConfig character;
+    LlmSettings settings;
+    {
+        std::lock_guard<std::mutex> lock(character_mutex_);
+        character = character_;
+        settings = llm_settings_;
+    }
+    const double temperature = engine::io::json::optional_f32(
+        body, "temperature", static_cast<float>(settings.temperature));
+    const double top_p = engine::io::json::optional_f32(
+        body, "top_p", static_cast<float>(settings.top_p));
+    const double repeat_penalty = engine::io::json::optional_f32(
+        body, "repeat_penalty", static_cast<float>(settings.repeat_penalty));
+    // No length ramp here: that machinery exists to keep first AUDIO snappy.
+    // Pure text gets the configured ceiling unless the request says otherwise.
+    const int64_t max_tokens = engine::io::json::optional_i64(
+        body, "max_tokens", std::max<int64_t>(settings.max_tokens, 256));
+    const int64_t llm_seed = engine::io::json::optional_i64(body, "seed", -1);
+    // cache_prompt defaults ON (the pipeline's real configuration). Sending
+    // false forces a full re-prefill -- the honest way to measure raw
+    // prompt-processing speed instead of the cached-prefix fast path.
+    const bool cache_prompt = bool_field(body, "cache_prompt", true);
+
+    // The same brain the character runs -- master prompt, persona, samplers,
+    // stop strings -- minus everything that exists only to serve the TTS
+    // (steering notes, length ramp, sentence segmentation, scrubbing).
+    std::string llama_body = std::string("{\"stream\":true,\"cache_prompt\":") +
+        (cache_prompt ? "true" : "false");
+    llama_body += ",\"stop\":[\"<|im_end|>\",\"<|im_start|>\",\"\\n\\n\"]";
+    llama_body += ",\"dry_multiplier\":0.8,\"dry_base\":1.75"
+                  ",\"dry_allowed_length\":4,\"dry_penalty_last_n\":4096";
+    llama_body += ",\"temperature\":" + std::to_string(temperature);
+    llama_body += ",\"top_p\":" + std::to_string(top_p);
+    llama_body += ",\"repeat_penalty\":" + std::to_string(repeat_penalty);
+    llama_body += ",\"max_tokens\":" + std::to_string(max_tokens);
+    if (llm_seed >= 0) {
+        llama_body += ",\"seed\":" + std::to_string(llm_seed);
+    }
+    llama_body += ",\"messages\":[";
+    bool first_message = true;
+    if (list[0].find("role")->as_string() != "system") {
+        const std::string system_prompt =
+            render_master_prompt(settings, character.name, character.persona);
+        llama_body += "{\"role\":\"system\",\"content\":" + json_quote(system_prompt) + "}";
+        first_message = false;
+    }
+    for (const auto & message : list) {
+        llama_body += (first_message ? "" : ",");
+        llama_body += "{\"role\":" + json_quote(message.find("role")->as_string()) +
+            ",\"content\":" + json_quote(message.find("content")->as_string()) + "}";
+        first_message = false;
+    }
+    llama_body += "]}";
+
+    return sse_response([this, llama_body](HttpStreamWriter & writer) {
+        const auto started = Clock::now();
+        double first_token_ms = -1.0;
+        bool client_gone = false;
+        begin_llm_generation();
+        llm::ChatResult result;
+        try {
+            write_sse(writer, "{\"type\":\"start\"}");
+            result = llm::stream_chat(
+                config_.llm_host, config_.llm_port, llama_body,
+                [&](const std::string & delta) {
+                    if (first_token_ms < 0) {
+                        first_token_ms = elapsed_ms(started);
+                    }
+                    try {
+                        write_sse(writer, "{\"type\":\"token\",\"text\":" + json_quote(delta) + "}");
+                    } catch (const std::exception &) {
+                        client_gone = true;
+                        return false;
+                    }
+                    return true;
+                });
+        } catch (const std::exception &) {
+            client_gone = true;
+        }
+        end_llm_generation();
+        if (client_gone) {
+            return;
+        }
+        try {
+            if (!result.ok && !result.error.empty()) {
+                write_sse(writer, "{\"type\":\"error\",\"message\":" + json_quote(result.error) + "}");
+            }
+            std::ostringstream done;
+            done << "{\"type\":\"done\",\"stats\":{"
+                 << "\"first_token_ms\":" << first_token_ms
+                 << ",\"wall_ms\":" << elapsed_ms(started)
+                 << ",\"prompt_n\":" << result.prompt_n
+                 << ",\"prompt_ms\":" << result.prompt_ms
+                 << ",\"predicted_n\":" << result.predicted_n
+                 << ",\"predicted_ms\":" << result.predicted_ms
+                 << ",\"finish_reason\":" << json_quote(result.finish_reason)
+                 << "}}";
+            write_sse(writer, done.str());
+            write_sse_done(writer);
+        } catch (const std::exception &) {
+            // The client left between the last token and the summary.
+        }
     });
 }
 

@@ -82,7 +82,7 @@ character keeps its voice and can be re-activated in one click.
 
 ```powershell
 scripts/start.ps1        # builds nothing; launches TTS server + llama sidecar
-# UI at http://127.0.0.1:8080  — Speak · Live · Voice · Chat · Settings
+# UI at http://127.0.0.1:8080  — Speak · Live · Voice · Chat · LLM · Settings
 ```
 
 Building from source (CUDA):
@@ -101,6 +101,7 @@ cd webui/native && npm install && npm run build   # embedded on next build
 | `POST /v1/voice/live` | chunked 16 kHz PCM in → SSE transcript events out, one connection |
 | `POST /v1/voice/sessions` (+`/audio`, `/events`, `/stop`) | the same events for browsers |
 | `POST /v1/audio/speech` | plain TTS in the character voice |
+| `POST /v1/llm/chat` | text-only chat straight through the LLM sidecar, with per-turn prefill/decode telemetry (the benchmark surface) |
 | `/mcp` | MCP (streamable HTTP): agents call `speak` and get WAV back |
 | `/v1/character`, `/v1/characters` | the character library |
 | `/v1/llm-settings` | master prompt + sampling, persisted |

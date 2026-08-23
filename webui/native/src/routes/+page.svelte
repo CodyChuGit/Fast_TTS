@@ -16,6 +16,8 @@
     type LlmSettings,
     character as fetchCharacter,
     chatSpeak,
+    llmChat,
+    type LlmBenchStats,
     prewarmChat,
     speculateChat,
     deleteCharacter,
@@ -41,7 +43,7 @@
   } from '$lib/karaoke';
   import '../app.css';
 
-  let view: 'speak' | 'chat' | 'settings' | 'live' | 'voice' = 'speak';
+  let view: 'speak' | 'chat' | 'llm' | 'settings' | 'live' | 'voice' = 'speak';
   let server: ServerHealth | null = null;
   let active: Character | null = null;
 
@@ -1018,6 +1020,91 @@
     chatError = '';
   }
 
+  // LLM bench view: text-only chat straight through the sidecar. No TTS in
+  // the request path, so the numbers are the LLM leg by itself.
+  interface LlmBenchMessage {
+    role: 'user' | 'assistant';
+    content: string;
+    writing?: boolean;
+    stats?: LlmBenchStats;
+  }
+  let benchMessages: LlmBenchMessage[] = [];
+  let benchInput = '';
+  let benchBusy = false;
+  let benchError = '';
+  let benchAborter: AbortController | null = null;
+  // Off = force a full re-prefill every turn: the honest measure of raw
+  // prompt-processing speed instead of the cached-prefix fast path.
+  let benchCachePrompt = true;
+  let benchLog: HTMLDivElement | null = null;
+  let benchScrollQueued = false;
+
+  function benchRate(tokens: number, ms: number): string {
+    if (tokens <= 0 || ms <= 0) return '—';
+    return `${((tokens / ms) * 1000).toFixed(1)} t/s`;
+  }
+
+  async function sendBench() {
+    const content = benchInput.trim();
+    if (!content || benchBusy) return;
+    benchBusy = true;
+    benchError = '';
+    benchInput = '';
+    benchMessages = [...benchMessages, { role: 'user', content }, { role: 'assistant', content: '', writing: true }];
+    benchAborter = new AbortController();
+    try {
+      const history = benchMessages
+        .slice(0, -1)
+        .slice(-24)
+        .map(({ role, content: text }) => ({ role, content: text }));
+      await llmChat(history, { cachePrompt: benchCachePrompt }, (event) => {
+        const last = benchMessages[benchMessages.length - 1];
+        if (event.type === 'token') {
+          last.content += event.text;
+          benchMessages = benchMessages;
+          if (!benchScrollQueued) {
+            benchScrollQueued = true;
+            requestAnimationFrame(() => {
+              benchScrollQueued = false;
+              benchLog?.scrollTo({ top: benchLog.scrollHeight });
+            });
+          }
+        } else if (event.type === 'error') {
+          benchError = event.message;
+        } else if (event.type === 'done') {
+          last.stats = event.stats;
+          benchMessages = benchMessages;
+        }
+      }, benchAborter.signal);
+    } catch (error) {
+      if ((error as Error)?.name !== 'AbortError') {
+        benchError = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      const last = benchMessages[benchMessages.length - 1];
+      if (last) {
+        last.writing = false;
+        if (!last.content) {
+          benchMessages = benchMessages.slice(0, -1);
+        } else {
+          benchMessages = benchMessages;
+        }
+      }
+      benchBusy = false;
+      benchAborter = null;
+    }
+  }
+
+  function stopBench() {
+    benchAborter?.abort();
+  }
+
+  function clearBench() {
+    if (benchBusy) return;
+    benchMessages = [];
+    benchError = '';
+  }
+
   onMount(() => {
     endpoint = mcpEndpoint(window.location.origin);
     void refresh();
@@ -1028,6 +1115,7 @@
   onDestroy(() => {
     aborter?.abort();
     liveAborter?.abort();
+    benchAborter?.abort();
     void stopVoice();
     stopLiveLoop();
     stopChatCaptionLoop();
@@ -1057,6 +1145,7 @@
     <button class:active={view === 'voice'} on:click={() => (view = 'voice')}>Voice</button>
     {#if server?.llm}
       <button class:active={view === 'chat'} on:click={() => (view = 'chat')}>Chat</button>
+      <button class:active={view === 'llm'} on:click={() => (view = 'llm')}>LLM</button>
     {/if}
     <button class:active={view === 'settings'} on:click={() => (view = 'settings')}>Settings</button>
   </nav>
@@ -1293,6 +1382,59 @@
           · first audio {chatStats.first_audio_ms < 0 ? '—' : `${chatStats.first_audio_ms.toFixed(0)} ms`}
           · {chatStats.audio_seconds.toFixed(1)} s spoken in {(chatStats.wall_ms / 1000).toFixed(1)} s
         </p>
+      {/if}
+    </section>
+  {:else if view === 'llm'}
+    <section class="hero">
+      <p class="eyebrow">PURE MODEL SPEED</p>
+      <h1>LLM</h1>
+      <p>
+        Text only, no synthesis in the request path — every reply prints llama's own numbers, so
+        this is the benchmark surface for the model by itself.
+      </p>
+    </section>
+
+    <section class="panel chat-panel">
+      <div class="chat-log" bind:this={benchLog}>
+        {#if !benchMessages.length}
+          <p class="status">Send a message. The reply streams as text with per-turn timings.</p>
+        {/if}
+        {#each benchMessages as message, index (index)}
+          <div class="chat-message {message.role}">
+            <div class="bubble">
+              {message.content}{#if message.writing}<span class="caret"></span>{/if}
+              {#if message.stats}
+                <div class="bench-stats">
+                  first token {message.stats.first_token_ms < 0 ? '—' : `${message.stats.first_token_ms.toFixed(0)} ms`}
+                  · prefill {message.stats.prompt_n < 0 ? '—' : `${message.stats.prompt_n.toFixed(0)} tok`}
+                  @ {benchRate(message.stats.prompt_n, message.stats.prompt_ms)}
+                  · decode {message.stats.predicted_n < 0 ? '—' : `${message.stats.predicted_n.toFixed(0)} tok`}
+                  @ {benchRate(message.stats.predicted_n, message.stats.predicted_ms)}
+                  · {(message.stats.wall_ms / 1000).toFixed(1)} s total
+                </div>
+              {/if}
+            </div>
+          </div>
+        {/each}
+      </div>
+      <form class="chat-input" on:submit|preventDefault={sendBench}>
+        <input
+          bind:value={benchInput}
+          placeholder={benchBusy ? 'Streaming…' : 'Say something…'}
+        />
+        {#if benchBusy}
+          <button class="danger" type="button" on:click={stopBench}>Stop</button>
+        {:else}
+          <button class="primary" type="submit" disabled={!benchInput.trim()}>Send</button>
+        {/if}
+        <button class="ghost" type="button" on:click={clearBench} disabled={benchBusy}>Clear</button>
+      </form>
+      <label class="bench-toggle">
+        <input type="checkbox" bind:checked={benchCachePrompt} disabled={benchBusy} />
+        Use prompt cache (uncheck to force a full re-prefill each turn — raw prefill speed)
+      </label>
+      {#if benchError}
+        <p class="status bad">{benchError}</p>
       {/if}
     </section>
   {:else}

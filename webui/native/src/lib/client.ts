@@ -235,8 +235,14 @@ export async function chatSpeak(
     signal
   });
   if (!response.ok) throw await errorFrom(response);
-  if (!response.body) throw new Error('The chat response has no readable body.');
+  await readSseEvents(response, (payload) => onEvent(payload as ChatEvent));
+}
 
+async function readSseEvents(
+  response: Response,
+  onPayload: (payload: unknown) => void
+): Promise<void> {
+  if (!response.body) throw new Error('The chat response has no readable body.');
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -254,7 +260,7 @@ export async function chatSpeak(
           const payload = line.slice(5).trim();
           if (!payload || payload === '[DONE]') continue;
           try {
-            onEvent(JSON.parse(payload) as ChatEvent);
+            onPayload(JSON.parse(payload));
           } catch {
             // A malformed frame is dropped; the stream continues.
           }
@@ -264,6 +270,46 @@ export async function chatSpeak(
   } finally {
     reader.releaseLock();
   }
+}
+
+// llama's own per-request telemetry, straight from the sidecar's final chunk.
+// prompt_n is how many prompt tokens were actually (re)processed this turn --
+// near zero when the prompt cache held, the full history when it did not.
+export interface LlmBenchStats {
+  first_token_ms: number;
+  wall_ms: number;
+  prompt_n: number;
+  prompt_ms: number;
+  predicted_n: number;
+  predicted_ms: number;
+  finish_reason: string;
+}
+
+export type LlmBenchEvent =
+  | { type: 'token'; text: string }
+  | { type: 'error'; message: string }
+  | { type: 'done'; stats: LlmBenchStats }
+  | { type: 'start' };
+
+// Text-only chat straight through the LLM sidecar: no TTS, no speculation,
+// no prewarming. The benchmark surface for the LLM leg by itself.
+export async function llmChat(
+  messages: ChatMessage[],
+  options: { cachePrompt?: boolean; maxTokens?: number },
+  onEvent: (event: LlmBenchEvent) => void,
+  signal?: AbortSignal
+): Promise<void> {
+  const body: Record<string, unknown> = { messages };
+  if (options.cachePrompt === false) body.cache_prompt = false;
+  if (options.maxTokens !== undefined) body.max_tokens = options.maxTokens;
+  const response = await fetch('/v1/llm/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal
+  });
+  if (!response.ok) throw await errorFrom(response);
+  await readSseEvents(response, (payload) => onEvent(payload as LlmBenchEvent));
 }
 // The roleplay engine: the master prompt every character plays through, and
 // the sampling that shapes delivery. {name} and {persona} in the master prompt

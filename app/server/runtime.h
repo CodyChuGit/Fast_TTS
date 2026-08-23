@@ -199,6 +199,10 @@ private:
     // audio events on the same SSE stream. The LLM keeps generating while the
     // TTS model speaks, so text runs ahead and audio catches up.
     HttpResponse handle_chat_speak(const std::string & body_text);
+    // Text-only chat straight through the sidecar: no TTS, no speculation, no
+    // prewarming -- the benchmark surface for the LLM leg by itself. The done
+    // event carries llama's own prefill/decode telemetry.
+    HttpResponse handle_llm_chat(const std::string & body_text);
     // `warm_body_prefix`, when non-empty, is the canonical next-turn request
     // up to (not including) the reply message: once the reply is complete it
     // is appended and the whole thing sent to the sidecar as a one-token
