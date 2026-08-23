@@ -39,6 +39,12 @@ struct LlmModelSpec {
     std::string name;
     std::filesystem::path path;
     std::vector<std::string> extra_args;
+    // False for hybrid-attention models whose KV cache cannot roll back to a
+    // divergence point (only exact prefix extensions reuse). For these, every
+    // speculative prefill on an evolving draft costs a full prompt pass, so
+    // the predictive-fill triggers are skipped and turns rely on the post-turn
+    // canonical warm plus cheap extensions.
+    bool cache_rollback = true;
 };
 
 struct ServerModelConfig {

@@ -2085,6 +2085,16 @@ void ServerState::end_llm_generation() {
     llm_warm_cv_.notify_all();
 }
 
+void ServerState::note_llm_decode_rate(double predicted_n, double predicted_ms) {
+    // Tiny generations measure mostly overhead; skip them.
+    if (predicted_n < 8.0 || predicted_ms <= 0.0) {
+        return;
+    }
+    const double rate = 1000.0 * predicted_n / predicted_ms;
+    const double previous = llm_decode_tps_ema_.load();
+    llm_decode_tps_ema_.store(previous <= 0.0 ? rate : 0.7 * previous + 0.3 * rate);
+}
+
 std::string ServerState::llm_settings_json() const {
     LlmSettings settings;
     {
@@ -2118,6 +2128,14 @@ std::string ServerState::llm_settings_json() const {
     return out.str();
 }
 
+bool ServerState::active_llm_cache_rollback() const {
+    if (llm_manager_ == nullptr) {
+        return true;
+    }
+    const auto * spec = find_llm_spec(llm_manager_->current_model_id());
+    return spec == nullptr || spec->cache_rollback;
+}
+
 const LlmModelSpec * ServerState::find_llm_spec(const std::string & id) const {
     if (id.empty()) {
         return nullptr;
@@ -2140,6 +2158,9 @@ void ServerState::switch_llm_model(const LlmModelSpec & spec) {
         return;
     }
     llm_manager_->stop();
+    // A different model writes at a different speed; let the opener sizing
+    // re-learn instead of inheriting the previous model's rate.
+    llm_decode_tps_ema_.store(0.0);
     std::string error;
     if (llm_manager_->start(spec, error) && llm_manager_->wait_ready(300, error)) {
         return;
@@ -2460,6 +2481,16 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     llama_body += "]}";
     const std::string spec_key = speculation_key(list, last_user_index);
 
+    // A model whose cache cannot roll back pays a FULL prompt pass for every
+    // draft revision: successive prewarms and speculations each diverge from
+    // the last one's cache and jam the single llama slot for seconds
+    // (measured: a mid-conversation turn behind that queue took 4.9 s to
+    // first token). Plain sends extend the post-turn canonical warm for a
+    // few dozen tokens, so skipping the predictive triggers keeps such
+    // models consistently fast instead of intermittently wedged.
+    if ((speculate || prewarm) && !active_llm_cache_rollback()) {
+        return json_response("{\"status\":\"skipped\"}");
+    }
     if (speculate) {
         // A draft ending like a sentence is the client's highest-confidence
         // tier -- the send is imminent, so the first sentence's audio is
@@ -2617,6 +2648,7 @@ HttpResponse ServerState::handle_llm_chat(const std::string & body_text) {
             client_gone = true;
         }
         end_llm_generation();
+        note_llm_decode_rate(result.predicted_n, result.predicted_ms);
         if (client_gone) {
             return;
         }
@@ -2959,9 +2991,17 @@ void ServerState::chat_orchestrate(
         // the client renders, the sentences the TTS speaks, and (next turn)
         // the history the model re-reads all stay free of roleplay markup.
         // The opening clause is cut early: every buffered character is
-        // ~2.5 ms of audible silence at decode speed, and only the first
-        // segment is compromised -- every later one is a whole sentence.
-        SentenceSegmenter segmenter(SentenceSegmenter::Options{16, 28, 300});
+        // audible silence at decode speed, and only the first segment is
+        // compromised -- every later one is a whole sentence. How early
+        // depends on how fast the active model writes: at 50 t/s a 16-char
+        // clause exists in ~110 ms, but a dense 27B at 17 t/s needs ~300 ms
+        // for the same clause, so slow decoders get an 8-char cut to keep
+        // opener generation near a constant ~150 ms.
+        const double decode_tps = llm_decode_tps_ema_.load();
+        const bool slow_decoder = decode_tps > 0.0 && decode_tps < 30.0;
+        SentenceSegmenter segmenter(slow_decoder
+            ? SentenceSegmenter::Options{8, 14, 300}
+            : SentenceSegmenter::Options{16, 28, 300});
         hygiene::StreamScrubber scrubber;
         auto emit = [&](const std::string & clean) {
             if (clean.empty()) {
@@ -2987,6 +3027,7 @@ void ServerState::chat_orchestrate(
         llm_prompt_ms = result.prompt_ms;
         llm_predicted_n = result.predicted_n;
         llm_predicted_ms = result.predicted_ms;
+        note_llm_decode_rate(result.predicted_n, result.predicted_ms);
         auto rest = segmenter.flush();
         // A reply cut off by the token ceiling ends mid-thought. The dangling
         // fragment still displays as text, but speaking it would stop the

@@ -186,6 +186,8 @@ private:
     // The registered chat model matching `id`, or null. Registry is immutable
     // after construction, so no lock is needed.
     const LlmModelSpec * find_llm_spec(const std::string & id) const;
+    // True unless the ACTIVE sidecar model is flagged cache_rollback=false.
+    bool active_llm_cache_rollback() const;
     // Stops the running sidecar, starts `spec`, and blocks until its /health
     // reports the model loaded. On failure the previous model is restarted.
     // Serialized by llm_switch_mutex_.
@@ -245,6 +247,8 @@ private:
     void queue_llm_warm(std::string body);
     void begin_llm_generation();
     void end_llm_generation();
+    // Feed one finished generation's telemetry into llm_decode_tps_ema_.
+    void note_llm_decode_rate(double predicted_n, double predicted_ms);
     std::string fresh_llm_warm_body() const;
     mcp::SpeakOutcome run_mcp_speak(const std::string & text, long long seed);
 
@@ -304,6 +308,11 @@ private:
     std::string llm_warm_pending_;
     bool llm_warm_worker_running_ = false;
     int llm_generations_active_ = 0;
+    // Rolling decode rate of the active sidecar model (tokens/sec), fed by
+    // every finished generation. The opener segmenter reads it: a slow
+    // decoder gets a shorter first cut so time-to-first-audio stays bounded
+    // instead of scaling with the model's writing speed. Zero = unmeasured.
+    std::atomic<double> llm_decode_tps_ema_{0.0};
     // One speculative stream at a time, newest wins. A superseded worker
     // that has not started streaming yet sees its abort flag while waiting
     // here and never reaches the sidecar; without this, a burst of

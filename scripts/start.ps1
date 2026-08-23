@@ -272,6 +272,7 @@ if (Test-Path -LiteralPath $orcaModelPath -PathType Leaf) {
             id = "orca-qwen"
             name = "Qwen3.8 27B OrcaRouter"
             path = ($orcaModelPath -replace "\\", "/")
+            cache_rollback = $false
             extra_args = $orcaCommon
         }
         $orcaMtpPath = Join-Path $repoRoot "models\Qwen3.8-27B-OrcaRouter-GGUF\Qwen3.8-27B-Uncensored-OrcaRouter-MTP-Q8_0.gguf"
@@ -280,6 +281,7 @@ if (Test-Path -LiteralPath $orcaModelPath -PathType Leaf) {
                 id = "orca-qwen-mtp"
                 name = "Qwen3.8 27B OrcaRouter (MTP)"
                 path = ($orcaModelPath -replace "\\", "/")
+            cache_rollback = $false
                 extra_args = $orcaCommon + @("--spec-type", "draft-mtp",
                     "-md", ($orcaMtpPath -replace "\\", "/"), "-ngld", "99",
                     "-ctkd", "q8_0", "-ctvd", "q8_0",
@@ -291,6 +293,7 @@ if (Test-Path -LiteralPath $orcaModelPath -PathType Leaf) {
             id = "orca-qwen-ngram"
             name = "Qwen3.8 27B OrcaRouter (ngram)"
             path = ($orcaModelPath -replace "\\", "/")
+            cache_rollback = $false
             extra_args = $orcaCommon + @("--spec-type", "ngram-mod")
         }
     } else {
@@ -298,6 +301,7 @@ if (Test-Path -LiteralPath $orcaModelPath -PathType Leaf) {
             id = "orca-qwen"
             name = "Qwen3.8 27B OrcaRouter (slow)"
             path = ($orcaModelPath -replace "\\", "/")
+            cache_rollback = $false
             extra_args = @("-ngl", "42", "-ub", "1024",
                 "--chat-template-kwargs", '{"enable_thinking":false}')
         }
@@ -313,6 +317,7 @@ if (Test-Path -LiteralPath $orcaIq3Path -PathType Leaf) {
         id = "orca-qwen-fast"
         name = "Qwen3.8 27B OrcaRouter (Q3, fast)"
         path = ($orcaIq3Path -replace "\\", "/")
+        cache_rollback = $false
         extra_args = @("-ngl", "99", "-ub", "2048",
             "--chat-template-kwargs", '{"enable_thinking":false}')
     }

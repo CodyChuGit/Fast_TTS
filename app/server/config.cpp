@@ -269,6 +269,10 @@ ServerConfig load_server_config(const std::filesystem::path & path) {
                     spec.extra_args.push_back(arg.as_string());
                 }
             }
+            if (const auto * rollback = entry.find("cache_rollback");
+                rollback != nullptr && rollback->is_bool()) {
+                spec.cache_rollback = rollback->as_bool();
+            }
             config.llm_models.push_back(std::move(spec));
         }
     }
