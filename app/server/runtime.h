@@ -59,21 +59,6 @@ struct ChatSpeculation {
     std::vector<std::vector<uint8_t>> first_audio_chunks;
 };
 
-// A hesitation clip chosen for one chat turn: the PCM to play, the text it
-// speaks (shown in the transcript and captions, since it is really said), and
-// what chat_orchestrate needs to chain a follow-up clip if the reply outlasts
-// this one (language, voice fingerprint, which library entry it was).
-struct ChatFiller {
-    std::shared_ptr<std::vector<uint8_t>> clip;
-    std::string text;
-    bool chinese = false;
-    uint64_t voice_fp = 0;
-    int index = -1;
-    // Which wait estimate this turn updates: 0 = fresh conversation,
-    // 1 = later turn. -1 skips the update (speculative attaches replay at
-    // memory speed and would drag the estimate down).
-    int wait_bucket = -1;
-};
 
 class ServerState final : public IHttpHandler {
 public:
@@ -226,13 +211,7 @@ private:
         const std::string & warm_body_prefix,
         long long tts_seed,
         HttpStreamWriter & writer,
-        std::shared_ptr<ChatSpeculation> speculation = nullptr,
-        std::optional<ChatFiller> filler = std::nullopt);
-    // Pre-synthesizes the filler library in the active character's voice on a
-    // background thread, disk-cached per (voice, text) so later boots just
-    // load. Restarted whenever the character voice changes.
-    void start_filler_build(LoadedModel & model);
-    std::shared_ptr<std::vector<uint8_t>> find_filler(uint64_t key) const;
+        std::shared_ptr<ChatSpeculation> speculation = nullptr);
     // Launches a detached worker generating the reply for `llama_body` into a
     // ChatSpeculation buffer, replacing (and aborting) any previous one. Once
     // the reply settles, the worker also synthesizes the first sentence's
@@ -315,18 +294,6 @@ private:
     // Guarded by chat_speculation_mutex_.
     std::string llm_last_send_key_;
     std::chrono::steady_clock::time_point llm_last_send_at_{};
-    // Hesitation audio spoken the instant a non-speculative send arrives,
-    // filling the air until the real first sentence lands.
-    std::unordered_map<uint64_t, std::shared_ptr<std::vector<uint8_t>>> filler_pcm_;
-    mutable std::mutex filler_mutex_;
-    uint64_t filler_voice_fp_ = 0;
-    std::atomic<bool> filler_build_running_{false};
-    // Running estimate of how long a non-speculative turn takes to reach its
-    // first real audio, by ChatFiller::wait_bucket. The pick targets a clip
-    // of roughly this length, so the hesitation ends about when the real
-    // voice arrives instead of at a random moment. Seeded from measured
-    // prewarmed-path times; guarded by filler_mutex_.
-    double filler_wait_ms_[2] = {1600.0, 1200.0};
     // Prewarm coalescing state; see queue_llm_warm.
     std::mutex llm_warm_mutex_;
     std::condition_variable llm_warm_cv_;

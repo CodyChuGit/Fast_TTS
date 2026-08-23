@@ -115,9 +115,6 @@ Voice tuning rides on the query string:
   the regression gate for anything touching the send path
 - `scripts/voice_probe.py` — streams a spoken utterance at real-time pace,
   prints the event timeline and stop→final latency
-- `scripts/latency_matrix.py` — A/B harness across the latency strategies
-- `scripts/filler_qa.py` — multi-seed synthesis lottery that curates any
-  pre-rendered clip library by waveform scoring
 
 ## Heritage
 

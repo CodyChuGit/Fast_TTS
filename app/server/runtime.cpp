@@ -5,7 +5,6 @@
 #include "segmenter.h"
 #include "multipart.h"
 #include "chat_hygiene.h"
-#include "filler.h"
 #include "ui_assets.h"
 
 #include "../cli/request.h"
@@ -338,78 +337,6 @@ std::vector<uint8_t> encode_pcm16_samples(const engine::runtime::AudioBuffer & a
         append_bytes(&pcm, sizeof(pcm));
     }
     return out;
-}
-
-// Trims the near-silence a synthesized clip starts and ends with: a
-// hesitation should make sound the moment it reaches the speaker and hand
-// off to the real reply without dead air. A short margin stays on both ends
-// so the onset and release do not click.
-void trim_edge_silence(std::vector<uint8_t> & pcm) {
-    constexpr int16_t kThreshold = 400;       // ~1% of full scale
-    constexpr size_t kAttackSamples = 720;    // 30 ms at 24 kHz
-    constexpr size_t kReleaseSamples = 2400;  // 100 ms
-    const auto * samples = reinterpret_cast<const int16_t *>(pcm.data());
-    const size_t count = pcm.size() / 2;
-    auto loud = [&](size_t i) { return samples[i] > kThreshold || samples[i] < -kThreshold; };
-    size_t first = 0;
-    while (first < count && !loud(first)) {
-        ++first;
-    }
-    if (first == count) {
-        return;  // all silence; the empty-clip guard reports it
-    }
-    size_t last = count;
-    while (last > first && !loud(last - 1)) {
-        --last;
-    }
-    const size_t begin = first > kAttackSamples ? first - kAttackSamples : 0;
-    const size_t end = std::min(count, last + kReleaseSamples);
-    if (begin == 0 && end == count) {
-        return;
-    }
-    std::vector<uint8_t> trimmed(pcm.begin() + begin * 2, pcm.begin() + end * 2);
-    pcm.swap(trimmed);
-}
-
-// Bounds a hesitation clip to its text. Tiny prompts make the TTS run past
-// EOS -- "Ooh." came back 2.7 s long -- and that tail is babble, not
-// silence, so trimming alone cannot catch it. A short clip is one vocal
-// gesture: cut at the first quarter-second of internal quiet. Every size
-// also gets a hard ceiling with a fade, so a runaway never reaches the ear
-// and never delays the real reply.
-void bound_filler_clip(filler::Size size, std::vector<uint8_t> & pcm) {
-    constexpr int16_t kThreshold = 400;
-    auto * samples = reinterpret_cast<int16_t *>(pcm.data());
-    size_t count = pcm.size() / 2;
-    auto loud = [&](size_t i) { return samples[i] > kThreshold || samples[i] < -kThreshold; };
-    size_t cut = count;
-    if (size == filler::Size::Short) {
-        constexpr size_t kGapSamples = 6000;  // 250 ms of quiet ends the gesture
-        size_t quiet_run = 0;
-        for (size_t i = 0; i < count; ++i) {
-            quiet_run = loud(i) ? 0 : quiet_run + 1;
-            if (quiet_run >= kGapSamples) {
-                cut = i + 1 - quiet_run + 2400;  // keep a 100 ms release
-                break;
-            }
-        }
-    }
-    // Safety ceilings only: scripts/filler_qa.py curates the clips well
-    // under these, so a cap firing means an uncurated synthesis slipped in.
-    const size_t cap = size == filler::Size::Short ? 38400       // 1.6 s
-        : size == filler::Size::Medium ? 67200                   // 2.8 s
-        : 115200;                                                // 4.8 s
-    cut = std::min(cut, cap);
-    if (cut >= count) {
-        return;
-    }
-    constexpr size_t kFade = 1920;  // 80 ms
-    const size_t fade_start = cut > kFade ? cut - kFade : 0;
-    for (size_t i = fade_start; i < cut; ++i) {
-        const double gain = static_cast<double>(cut - i) / static_cast<double>(cut - fade_start);
-        samples[i] = static_cast<int16_t>(samples[i] * gain);
-    }
-    pcm.resize(cut * 2);
 }
 
 void write_sse(HttpStreamWriter & writer, const std::string & json) {
@@ -1743,137 +1670,6 @@ void ServerState::apply_character(LoadedModel & model, const CharacterConfig & c
     }
     model.default_voice_preset = std::move(preset);
     metadata_lock.unlock();
-
-    // The character voice defines the filler audio; refingerprint and rebuild
-    // the hesitation library in the new voice.
-    uint64_t fp = 1469598103934665603ull;
-    {
-        std::shared_lock<std::shared_mutex> read_lock(model.metadata_mutex);
-        if (model.default_voice_preset.has_value() && model.default_voice_preset->audio.has_value()) {
-            for (const float sample : model.default_voice_preset->audio->samples) {
-                uint32_t bits;
-                std::memcpy(&bits, &sample, sizeof(bits));
-                fp ^= bits;
-                fp *= 1099511628211ull;
-            }
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(filler_mutex_);
-        if (filler_voice_fp_ == fp) {
-            return;
-        }
-        filler_voice_fp_ = fp;
-        filler_pcm_.clear();
-    }
-    start_filler_build(model);
-}
-
-void ServerState::start_filler_build(LoadedModel & model) {
-    bool expected = false;
-    if (!filler_build_running_.compare_exchange_strong(expected, true)) {
-        return;  // a build is already running; it re-checks the fp per clip
-    }
-    std::thread([this, &model] {
-        const auto dir = character_dir_ / "fillers";
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        // Two passes. Disk-cached clips load in milliseconds and use no
-        // model, so they go straight into RAM -- the first chat after boot
-        // already has its hesitations. Only actual synthesis waits out the
-        // startup warmups before competing for the model.
-        bool slept_for_model = false;
-        for (const bool synthesis_pass : {false, true}) {
-        for (size_t i = 0; i < filler::library().size(); ++i) {
-            uint64_t fp;
-            {
-                std::lock_guard<std::mutex> lock(filler_mutex_);
-                fp = filler_voice_fp_;
-            }
-            const auto & entry = filler::library()[i];
-            const uint64_t key = filler::clip_key(fp, entry.text);
-            {
-                std::lock_guard<std::mutex> lock(filler_mutex_);
-                if (filler_pcm_.count(key) != 0) {
-                    continue;
-                }
-            }
-            char name[32];
-            std::snprintf(name, sizeof(name), "%016llx.pcm",
-                          static_cast<unsigned long long>(key));
-            const auto path = dir / name;
-            auto clip = std::make_shared<std::vector<uint8_t>>();
-            bool synthesized = false;
-            std::ifstream in(path, std::ios::binary);
-            if (in) {
-                clip->assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-            } else {
-                if (!synthesis_pass) {
-                    continue;  // second pass synthesizes what disk lacked
-                }
-                synthesized = true;
-                if (!slept_for_model) {
-                    slept_for_model = true;
-                    std::this_thread::sleep_for(std::chrono::seconds(15));
-                }
-                try {
-                    Value::Object fields;
-                    fields.emplace("input", Value::make_string(entry.text));
-                    fields.emplace("seed", Value::make_number(777));
-                    const auto body = Value::make_object(std::move(fields));
-                    auto request = build_speech_request(model, body);
-                    request.options["stream_accumulate"] = "false";
-                    const int64_t cap = entry.size == filler::Size::Short ? 48
-                        : entry.size == filler::Size::Medium ? 96 : 160;
-                    request.options["max_tokens"] = std::to_string(cap);
-                    run_streaming_model(model, request, [&](const engine::runtime::StreamEvent & event) {
-                        if (event.audio_output.has_value()) {
-                            const auto pcm = encode_pcm16_samples(*event.audio_output);
-                            clip->insert(clip->end(), pcm.begin(), pcm.end());
-                        }
-                        for (const auto & named : event.named_audio_outputs) {
-                            const auto pcm = encode_pcm16_samples(named.audio);
-                            clip->insert(clip->end(), pcm.begin(), pcm.end());
-                        }
-                    });
-                } catch (const std::exception & ex) {
-                    std::cerr << "filler synthesis skipped (" << ex.what() << ")\n";
-                    std::this_thread::sleep_for(std::chrono::seconds(2));
-                    continue;
-                }
-            }
-            trim_edge_silence(*clip);
-            bound_filler_clip(entry.size, *clip);
-            if (synthesized && !clip->empty()) {
-                std::ofstream out(path, std::ios::binary | std::ios::trunc);
-                out.write(reinterpret_cast<const char *>(clip->data()),
-                          static_cast<std::streamsize>(clip->size()));
-            }
-            if (!clip->empty()) {
-                std::lock_guard<std::mutex> lock(filler_mutex_);
-                if (filler_voice_fp_ == fp) {
-                    filler_pcm_[key] = std::move(clip);
-                } else {
-                    std::cerr << "filler build: fp changed mid-build, clip dropped\n";
-                }
-            } else {
-                std::cerr << "filler build: empty clip for entry " << i << "\n";
-            }
-            if (synthesized) {
-                // Yield between syntheses so a live chat never queues behind
-                // more than one short clip.
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
-            }
-        }
-        }
-        filler_build_running_.store(false);
-    }).detach();
-}
-
-std::shared_ptr<std::vector<uint8_t>> ServerState::find_filler(uint64_t key) const {
-    std::lock_guard<std::mutex> lock(filler_mutex_);
-    const auto it = filler_pcm_.find(key);
-    return it == filler_pcm_.end() ? nullptr : it->second;
 }
 
 HttpResponse ServerState::handle_character_get() {
@@ -2592,11 +2388,8 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     for (size_t i = 0; i < list.size(); ++i) {
         const auto & role_name = list[i].find("role")->as_string();
         if (role_name == "assistant") {
-            // Spoken hesitations stay in the client's transcript but never
-            // reach the model: a history of "Hmm..." openers would teach it
-            // to write its own on top of the spoken ones.
             assistant_history.push_back(hygiene::sanitize_assistant_text(
-                filler::strip_leading(list[i].find("content")->as_string())));
+                list[i].find("content")->as_string()));
         } else if (role_name == "user") {
             last_user_index = i;
         }
@@ -2700,100 +2493,10 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     }
     auto speculation = take_matching_speculation(spec_key);
 
-    // Hesitation audio is OPT-IN ("filler": true): spoken umm/uhh openers
-    // read as obtuse in real listening, so the default strategy is
-    // predictive -- aggressive speculation with punctuation-tolerant
-    // attachment -- and an uncovered miss simply starts with the fast short
-    // first clause. The filler machinery stays for callers that want it.
-    const bool filler_wanted = [&] {
-        const auto * flag = body.find("filler");
-        return flag != nullptr && flag->is_bool() && flag->as_bool();
-    }();
-    std::optional<ChatFiller> filler;
-    bool spec_covered = false;
-    if (speculation != nullptr) {
-        std::lock_guard<std::mutex> lock(speculation->mutex);
-        spec_covered = speculation->llm_done ||
-            speculation->audio_state == ChatSpeculation::AudioState::Running ||
-            speculation->audio_state == ChatSpeculation::AudioState::Done;
-    }
-    if (filler_wanted && !spec_covered && last_user_index < list.size()) {
-        const auto & latest_user = list[last_user_index].find("content")->as_string();
-        const bool zh = hygiene::mostly_cjk(latest_user);
-        const int bucket = assistant_turns == 0 ? 0 : 1;
-        const auto size = speculation != nullptr || assistant_turns > 0
-            ? filler::Size::Short
-            : filler::Size::Medium;
-        const auto kind = filler::classify(latest_user);
-        uint64_t fp;
-        double target_ms;
-        {
-            std::lock_guard<std::mutex> lock(filler_mutex_);
-            fp = filler_voice_fp_;
-            target_ms = filler_wait_ms_[bucket];
-        }
-        // Among the kind-matched candidates, keep those whose length lands
-        // near the expected wait (a little over beats a little under -- the
-        // clip should not end noticeably before the real voice), then pad to
-        // at least two by nearest length so the same phrase never becomes
-        // the only choice; random among those.
-        struct Candidate {
-            double diff;
-            int index;
-            std::shared_ptr<std::vector<uint8_t>> clip;
-            bool in_band;
-        };
-        std::vector<Candidate> scored;
-        for (const int cand : filler::candidates(size, zh, kind, false)) {
-            const auto & text = filler::library()[static_cast<size_t>(cand)].text;
-            auto clip = find_filler(filler::clip_key(fp, text));
-            if (clip == nullptr || clip->empty()) {
-                continue;
-            }
-            const double clip_ms = static_cast<double>(clip->size()) / 48.0;
-            scored.push_back({std::abs(clip_ms - target_ms), cand, std::move(clip),
-                              clip_ms >= target_ms - 450.0 && clip_ms <= target_ms + 700.0});
-        }
-        std::sort(scored.begin(), scored.end(),
-                  [](const Candidate & a, const Candidate & b) { return a.diff < b.diff; });
-        std::vector<const Candidate *> viable;
-        for (const auto & cand : scored) {
-            if (cand.in_band) {
-                viable.push_back(&cand);
-            }
-        }
-        for (const auto & cand : scored) {
-            if (viable.size() >= 2) {
-                break;
-            }
-            if (!cand.in_band) {
-                viable.push_back(&cand);
-            }
-        }
-        const auto seed = filler::mix(static_cast<uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count()));
-        int index = -1;
-        std::shared_ptr<std::vector<uint8_t>> clip;
-        if (!viable.empty()) {
-            const auto & chosen = *viable[static_cast<size_t>(seed % viable.size())];
-            index = chosen.index;
-            clip = chosen.clip;
-        }
-        if (index >= 0 && clip != nullptr) {
-            const int spec_bucket = speculation != nullptr ? -1 : bucket;
-            filler = ChatFiller{std::move(clip),
-                                filler::library()[static_cast<size_t>(index)].text,
-                                zh, fp, index, spec_bucket};
-        } else {
-            std::cerr << "filler miss: no cached clip for size/lang bucket\n";
-        }
-    }
-
     LoadedModel * model_ptr = model;
     return sse_response([this, model_ptr, llama_body, warm_prefix, tts_seed,
-                         speculation, filler](HttpStreamWriter & writer) {
-        chat_orchestrate(*model_ptr, llama_body, warm_prefix, tts_seed, writer,
-                         speculation, filler);
+                         speculation](HttpStreamWriter & writer) {
+        chat_orchestrate(*model_ptr, llama_body, warm_prefix, tts_seed, writer, speculation);
     });
 }
 
@@ -2860,8 +2563,7 @@ void ServerState::start_chat_speculation(
                 // Never roll a random seed for the character's speech: short
                 // chat sentences are a per-seed quality lottery (muffle,
                 // noise, off-voice deliveries), and a different roll per
-                // sentence makes her timbre drift within one reply. 777 is
-                // the seed the filler QA library was curated with.
+                // sentence makes her timbre drift within one reply.
                 fields.emplace("seed", Value::make_number(
                     static_cast<double>(tts_seed >= 0 ? tts_seed : 777)));
                 const auto speech_body = Value::make_object(std::move(fields));
@@ -3016,8 +2718,7 @@ void ServerState::chat_orchestrate(
     const std::string & warm_body_prefix,
     long long tts_seed,
     HttpStreamWriter & writer,
-    std::shared_ptr<ChatSpeculation> speculation,
-    std::optional<ChatFiller> filler) {
+    std::shared_ptr<ChatSpeculation> speculation) {
     // Producer/consumer: the LLM reader thread turns the sidecar's SSE stream
     // into token and sentence events; this (writer) thread is the only one
     // touching the HTTP stream. Tokens flow out immediately; each completed
@@ -3112,18 +2813,13 @@ void ServerState::chat_orchestrate(
             speculation->abort.store(true);
             return;
         }
-        // With a hesitation clip covering the air, the opener no longer has
-        // to be scalped for latency: a whole first sentence (clause-cut only
-        // past 90 characters) speaks with real prosody, and the filler
-        // absorbs the extra wait. Only an uncovered turn still cuts the
-        // opening clause at 16 characters -- there, every buffered character
-        // is ~2.5 ms of audible silence at decode speed.
-        SentenceSegmenter segmenter(filler.has_value()
-            ? SentenceSegmenter::Options{90, 140, 300}
-            : SentenceSegmenter::Options{16, 28, 300});
         // The scrubber cleans the stream before ANYONE sees it: the transcript
         // the client renders, the sentences the TTS speaks, and (next turn)
         // the history the model re-reads all stay free of roleplay markup.
+        // The opening clause is cut early: every buffered character is
+        // ~2.5 ms of audible silence at decode speed, and only the first
+        // segment is compromised -- every later one is a whole sentence.
+        SentenceSegmenter segmenter(SentenceSegmenter::Options{16, 28, 300});
         hygiene::StreamScrubber scrubber;
         auto emit = [&](const std::string & clean) {
             if (clean.empty()) {
@@ -3197,108 +2893,18 @@ void ServerState::chat_orchestrate(
         }
     };
 
-    // Hesitation bookkeeping: how much filler audio went out (the client
-    // plays it before any real speech) and whether another clip may still
-    // chain on. The clip is really spoken, so it is really shown: the token
-    // event puts it in the transcript, the sentence event gives the caption
-    // track a line to bind the clip's seconds to. It stays out of reply_text
-    // -- history must not teach the model to write its own hesitations --
-    // and the request builder strips it from incoming assistant messages.
-    double filler_seconds = 0.0;
-    int filler_clips = 0;
-    int last_filler_index = -1;
-    bool filler_chain_open = filler.has_value();
-    auto emit_filler = [&](const ChatFiller & chosen) {
-        if (chosen.clip == nullptr || chosen.clip->empty()) {
-            return;
-        }
-        write_sse(writer, "{\"type\":\"token\",\"text\":" +
-            json_quote(chosen.chinese ? chosen.text : chosen.text + " ") + "}");
-        write_sse(writer, "{\"type\":\"sentence\",\"text\":" + json_quote(chosen.text) + "}");
-        audio_bytes += chosen.clip->size();
-        write_sse(writer, "{\"type\":\"audio\",\"audio\":" + json_quote(base64_encode(*chosen.clip)) + "}");
-        filler_seconds += static_cast<double>(chosen.clip->size()) / 48000.0;
-        ++filler_clips;
-        last_filler_index = chosen.index;
-    };
-    auto chain_filler = [&] {
-        // Mid-wait, thinking and quiet acknowledgment both read naturally;
-        // reactions do not. Drawing from both kinds keeps chains varied --
-        // Think alone has one short entry per language, and real-user runs
-        // chained the same "Uhh..." eleven times. Never the same clip twice
-        // in a row.
-        auto pool = filler::candidates(
-            filler::Size::Short, filler->chinese, filler::Kind::Think, true);
-        for (const int extra : filler::candidates(
-                 filler::Size::Short, filler->chinese, filler::Kind::Ack, true)) {
-            if (std::find(pool.begin(), pool.end(), extra) == pool.end()) {
-                pool.push_back(extra);
-            }
-        }
-        pool.erase(std::remove(pool.begin(), pool.end(), last_filler_index), pool.end());
-        if (pool.empty()) {
-            filler_chain_open = false;
-            return;
-        }
-        const auto seed = filler::mix(static_cast<uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count()));
-        const int index = pool[static_cast<size_t>(seed % pool.size())];
-        const auto & entry = filler::library()[static_cast<size_t>(index)];
-        auto clip = find_filler(filler::clip_key(filler->voice_fp, entry.text));
-        if (clip == nullptr || clip->empty()) {
-            filler_chain_open = false;
-            return;
-        }
-        emit_filler(ChatFiller{std::move(clip), entry.text, filler->chinese,
-                               filler->voice_fp, index});
-    };
-
     try {
         write_sse(writer, "{\"type\":\"start\"}");
-        if (filler.has_value()) {
-            // The hesitation goes out immediately: the character starts
-            // making sound while the reply is still being generated, and the
-            // real audio queues behind it seamlessly in the client player.
-            emit_filler(*filler);
-        }
         while (true) {
             ChatEvent event;
-            bool chain_now = false;
             {
                 std::unique_lock<std::mutex> lock(queue_mutex);
-                auto ready = [&] { return !queue.empty() || llm_finished; };
-                while (!ready()) {
-                    // While the hesitation covers the air and the LLM has not
-                    // produced a token, wake shortly before the clip runs dry
-                    // -- timing out there means the reply is outlasting the
-                    // filler and another short clip should chain on. Once
-                    // text exists the first sentence is close, and a fresh
-                    // "umm" would land in the middle of the transcript.
-                    const bool may_chain = filler_chain_open && first_token_ms < 0 &&
-                        filler_clips < 3 && filler_seconds < 4.0;
-                    if (!may_chain) {
-                        queue_cv.wait(lock, ready);
-                        break;
-                    }
-                    const auto dry = started + std::chrono::milliseconds(
-                        static_cast<long long>(filler_seconds * 1000.0) - 250);
-                    if (Clock::now() >= dry) {
-                        chain_now = true;
-                        break;
-                    }
-                    queue_cv.wait_until(lock, dry, ready);
+                queue_cv.wait(lock, [&] { return !queue.empty() || llm_finished; });
+                if (queue.empty()) {
+                    break;
                 }
-                if (!chain_now) {
-                    if (queue.empty()) {
-                        break;
-                    }
-                    event = std::move(queue.front());
-                    queue.pop_front();
-                }
-            }
-            if (chain_now) {
-                chain_filler();
-                continue;
+                event = std::move(queue.front());
+                queue.pop_front();
             }
             if (event.kind == ChatEvent::Kind::Token) {
                 write_token(event.text);
@@ -3446,15 +3052,6 @@ void ServerState::chat_orchestrate(
     }
     abort.store(true);
     llm_thread.join();
-
-    // Feed the measured wait back into the pick: the next turn's hesitation
-    // is chosen to last about this long. Only genuine cold paths count --
-    // speculative replays reach audio at memory speed.
-    if (filler.has_value() && filler->wait_bucket >= 0 && first_audio_ms > 0) {
-        std::lock_guard<std::mutex> lock(filler_mutex_);
-        auto & ema = filler_wait_ms_[filler->wait_bucket];
-        ema = 0.7 * ema + 0.3 * first_audio_ms;
-    }
 
     // The GPU is idle now while the user listens; spend that time re-priming
     // the sidecar's prompt cache with the canonical form of this turn (the

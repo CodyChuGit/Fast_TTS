@@ -693,7 +693,6 @@ add_executable(audiocpp_server
     app/server/character.cpp
     app/server/chat_hygiene.cpp
     app/server/config.cpp
-    app/server/filler.cpp
     app/server/voice.cpp
     app/server/voice_stability.cpp
     app/server/http.cpp
