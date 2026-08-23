@@ -225,10 +225,12 @@ if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
         path = ($gemmaModelPath -replace "\\", "/")
         # Deeper on the GPU when the small TTS model frees the VRAM; the
         # larger-TTS branch stays conservative (one layer from KV savings).
-        # When the streaming-STT model is registered, two expert layers go
-        # back to the CPU so its ~1.5 GB fits beside everything else.
+        # When the streaming-STT model is registered, THREE expert layers go
+        # back to the CPU: at two, total VRAM sat at 96% and a TTS prefill
+        # graph capture wedged the model mid-allocation. Headroom is a
+        # correctness requirement here, not a tuning preference.
         extra_args = @($(if ($ModelPath -match '0\.6b|q4_k-mix') {
-                @("--n-cpu-moe", $(if (Test-Path -LiteralPath (Join-Path $repoRoot "models\Qwen3-ASR-0.6B-GGUF\qwen3-asr-0.6b-q8_0.gguf") -PathType Leaf) { "5" } else { "3" }), "-ub", "2048")
+                @("--n-cpu-moe", $(if (Test-Path -LiteralPath (Join-Path $repoRoot "models\Qwen3-ASR-0.6B-GGUF\qwen3-asr-0.6b-q8_0.gguf") -PathType Leaf) { "6" } else { "3" }), "-ub", "2048")
             } else {
                 @("--n-cpu-moe", "6", "-ub", "1024")
             }) + @("--reasoning-budget", "0"))
