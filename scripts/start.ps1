@@ -230,7 +230,7 @@ if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
         # graph capture wedged the model mid-allocation. Headroom is a
         # correctness requirement here, not a tuning preference.
         extra_args = @($(if ($ModelPath -match '0\.6b|q4_k-mix') {
-                @("--n-cpu-moe", $(if (Test-Path -LiteralPath (Join-Path $repoRoot "models\Qwen3-ASR-0.6B-GGUF\qwen3-asr-0.6b-q8_0.gguf") -PathType Leaf) { "6" } else { "3" }), "-ub", "2048")
+                @("--n-cpu-moe", $(if (Test-Path -LiteralPath (Join-Path $repoRoot "models\Qwen3-ASR-0.6B-GGUF\qwen3-asr-0.6b-q4_k.gguf") -PathType Leaf) { "5" } else { "3" }), "-ub", "2048")
             } else {
                 @("--n-cpu-moe", "6", "-ub", "1024")
             }) + @("--reasoning-budget", "0"))
@@ -295,7 +295,7 @@ if (-not $SkipLlm) {
 # Streaming STT (the Voice tab): registered whenever the converted ASR
 # weights exist. Lazy, so boot stays fast and the ~1.5 GB VRAM is only spent
 # once voice is actually used; after the first use the model stays warm.
-$asrModelPath = Join-Path $repoRoot "models\Qwen3-ASR-0.6B-GGUF\qwen3-asr-0.6b-q8_0.gguf"
+$asrModelPath = Join-Path $repoRoot "models\Qwen3-ASR-0.6B-GGUF\qwen3-asr-0.6b-q4_k.gguf"
 $voiceAvailable = Test-Path -LiteralPath $asrModelPath -PathType Leaf
 
 $effectiveConfig = [ordered]@{
@@ -322,15 +322,15 @@ $effectiveConfig = [ordered]@{
                 # gave no warm speedup and nearly tripled the cost of a prefill
                 # graph capture, so the parity default is also the fast one.
                 "qwen3_tts.perf_mode" = "off"
-                # Chat speaks one sentence at a time, so text lengths vary far
-                # more than studio use did. Three voice slots cover the active
-                # character plus a couple of demo auditions -- chat only ever
-                # uses one voice, and the reclaimed VRAM buys two more Gemma
-                # expert layers on the GPU. Twelve prompt-shape graphs still
-                # stop a conversation paying capture spikes after its first
-                # exchanges.
-                "qwen3_tts.voice_prompt_cache_slots" = "3"
-                "qwen3_tts.prefill_graph_cache_slots" = "12"
+                # One voice slot: chat is the product and it speaks one
+                # character. Prefill graphs are the hidden VRAM monster --
+                # measured ~470 MB EACH -- so five slots caps them at ~2.3 GB;
+                # an unusual sentence length outside the five hottest buckets
+                # pays a one-time recapture instead of the whole machine
+                # paging (measured: graph creep to 23.5+ GB collapses llama
+                # decode to single digits via unified-memory fallback).
+                "qwen3_tts.voice_prompt_cache_slots" = "1"
+                "qwen3_tts.prefill_graph_cache_slots" = "5"
             }
             default_request_options = [ordered]@{
                 chunk_frames = "1"
