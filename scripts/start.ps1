@@ -21,6 +21,10 @@ param(
     [string]$LlmModelPath = "",
     [int]$LlmPort = 18081,
     [switch]$SkipLlm,
+    # Pure-LLM benchmarking: the TTS registers lazily (never loaded, no VRAM),
+    # the ASR is skipped, and Gemma keeps every expert layer on the GPU. The
+    # LLM tab then measures the model with nothing else on the card.
+    [switch]$LlmOnly,
     [switch]$Restart,
     [switch]$OpenBrowser
 )
@@ -224,7 +228,10 @@ if (Test-Path -LiteralPath $gemmaModelPath -PathType Leaf) {
         # back to the CPU: at two, total VRAM sat at 96% and a TTS prefill
         # graph capture wedged the model mid-allocation. Headroom is a
         # correctness requirement here, not a tuning preference.
-        extra_args = @($(if ($ModelPath -match '0\.6b|q4_k-mix') {
+        extra_args = @($(if ($LlmOnly) {
+                # The whole card belongs to the LLM: all experts on the GPU.
+                @("--n-cpu-moe", "0", "-ub", "2048")
+            } elseif ($ModelPath -match '0\.6b|q4_k-mix') {
                 @("--n-cpu-moe", $(if (Test-Path -LiteralPath (Join-Path $repoRoot "models\Qwen3-ASR-0.6B-GGUF\qwen3-asr-0.6b-q4_k.gguf") -PathType Leaf) { "5" } else { "3" }), "-ub", "2048")
             } else {
                 @("--n-cpu-moe", "6", "-ub", "1024")
@@ -291,7 +298,7 @@ if (-not $SkipLlm) {
 # weights exist. Lazy, so boot stays fast and the ~1.5 GB VRAM is only spent
 # once voice is actually used; after the first use the model stays warm.
 $asrModelPath = Join-Path $repoRoot "models\Qwen3-ASR-0.6B-GGUF\qwen3-asr-0.6b-q4_k.gguf"
-$voiceAvailable = Test-Path -LiteralPath $asrModelPath -PathType Leaf
+$voiceAvailable = (Test-Path -LiteralPath $asrModelPath -PathType Leaf) -and -not $LlmOnly
 
 $effectiveConfig = [ordered]@{
     host = "127.0.0.1"
@@ -309,7 +316,7 @@ $effectiveConfig = [ordered]@{
             path = ($ModelPath -replace "\\", "/")
             task = "tts"
             mode = "streaming"
-            lazy = $false
+            lazy = ([bool]$LlmOnly)
             voice_presets = $voicePresets
             session_options = [ordered]@{
                 "qwen3_tts.mem_saver" = "false"
@@ -546,7 +553,7 @@ if ($llmAvailable) {
 }
 
 $warmupResults = @()
-if (-not $SkipWarmup) {
+if (-not $SkipWarmup -and -not $LlmOnly) {
     if ($WarmVoices.Count -gt 0) {
         Add-Type -AssemblyName System.Net.Http
         $client = [System.Net.Http.HttpClient]::new()
