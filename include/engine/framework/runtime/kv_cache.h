@@ -45,6 +45,13 @@ public:
     void advance_after_direct_append(int64_t steps);
     void retain_prefix(int64_t prefix_steps);
 
+    // Resets the bookkeeping to exactly `steps` valid rows after those rows
+    // were written directly on the device (e.g. a transfer graph copying
+    // another graph's K/V into this cache): import_state without the host
+    // round trip. Rows past `steps` may hold stale data; attention masks
+    // must exclude them, which every step-graph user here already does.
+    void mark_device_import(int64_t steps);
+
     int64_t valid_steps() const noexcept;
     int64_t current_end() const noexcept;
     int64_t cache_steps() const noexcept;

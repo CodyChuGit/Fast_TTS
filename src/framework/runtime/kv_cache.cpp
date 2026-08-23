@@ -177,6 +177,14 @@ void TransformerKVCache::retain_prefix(int64_t prefix_steps) {
     current_end_ = prefix_steps;
 }
 
+void TransformerKVCache::mark_device_import(int64_t steps) {
+    if (steps < 0 || steps > cache_steps_) {
+        throw std::runtime_error("TransformerKVCache device import exceeds cache capacity");
+    }
+    valid_steps_ = steps;
+    current_end_ = steps;
+}
+
 int64_t TransformerKVCache::valid_steps() const noexcept {
     return valid_steps_;
 }

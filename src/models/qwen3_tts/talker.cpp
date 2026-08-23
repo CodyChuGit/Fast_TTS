@@ -21,6 +21,7 @@
 #include <ggml.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -1193,12 +1194,11 @@ public:
         return weights_.get() == &weights && prompt_capacity_ == prompt_capacity;
     }
 
-    struct OutputWithCache {
-        Qwen3TalkerPrefillResult result;
-        runtime::TransformerKVState state;
-    };
-
-    OutputWithCache run_with_state(const std::vector<float> & embeddings) {
+    // Computes the prefill and reads back only the last-row logits and
+    // hidden state. The K/V stays on the device: the caller moves it into
+    // the step cache with a GPU-side transfer graph instead of the ~80 MB
+    // host round trip the old state download+import paid per sentence.
+    Qwen3TalkerPrefillResult run_compute_result(const std::vector<float> & embeddings) {
         const auto & config = weights_->assets().config.talker;
         if (static_cast<int64_t>(embeddings.size()) != prompt_capacity_ * config.hidden_size) {
             throw std::runtime_error("Qwen3 talker prefill embedding size mismatch");
@@ -1211,29 +1211,47 @@ public:
         if (status != GGML_STATUS_SUCCESS) {
             throw std::runtime_error("Qwen3 talker prefill graph compute failed");
         }
-        OutputWithCache out;
-        out.result.logits.vocab_size = config.vocab_size;
-        out.result.logits.values.resize(static_cast<size_t>(config.vocab_size));
-        ggml_backend_tensor_get(logits_output_, out.result.logits.values.data(), 0, out.result.logits.values.size() * sizeof(float));
-        out.result.last_hidden.dims = config.hidden_size;
-        out.result.last_hidden.values.resize(static_cast<size_t>(config.hidden_size));
-        ggml_backend_tensor_get(hidden_output_, out.result.last_hidden.values.data(), 0, out.result.last_hidden.values.size() * sizeof(float));
-        out.state.current_end = prompt_capacity_;
-        out.state.layers.resize(keys_.size());
-        const size_t layer_values = static_cast<size_t>(
-            prompt_capacity_ * config.num_key_value_heads * attention_head_dim(config));
-        for (size_t layer = 0; layer < keys_.size(); ++layer) {
-            auto & state_layer = out.state.layers[layer];
-            state_layer.valid_steps = prompt_capacity_;
-            state_layer.key.resize(layer_values);
-            state_layer.value.resize(layer_values);
-            ggml_backend_tensor_get(keys_[layer], state_layer.key.data(), 0, state_layer.key.size() * sizeof(float));
-            ggml_backend_tensor_get(values_[layer], state_layer.value.data(), 0, state_layer.value.size() * sizeof(float));
-        }
+        Qwen3TalkerPrefillResult out;
+        out.logits.vocab_size = config.vocab_size;
+        out.logits.values.resize(static_cast<size_t>(config.vocab_size));
+        ggml_backend_tensor_get(logits_output_, out.logits.values.data(), 0, out.logits.values.size() * sizeof(float));
+        out.last_hidden.dims = config.hidden_size;
+        out.last_hidden.values.resize(static_cast<size_t>(config.hidden_size));
+        ggml_backend_tensor_get(hidden_output_, out.last_hidden.values.data(), 0, out.last_hidden.values.size() * sizeof(float));
         return out;
     }
 
+    int64_t prompt_capacity() const noexcept {
+        return prompt_capacity_;
+    }
+
+    size_t layer_count() const noexcept {
+        return keys_.size();
+    }
+
+    ggml_tensor * key_tensor(size_t layer) const {
+        return keys_.at(layer);
+    }
+
+    ggml_tensor * value_tensor(size_t layer) const {
+        return values_.at(layer);
+    }
+
+    uint64_t serial() const noexcept {
+        return serial_;
+    }
+
+    // Which prompt content this graph last computed; graphs are cached by
+    // length and a same-length different-text prompt reuses the instance,
+    // so identity comes from the runtime's content tag, not the pointer.
+    uint64_t content_tag = 0;
+
 private:
+    static uint64_t next_serial() {
+        static std::atomic<uint64_t> counter{0};
+        return ++counter;
+    }
+    uint64_t serial_ = next_serial();
     std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights_;
     int64_t prompt_capacity_ = 0;
     std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
@@ -1327,6 +1345,14 @@ public:
         return step_cache_.export_state();
     }
 
+    runtime::TransformerKVCache & cache() noexcept {
+        return step_cache_;
+    }
+
+    uint64_t serial() const noexcept {
+        return serial_;
+    }
+
     Qwen3TalkerPrefillResult run_step(const std::vector<float> & embedding) {
         last_timing_ = {};
         const auto & config = weights_->assets().config.talker;
@@ -1380,8 +1406,13 @@ public:
     }
 
 private:
+    static uint64_t next_serial() {
+        static std::atomic<uint64_t> counter{0};
+        return ++counter;
+    }
     std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights_;
     int64_t cache_steps_ = 0;
+    uint64_t serial_ = next_serial();
     std::unique_ptr<ggml_context, GgmlContextDeleter> ctx_;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * positions_ = nullptr;
@@ -1926,6 +1957,7 @@ public:
             }
             cached_prompt_prefill_ = request;
             cached_prefill_output_.reset();
+            prompt_content_tag_ = next_content_tag_++;
         }
         const auto & state = *cached_prompt_state_;
         const auto prompt_state_end = Clock::now();
@@ -1935,13 +1967,18 @@ public:
             throw std::runtime_error("Qwen3 talker prompt exceeds step runtime capacity");
         }
         const auto prefill_start = Clock::now();
-        const bool prefill_cache_hit = cached_prefill_output_.has_value();
+        auto * prefill_graph = ensure_prefill_graph(prompt_steps);
+        // The graph remembers which prompt content it holds: a same-text
+        // regeneration (multi-seed auditions) skips the compute and replays
+        // only the GPU-side state transfer below.
+        const bool prefill_cache_hit = cached_prefill_output_.has_value() &&
+            prefill_graph->content_tag == prompt_content_tag_;
         if (!prefill_cache_hit) {
-            cached_prefill_output_ = run_prefill_embeddings_with_state(state.prompt, prompt_steps);
+            cached_prefill_output_ = prefill_graph->run_compute_result(state.prompt);
+            prefill_graph->content_tag = prompt_content_tag_;
         }
-        const auto & prefill_output = *cached_prefill_output_;
         const auto prefill_end = Clock::now();
-        auto current = prefill_output.result;
+        auto current = *cached_prefill_output_;
         double code_predictor_build_ms = 0.0;
         if (code_predictor_graph_ == nullptr) {
             const auto build_start = Clock::now();
@@ -1952,16 +1989,15 @@ public:
         double import_prefill_state_ms = 0.0;
         int64_t cached_step_capacity = 0;
         runtime::TransformerKVState exported_cached_state;
-        const runtime::TransformerKVState * cached_state = &prefill_output.state;
-        bool cached_graph_has_state = false;
+        bool have_exported_state = false;
         auto ensure_cached_step_capacity = [&](int64_t required_capacity) {
-            if (cached_step_graph_ != nullptr && cached_graph_has_state &&
-                !cached_step_graph_->can_run(*weights_, required_capacity)) {
-                exported_cached_state = cached_step_graph_->export_state();
-                cached_state = &exported_cached_state;
-                cached_graph_has_state = false;
-            }
             if (cached_step_graph_ == nullptr || !cached_step_graph_->can_run(*weights_, required_capacity)) {
+                if (cached_step_graph_ != nullptr && cached_step_graph_->cache().valid_steps() > 0) {
+                    // Mid-generation growth: carry the whole prefix+generated
+                    // state across the rebuild through the host (rare).
+                    exported_cached_state = cached_step_graph_->export_state();
+                    have_exported_state = true;
+                }
                 const int64_t old_generated_capacity = cached_step_graph_ == nullptr
                     ? 0
                     : std::max<int64_t>(1, cached_step_graph_->cache_steps() - prompt_steps);
@@ -1977,15 +2013,24 @@ public:
                     weights_,
                     prompt_steps + next_generated_capacity);
                 cached_step_build_ms += engine::debug::elapsed_ms(build_start, Clock::now());
-            }
-            if (!cached_graph_has_state) {
-                const auto import_start = Clock::now();
-                cached_step_graph_->import_prefill_state(*cached_state);
-                import_prefill_state_ms += engine::debug::elapsed_ms(import_start, Clock::now());
-                cached_graph_has_state = true;
+                if (have_exported_state) {
+                    const auto import_start = Clock::now();
+                    cached_step_graph_->import_prefill_state(exported_cached_state);
+                    import_prefill_state_ms += engine::debug::elapsed_ms(import_start, Clock::now());
+                    have_exported_state = false;
+                }
             }
             cached_step_capacity = cached_step_graph_->cache_steps();
         };
+        // Fresh generation: size the step cache, then move the prefill K/V
+        // across on the GPU -- the transfer graph replaces the old
+        // download-then-import host round trip.
+        ensure_cached_step_capacity(prompt_steps + 1);
+        {
+            const auto transfer_start = Clock::now();
+            transfer_prefill_state(*prefill_graph, *cached_step_graph_, prompt_steps);
+            import_prefill_state_ms += engine::debug::elapsed_ms(transfer_start, Clock::now());
+        }
         Qwen3TalkerCodes out;
         out.generated_codes.code_groups = config.num_code_groups;
         out.decoder_input_codes.code_groups = config.num_code_groups;
@@ -2113,9 +2158,7 @@ public:
     }
 
 private:
-    TalkerPrefillGraph::OutputWithCache run_prefill_embeddings_with_state(
-        const std::vector<float> & embeddings,
-        int64_t prompt_steps) {
+    TalkerPrefillGraph * ensure_prefill_graph(int64_t prompt_steps) {
         if (prompt_steps > prompt_capacity_) {
             throw std::runtime_error("Qwen3 talker prompt exceeds step runtime capacity");
         }
@@ -2139,7 +2182,54 @@ private:
         debug::timing_log_scalar(
             "qwen3_tts.talker.prefill.graph.cache_entries",
             static_cast<int64_t>(prefill_graphs_.size()));
-        return (*graph)->run_with_state(embeddings);
+        return graph->get();
+    }
+
+    // Copies the prefill graph's K/V into the first `steps` rows of the step
+    // cache, entirely on the device. The tiny copy graph is rebuilt whenever
+    // either endpoint is a different instance (graphs are cached, evicted,
+    // and rebuilt, so identity is a serial number -- a reused allocation
+    // address must not revive stale tensor views).
+    void transfer_prefill_state(
+        TalkerPrefillGraph & prefill,
+        TalkerCachedStepGraph & step,
+        int64_t steps) {
+        if (prefill.prompt_capacity() != steps) {
+            throw std::runtime_error("Qwen3 talker transfer steps do not match prefill graph");
+        }
+        auto & cache = step.cache();
+        if (steps > cache.cache_steps()) {
+            throw std::runtime_error("Qwen3 talker transfer exceeds step cache capacity");
+        }
+        if (transfer_graph_ == nullptr ||
+            transfer_src_serial_ != prefill.serial() ||
+            transfer_dst_serial_ != step.serial()) {
+            ggml_init_params params{8 * 1024 * 1024, nullptr, true};
+            transfer_ctx_.reset(ggml_init(params));
+            if (transfer_ctx_ == nullptr) {
+                throw std::runtime_error("failed to initialize Qwen3 talker transfer graph context");
+            }
+            transfer_graph_ = ggml_new_graph_custom(transfer_ctx_.get(), 4096, false);
+            const auto & config = weights_->assets().config.talker;
+            const int64_t row_elems = config.num_key_value_heads * attention_head_dim(config);
+            for (size_t layer = 0; layer < prefill.layer_count(); ++layer) {
+                auto * dst_key = ggml_view_1d(
+                    transfer_ctx_.get(), cache.key_tensor(layer).tensor, steps * row_elems, 0);
+                auto * dst_value = ggml_view_1d(
+                    transfer_ctx_.get(), cache.value_tensor(layer).tensor, steps * row_elems, 0);
+                ggml_build_forward_expand(
+                    transfer_graph_, ggml_cpy(transfer_ctx_.get(), prefill.key_tensor(layer), dst_key));
+                ggml_build_forward_expand(
+                    transfer_graph_, ggml_cpy(transfer_ctx_.get(), prefill.value_tensor(layer), dst_value));
+            }
+            transfer_src_serial_ = prefill.serial();
+            transfer_dst_serial_ = step.serial();
+        }
+        const ggml_status status = engine::core::compute_backend_graph(weights_->backend(), transfer_graph_);
+        if (status != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("Qwen3 talker prefill state transfer failed");
+        }
+        cache.mark_device_import(steps);
     }
 
     std::shared_ptr<const Qwen3TalkerWeightsRuntime> weights_;
@@ -2154,7 +2244,14 @@ private:
     // see VoicePromptParts.
     std::optional<Qwen3TalkerPrefill> cached_voice_parts_prefill_;
     std::optional<VoicePromptParts> cached_voice_parts_;
-    std::optional<TalkerPrefillGraph::OutputWithCache> cached_prefill_output_;
+    std::optional<Qwen3TalkerPrefillResult> cached_prefill_output_;
+    // GPU-side prefill->step state transfer; see transfer_prefill_state.
+    std::unique_ptr<ggml_context, GgmlContextDeleter> transfer_ctx_;
+    ggml_cgraph * transfer_graph_ = nullptr;
+    uint64_t transfer_src_serial_ = 0;
+    uint64_t transfer_dst_serial_ = 0;
+    uint64_t prompt_content_tag_ = 0;
+    uint64_t next_content_tag_ = 1;
 };
 
 Qwen3TalkerStepRuntime::Qwen3TalkerStepRuntime(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {
