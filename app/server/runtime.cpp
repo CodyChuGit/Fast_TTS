@@ -2486,10 +2486,17 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     // the last one's cache and jam the single llama slot for seconds
     // (measured: a mid-conversation turn behind that queue took 4.9 s to
     // first token). Plain sends extend the post-turn canonical warm for a
-    // few dozen tokens, so skipping the predictive triggers keeps such
-    // models consistently fast instead of intermittently wedged.
-    if ((speculate || prewarm) && !active_llm_cache_rollback()) {
-        return json_response("{\"status\":\"skipped\"}");
+    // few dozen tokens, so the cheap-refresh triggers are skipped -- EXCEPT
+    // the highest-value one: a send-shaped draft (sentence-terminal, the
+    // send imminent) is worth one full pass, because a hit turns the whole
+    // turn into pre-generated audio. Coalescing (same-key keep, newest
+    // wins) bounds the churn to roughly one live speculation at a time.
+    if (!active_llm_cache_rollback()) {
+        const bool send_shaped = speculate && last_user_index < list.size() &&
+            ends_with_sentence_terminal(list[last_user_index].find("content")->as_string());
+        if (prewarm || (speculate && !send_shaped)) {
+            return json_response("{\"status\":\"skipped\"}");
+        }
     }
     if (speculate) {
         // A draft ending like a sentence is the client's highest-confidence
@@ -3006,17 +3013,12 @@ void ServerState::chat_orchestrate(
         // before synthesis exists to contend with, plays ~4 s of runway,
         // and carries natural prosody. ~1 s later to first sound, clean
         // from the first word on.
-        // Before the first generation has measured anything (EMA zero), the
-        // cache_rollback flag stands in: the models that cannot rewind are
-        // exactly the dense slow decoders, so their very first turn after a
-        // boot or switch gets the safe pacing instead of two pauses.
-        const double decode_tps = llm_decode_tps_ema_.load();
-        const bool slow_decoder = decode_tps > 0.0
-            ? decode_tps < 30.0
-            : !active_llm_cache_rollback();
-        SentenceSegmenter segmenter(slow_decoder
-            ? SentenceSegmenter::Options{120, 160, 300}
-            : SentenceSegmenter::Options{16, 28, 300});
+        // One opener for every model: the 16-char clause cut. Slow decoders
+        // used to need a longer opener, but the real thief was synthesis
+        // sprinting ahead of playback and starving decode on the shared GPU
+        // -- the realtime-aware throttle in the synthesis sink fixes the
+        // cause, and the client's paced reserve absorbs what remains.
+        SentenceSegmenter segmenter(SentenceSegmenter::Options{16, 28, 300});
         hygiene::StreamScrubber scrubber;
         auto emit = [&](const std::string & clean) {
             if (clean.empty()) {
@@ -3220,6 +3222,22 @@ void ServerState::chat_orchestrate(
                         audio_bytes += pcm.size();
                         write_sse(writer, "{\"type\":\"audio\",\"audio\":" + json_quote(base64_encode(pcm)) + "}");
                     }
+                    // Realtime-aware pacing: the speakers play 1 s of audio
+                    // per second no matter how fast it is synthesized, and a
+                    // dense LLM's decode drops ~40% while synthesis hogs the
+                    // GPU (measured 17 -> 10.6 t/s). Once a comfortable lead
+                    // over playback exists, napping between codec steps hands
+                    // the GPU back to the model that is still WRITING the
+                    // reply -- which is what the next sentence is waiting on.
+                    if (first_audio_ms >= 0 && !llm_finished) {
+                        const double lead_seconds =
+                            static_cast<double>(audio_bytes) / 48000.0 -
+                            (elapsed() - first_audio_ms) / 1000.0;
+                        if (lead_seconds > 2.5) {
+                            drain_tokens();
+                            std::this_thread::sleep_for(std::chrono::milliseconds(90));
+                        }
+                    }
                 });
             } else {
                 llm_finished = true;
@@ -3230,6 +3248,15 @@ void ServerState::chat_orchestrate(
                 // speculating on the user's next draft while the character
                 // is still speaking.
                 write_sse(writer, "{\"type\":\"llm_done\"}");
+                // Queue the canonical re-prime NOW rather than at stream end:
+                // synthesis (throttled to playback pace) can outlast the
+                // generation by many seconds, and a no-rollback model needs
+                // the warm finished before the next send to stay cheap.
+                if (llm_ok && !warm_body_prefix.empty() && !reply_text.empty()) {
+                    queue_llm_warm(warm_body_prefix +
+                        ",{\"role\":\"assistant\",\"content\":" +
+                        json_quote(hygiene::sanitize_assistant_text(reply_text)) + "}]}");
+                }
             }
         }
         if (!llm_ok && !llm_error.empty()) {
@@ -3263,16 +3290,10 @@ void ServerState::chat_orchestrate(
     abort.store(true);
     llm_thread.join();
 
-    // The GPU is idle now while the user listens; spend that time re-priming
-    // the sidecar's prompt cache with the canonical form of this turn (the
-    // steering note the client never stores replaced by the finished reply),
-    // so the NEXT turn's prefill covers only the user's new message. Skipped
-    // for aborted streams: the client did not keep this reply.
-    if (completed && llm_ok && !warm_body_prefix.empty() && !reply_text.empty()) {
-        queue_llm_warm(warm_body_prefix +
-            ",{\"role\":\"assistant\",\"content\":" +
-            json_quote(hygiene::sanitize_assistant_text(reply_text)) + "}]}");
-    }
+    // The canonical re-prime was queued at llm_done (see above); nothing
+    // left to do here. An aborted stream skipped it naturally: the abort
+    // fires before llm_done is processed, or the coalescer replaces the
+    // stale body on the next real activity.
 }
 
 // ============================== Live voice (STT) ==============================
