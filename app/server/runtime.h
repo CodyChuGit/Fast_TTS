@@ -205,6 +205,12 @@ private:
     // prewarming -- the benchmark surface for the LLM leg by itself. The done
     // event carries llama's own prefill/decode telemetry.
     HttpResponse handle_llm_chat(const std::string & body_text);
+    // Typing-episode collector: the client records raw keystroke timing and
+    // draft evolution while the user types, and posts finished episodes here.
+    // Episodes land in data/typing_episodes.jsonl as the training corpus for
+    // the send predictor. Raw events, not features: features are computed
+    // offline, so the collector never needs re-instrumenting.
+    HttpResponse handle_typing_telemetry(const std::string & body_text);
     // `warm_body_prefix`, when non-empty, is the canonical next-turn request
     // up to (not including) the reply message: once the reply is complete it
     // is appended and the whole thing sent to the sidecar as a one-token
@@ -308,6 +314,8 @@ private:
     std::string llm_warm_pending_;
     bool llm_warm_worker_running_ = false;
     int llm_generations_active_ = 0;
+    // Serializes appends to data/typing_episodes.jsonl.
+    std::mutex typing_log_mutex_;
     // Rolling decode rate of the active sidecar model (tokens/sec), fed by
     // every finished generation. The opener segmenter reads it: a slow
     // decoder gets a shorter first cut so time-to-first-audio stays bounded

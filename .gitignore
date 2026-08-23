@@ -41,3 +41,4 @@ __pycache__/
 /webui/native/dist/*
 !/webui/native/dist/index.html
 /character/
+data/

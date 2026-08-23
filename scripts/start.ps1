@@ -296,6 +296,19 @@ if (Test-Path -LiteralPath $orcaModelPath -PathType Leaf) {
             cache_rollback = $false
             extra_args = $orcaCommon + @("--spec-type", "ngram-mod")
         }
+        $orcaQ5Path = Join-Path $repoRoot "models\Qwen3.8-27B-OrcaRouter-GGUF\Qwen3.8-27B-Uncensored-OrcaRouter-Q5_K_M.gguf"
+        if (Test-Path -LiteralPath $orcaQ5Path -PathType Leaf) {
+            # Q5_K_M (19.5 GB): fits ONLY with the card to itself. Exists to
+            # answer whether 5-bit beats 4-bit where it should show first --
+            # hard coding and tool-use tasks.
+            $llmModels += , [ordered]@{
+                id = "orca-qwen-q5"
+                name = "Qwen3.8 27B OrcaRouter (Q5)"
+                path = ($orcaQ5Path -replace "\\", "/")
+                cache_rollback = $false
+                extra_args = $orcaCommon
+            }
+        }
     } else {
         $llmModels += , [ordered]@{
             id = "orca-qwen"

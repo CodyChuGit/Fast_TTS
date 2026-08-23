@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -1025,6 +1026,9 @@ HttpResponse ServerState::handle(const HttpRequest & request) {
     }
     else if (request.method == "POST" && request.path == "/v1/llm/chat") {
         response = handle_llm_chat(request.body);
+    }
+    else if (request.method == "POST" && request.path == "/v1/telemetry/typing") {
+        response = handle_typing_telemetry(request.body);
     }
     else if (request.method == "GET" && request.path == "/v1/llm-settings") {
         response = handle_llm_settings_get();
@@ -2126,6 +2130,44 @@ std::string ServerState::llm_settings_json() const {
     }
     out << "]}";
     return out.str();
+}
+
+HttpResponse ServerState::handle_typing_telemetry(const std::string & body_text) {
+    if (body_text.size() > 512 * 1024) {
+        return error_response(400, "typing episode is too large", "invalid_request_error");
+    }
+    const auto body = engine::io::json::parse(body_text);
+    const auto * events = body.find("events");
+    if (events == nullptr || !events->is_array() || events->as_array().empty()) {
+        return error_response(400, "a typing episode needs a non-empty 'events' array", "invalid_request_error");
+    }
+    const auto * outcome = body.find("outcome");
+    if (outcome == nullptr || !outcome->is_string()) {
+        return error_response(400, "a typing episode needs an 'outcome' string", "invalid_request_error");
+    }
+
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path("data");
+    const fs::path file = dir / "typing_episodes.jsonl";
+    std::lock_guard<std::mutex> lock(typing_log_mutex_);
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    // A runaway client must not fill the disk; 256 MB of episodes is years
+    // of typing for one person.
+    if (fs::exists(file, ec) && fs::file_size(file, ec) > 256ull * 1024 * 1024) {
+        return error_response(507, "typing log is full; archive data/typing_episodes.jsonl", "storage_full");
+    }
+    std::ofstream out(file, std::ios::app | std::ios::binary);
+    if (!out) {
+        return error_response(500, "could not open the typing log", "internal_error");
+    }
+    // One line per episode, stamped server-side so offline analysis can
+    // order collection sessions without trusting client clocks.
+    out << "{\"received_unix_ms\":"
+        << std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count()
+        << ",\"episode\":" << body_text << "}\n";
+    return json_response("{\"status\":\"recorded\"}");
 }
 
 bool ServerState::active_llm_cache_rollback() const {
