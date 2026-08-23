@@ -258,12 +258,49 @@ if (Test-Path -LiteralPath $orcaModelPath -PathType Leaf) {
     # model, so whole layers go to the CPU and decode is slow. Its matched
     # MTP draft head measured flat here (33% acceptance, heavy head, hybrid
     # attention rollback), so speculation stays off.
-    $llmModels += , [ordered]@{
-        id = "orca-qwen"
-        name = "Qwen3.8 27B OrcaRouter (slow)"
-        path = ($orcaModelPath -replace "\\", "/")
-        extra_args = @("-ngl", "42", "-ub", "1024",
+    if ($LlmOnly) {
+        # With the card to itself the dense 27B fits fully on the GPU for the
+        # first time -- this is the model the voice-mode budget could never
+        # afford. Three flavors race from the Settings switch; measured
+        # (2026-08-23, 3090, story turns): plain 18.4 t/s decode, ngram-mod
+        # 19.9 t/s (free +8%), MTP 18.0 at its best tuning (n-max 4) and 11
+        # untuned -- the Q8 head's draft cost cancels its 33-40% acceptance,
+        # so ngram is the one speculation worth switching on.
+        $orcaCommon = @("-ngl", "99", "-ub", "2048",
             "--chat-template-kwargs", '{"enable_thinking":false}')
+        $llmModels += , [ordered]@{
+            id = "orca-qwen"
+            name = "Qwen3.8 27B OrcaRouter"
+            path = ($orcaModelPath -replace "\\", "/")
+            extra_args = $orcaCommon
+        }
+        $orcaMtpPath = Join-Path $repoRoot "models\Qwen3.8-27B-OrcaRouter-GGUF\Qwen3.8-27B-Uncensored-OrcaRouter-MTP-Q8_0.gguf"
+        if (Test-Path -LiteralPath $orcaMtpPath -PathType Leaf) {
+            $llmModels += , [ordered]@{
+                id = "orca-qwen-mtp"
+                name = "Qwen3.8 27B OrcaRouter (MTP)"
+                path = ($orcaModelPath -replace "\\", "/")
+                extra_args = $orcaCommon + @("--spec-type", "draft-mtp",
+                    "-md", ($orcaMtpPath -replace "\\", "/"), "-ngld", "99",
+                    "-ctkd", "q8_0", "-ctvd", "q8_0",
+                    "--spec-draft-n-max", "4", "--spec-draft-n-min", "1",
+                    "--spec-draft-p-min", "0.5")
+            }
+        }
+        $llmModels += , [ordered]@{
+            id = "orca-qwen-ngram"
+            name = "Qwen3.8 27B OrcaRouter (ngram)"
+            path = ($orcaModelPath -replace "\\", "/")
+            extra_args = $orcaCommon + @("--spec-type", "ngram-mod")
+        }
+    } else {
+        $llmModels += , [ordered]@{
+            id = "orca-qwen"
+            name = "Qwen3.8 27B OrcaRouter (slow)"
+            path = ($orcaModelPath -replace "\\", "/")
+            extra_args = @("-ngl", "42", "-ub", "1024",
+                "--chat-template-kwargs", '{"enable_thinking":false}')
+        }
     }
 }
 $huihuiModelPath = Join-Path $repoRoot "models\Huihui-Qwen3.8-27B-abliterated-GGUF\Huihui-Qwen3.8-27B-abliterated.Q4_K_M.gguf"
@@ -278,8 +315,9 @@ if (Test-Path -LiteralPath $huihuiModelPath -PathType Leaf) {
         id = "huihui-qwen"
         name = "Qwen3.8 27B heretic (slow)"
         path = ($huihuiModelPath -replace "\\", "/")
-        extra_args = @("-ngl", "46", "-ub", "1024",
-            "--chat-template-kwargs", '{"enable_thinking":false}')
+        extra_args = @($(if ($LlmOnly) { @("-ngl", "99", "-ub", "2048") }
+            else { @("-ngl", "46", "-ub", "1024") }) +
+            @("--chat-template-kwargs", '{"enable_thinking":false}'))
     }
 }
 $llmAvailable = $false
