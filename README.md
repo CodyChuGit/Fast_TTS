@@ -33,7 +33,7 @@ hot path, no framework between the microphone and the GPU.
 | Speak, stop talking | final transcript in **170–300 ms**, reply follows |
 | Words on screen while speaking | stable prefix updates every **~300 ms** |
 | Plain TTS (speak endpoint) | first PCM in **~140 ms** |
-| Whole stack resident | 23.2 GB VRAM, all three engines warm |
+| Whole stack resident | ~21 GB VRAM steady, all three engines warm from boot |
 
 These are honest numbers from the probes in `scripts/` (`real_user_sim.py`
 emulates typing users; `voice_probe.py` streams real-time-paced speech), not
@@ -73,7 +73,7 @@ Every stage overlaps the next, and everything that can be guessed is guessed:
 |---|---|---|
 | Reply generation | Gemma-4-26B-A4B (QAT, Q4_K_XL) via managed [llama.cpp](https://github.com/ggml-org/llama.cpp) sidecar | ~13 GB (MoE experts split CPU/GPU) |
 | Character voice | Qwen3-TTS 1.7B, 12.5 Hz codec, Q4 mix | ~2 GB |
-| Ears | Qwen3-ASR 0.6B, Q8_0 + bundled Silero VAD | ~1.5 GB (lazy) |
+| Ears | Qwen3-ASR 0.6B, Q4_K + bundled Silero VAD | ~1 GB (resident from boot) |
 
 The character is defined by a reference recording + persona; every saved
 character keeps its voice and can be re-activated in one click.
