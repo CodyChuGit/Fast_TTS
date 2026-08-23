@@ -2636,7 +2636,12 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
     const std::string spec_key = speculation_key(list, last_user_index);
 
     if (speculate) {
-        start_chat_speculation(llama_body, spec_key, model, tts_seed);
+        // A draft ending like a sentence is the client's highest-confidence
+        // tier -- the send is imminent, so the first sentence's audio is
+        // worth synthesizing the moment it exists.
+        const bool early_tts = last_user_index < list.size() &&
+            ends_with_sentence_terminal(list[last_user_index].find("content")->as_string());
+        start_chat_speculation(llama_body, spec_key, model, tts_seed, early_tts);
         return json_response("{\"status\":\"speculating\"}");
     }
     if (prewarm) {
@@ -2765,7 +2770,7 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
 
 void ServerState::start_chat_speculation(
     const std::string & llama_body, const std::string & spec_key,
-    LoadedModel * model, long long tts_seed) {
+    LoadedModel * model, long long tts_seed, bool early_tts) {
     auto spec = std::make_shared<ChatSpeculation>();
     spec->key = spec_key;
     {
@@ -2786,7 +2791,7 @@ void ServerState::start_chat_speculation(
         chat_speculation_ = spec;
     }
     std::thread([this, host = config_.llm_host, port = config_.llm_port, spec,
-                 body = llama_body, model, tts_seed] {
+                 body = llama_body, model, tts_seed, early_tts] {
         // Real users mostly attach EARLY (send lands while this worker is
         // still generating), and with no hesitation audio covering the air
         // the first segment sets time-to-first-sound. 28 characters buys a
@@ -2795,6 +2800,72 @@ void ServerState::start_chat_speculation(
         // either way.
         SentenceSegmenter segmenter(SentenceSegmenter::Options{28, 56, 300});
         hygiene::StreamScrubber scrubber;
+        // Synthesizes one sentence into the speculation buffer unless another
+        // trigger got there first (the audio_state handoff below). The settle
+        // delay lets an abort land before a synthesis is burned -- a run
+        // cannot be cancelled once started, which bounds a wrong guess's TTS
+        // cost at roughly one short sentence.
+        auto synthesize_first = [this, spec, model, tts_seed](
+                                    std::string sentence, int settle_ms) {
+            if (model == nullptr) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(settle_ms));
+            if (spec->abort.load()) {
+                return;
+            }
+            const auto spoken = strip_speech_markup(sentence);
+            if (spoken.empty()) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(spec->mutex);
+                if (spec->audio_state != ChatSpeculation::AudioState::None) {
+                    return;
+                }
+                spec->audio_state = ChatSpeculation::AudioState::Running;
+            }
+            try {
+                Value::Object fields;
+                fields.emplace("input", Value::make_string(spoken));
+                if (tts_seed >= 0) {
+                    fields.emplace("seed", Value::make_number(static_cast<double>(tts_seed)));
+                }
+                const auto speech_body = Value::make_object(std::move(fields));
+                auto request = build_speech_request(*model, speech_body);
+                request.options["stream_accumulate"] = "false";
+                run_streaming_model(*model, request, [&](const engine::runtime::StreamEvent & stream_event) {
+                    std::vector<engine::runtime::AudioBuffer> buffers;
+                    if (stream_event.audio_output.has_value()) {
+                        buffers.push_back(*stream_event.audio_output);
+                    }
+                    for (const auto & named : stream_event.named_audio_outputs) {
+                        buffers.push_back(named.audio);
+                    }
+                    for (const auto & audio : buffers) {
+                        auto pcm = encode_pcm16_samples(audio);
+                        if (pcm.empty()) {
+                            continue;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(spec->mutex);
+                            spec->first_audio_chunks.push_back(std::move(pcm));
+                        }
+                        spec->cv.notify_all();
+                    }
+                });
+                {
+                    std::lock_guard<std::mutex> lock(spec->mutex);
+                    spec->audio_state = ChatSpeculation::AudioState::Done;
+                }
+            } catch (const std::exception &) {
+                std::lock_guard<std::mutex> lock(spec->mutex);
+                spec->audio_state = ChatSpeculation::AudioState::Failed;
+                spec->first_audio_chunks.clear();
+            }
+            spec->cv.notify_all();
+        };
+        bool early_tts_started = false;
         auto emit = [&](const std::string & clean) {
             if (clean.empty()) {
                 return;
@@ -2808,6 +2879,24 @@ void ServerState::start_chat_speculation(
                 }
             }
             spec->cv.notify_all();
+            // The frontier of an early attach is TTS time: the moment the
+            // first sentence exists, synthesize it while the rest of the
+            // reply is still being written, so a send landing mid-generation
+            // finds its audio already streaming instead of paying the full
+            // synthesis after replay. Send-shaped drafts only.
+            if (early_tts && !early_tts_started) {
+                std::string first;
+                {
+                    std::lock_guard<std::mutex> lock(spec->mutex);
+                    if (!spec->sentences.empty()) {
+                        first = spec->sentences.front();
+                    }
+                }
+                if (!first.empty()) {
+                    early_tts_started = true;
+                    std::thread(synthesize_first, std::move(first), 400).detach();
+                }
+            }
         };
         std::unique_lock<std::mutex> stream_lock(llm_spec_stream_mutex_);
         if (spec->abort.load()) {
@@ -2842,66 +2931,13 @@ void ServerState::start_chat_speculation(
         }
         spec->cv.notify_all();
 
-        // The reply is settled and the GPU is idle while the user hovers:
-        // synthesize the first sentence too, so a hit starts speaking at the
-        // client's buffer speed. A short confirmation delay avoids burning a
-        // synthesis when the user was mid-edit; a run cannot be cancelled
-        // once started, which bounds a miss's extra TTS wait at roughly one
-        // short sentence.
-        if (model == nullptr || !result.ok || spec->abort.load()) {
+        // Fallback for replies whose only sentence appeared at flush time
+        // (the early trigger above never saw one). The audio_state handoff
+        // inside synthesize_first makes double-synthesis impossible.
+        if (!result.ok || spec->abort.load()) {
             return;
         }
-        const auto spoken = strip_speech_markup(first_sentence);
-        if (spoken.empty()) {
-            return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        if (spec->abort.load()) {
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> lock(spec->mutex);
-            spec->audio_state = ChatSpeculation::AudioState::Running;
-        }
-        try {
-            Value::Object fields;
-            fields.emplace("input", Value::make_string(spoken));
-            if (tts_seed >= 0) {
-                fields.emplace("seed", Value::make_number(static_cast<double>(tts_seed)));
-            }
-            const auto speech_body = Value::make_object(std::move(fields));
-            auto request = build_speech_request(*model, speech_body);
-            request.options["stream_accumulate"] = "false";
-            run_streaming_model(*model, request, [&](const engine::runtime::StreamEvent & stream_event) {
-                std::vector<engine::runtime::AudioBuffer> buffers;
-                if (stream_event.audio_output.has_value()) {
-                    buffers.push_back(*stream_event.audio_output);
-                }
-                for (const auto & named : stream_event.named_audio_outputs) {
-                    buffers.push_back(named.audio);
-                }
-                for (const auto & audio : buffers) {
-                    auto pcm = encode_pcm16_samples(audio);
-                    if (pcm.empty()) {
-                        continue;
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(spec->mutex);
-                        spec->first_audio_chunks.push_back(std::move(pcm));
-                    }
-                    spec->cv.notify_all();
-                }
-            });
-            {
-                std::lock_guard<std::mutex> lock(spec->mutex);
-                spec->audio_state = ChatSpeculation::AudioState::Done;
-            }
-        } catch (const std::exception &) {
-            std::lock_guard<std::mutex> lock(spec->mutex);
-            spec->audio_state = ChatSpeculation::AudioState::Failed;
-            spec->first_audio_chunks.clear();
-        }
-        spec->cv.notify_all();
+        synthesize_first(std::move(first_sentence), 300);
     }).detach();
 }
 
@@ -3241,6 +3277,15 @@ void ServerState::chat_orchestrate(
                 const bool use_spec_audio = first_sentence_ms < 0 && speculation != nullptr &&
                     [&] {
                         std::lock_guard<std::mutex> lock(speculation->mutex);
+                        if (speculation->audio_state == ChatSpeculation::AudioState::None) {
+                            // This thread is about to synthesize the first
+                            // sentence itself; claim the slot so the worker's
+                            // early-TTS trigger cannot start a duplicate
+                            // synthesis behind it and hold the model against
+                            // sentence two.
+                            speculation->audio_state = ChatSpeculation::AudioState::Failed;
+                            return false;
+                        }
                         return speculation->audio_state == ChatSpeculation::AudioState::Running ||
                                speculation->audio_state == ChatSpeculation::AudioState::Done;
                     }();

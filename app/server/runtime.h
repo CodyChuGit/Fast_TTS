@@ -236,10 +236,14 @@ private:
     // ChatSpeculation buffer, replacing (and aborting) any previous one. Once
     // the reply settles, the worker also synthesizes the first sentence's
     // audio on `model`. `spec_key` is the punctuation-tolerant conversation
-    // key the real send will be matched against.
+    // key the real send will be matched against. With `early_tts`, the first
+    // sentence synthesizes the moment it exists (draft looked send-shaped,
+    // so the attach is near-certain); otherwise synthesis waits for the
+    // settled reply -- a synthesis cannot be cancelled, and burning one per
+    // mid-thought speculation measurably starves the real send's TTS.
     void start_chat_speculation(
         const std::string & llama_body, const std::string & spec_key,
-        LoadedModel * model, long long tts_seed);
+        LoadedModel * model, long long tts_seed, bool early_tts);
     // Hands over the current speculation when its key matches; otherwise
     // aborts it. Null when there is nothing to attach to.
     std::shared_ptr<ChatSpeculation> take_matching_speculation(const std::string & key);
