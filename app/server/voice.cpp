@@ -46,6 +46,74 @@ std::string json_escape(const std::string & text) {
     return out;
 }
 
+// Semantic endpointing, the cheap way: the ASR punctuates every hypothesis,
+// so terminal punctuation carries no signal -- but a turn that stops on a
+// continuation word almost never ended. When the hypothesis tail is one of
+// these, the endpoint hold stretches instead of committing.
+bool hypothesis_looks_incomplete(const std::string & text) {
+    // Strip trailing whitespace and punctuation (ASCII + common fullwidth).
+    std::string t = text;
+    auto is_tail_junk = [](const std::string & s) {
+        if (s.empty()) {
+            return 0;
+        }
+        const unsigned char back = static_cast<unsigned char>(s.back());
+        if (back < 0x80) {
+            return std::ispunct(back) || std::isspace(back) ? 1 : 0;
+        }
+        if (s.size() >= 3) {
+            const unsigned char lead = static_cast<unsigned char>(s[s.size() - 3]);
+            const unsigned char second = static_cast<unsigned char>(s[s.size() - 2]);
+            if ((lead == 0xE3 && second == 0x80) || lead == 0xEF || (lead == 0xE2 && second == 0x80)) {
+                return 3;  // CJK punctuation, fullwidth forms, ellipsis/dashes
+            }
+        }
+        return 0;
+    };
+    while (true) {
+        const int n = is_tail_junk(t);
+        if (n == 0) {
+            break;
+        }
+        t.resize(t.size() - static_cast<size_t>(n));
+    }
+    if (t.empty()) {
+        return false;
+    }
+    // Last ASCII word, lowercased.
+    static const std::vector<std::string> kContinuationWords = {
+        "and", "but", "or", "so", "then", "because", "like", "um", "uh",
+        "the", "a", "an", "to", "of", "with", "if", "when", "for", "in", "on", "at", "my",
+    };
+    const auto space = t.find_last_of(' ');
+    std::string last = space == std::string::npos ? t : t.substr(space + 1);
+    if (!last.empty() && static_cast<unsigned char>(last.front()) < 0x80) {
+        for (char & c : last) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        for (const auto & word : kContinuationWords) {
+            if (last == word) {
+                return true;
+            }
+        }
+        return false;
+    }
+    // Last CJK character.
+    static const std::vector<std::string> kContinuationCjk = {
+        "的", "和", "或", "跟", "把", "给", "在", "是", "就", "还", "又",
+        "嗯", "呃", "那", "这", "很", "太", "要",
+    };
+    if (t.size() >= 3) {
+        const std::string tail = t.substr(t.size() - 3);
+        for (const auto & ch : kContinuationCjk) {
+            if (tail == ch) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -75,6 +143,8 @@ TurnParams turn_params_from_query(const std::string & query) {
             else if (key == "max_utterance_ms") params.max_utterance_ms = std::stoi(value);
             else if (key == "partial_interval_ms") params.partial_interval_ms = std::stoi(value);
             else if (key == "min_partial_audio_ms") params.min_partial_audio_ms = std::stoi(value);
+            else if (key == "endpoint_hold_ms") params.endpoint_hold_ms = std::stoi(value);
+            else if (key == "endpoint_hold_incomplete_ms") params.endpoint_hold_incomplete_ms = std::stoi(value);
             else if (key == "speech_pad_ms") params.speech_pad_ms = std::stoi(value);
             else if (key == "stable_hypothesis_count") params.stability.stable_hypothesis_count = std::stoi(value);
             else if (key == "min_stable_chars") params.stability.min_stable_chars = std::stoi(value);
@@ -109,10 +179,24 @@ struct VoiceLiveRunner::Impl {
     double first_partial_ms = -1;   // written by worker, read at final
     double first_stable_ms = -1;
 
+    // Adaptive endpoint: after the VAD reports silence, the turn does not
+    // commit immediately. A speculative final decode starts on the frozen
+    // utterance, and the hold stretches when the hypothesis ends mid-thought.
+    // Resumed speech cancels both for the cost of one wasted decode.
+    bool pending_end = false;
+    Clock::time_point pending_since;
+    std::vector<float> gap_buffer;  // audio captured during the hold
+    TranscribeResult candidate;     // guarded by decode_mutex
+    bool candidate_valid = false;   // guarded by decode_mutex
+    double candidate_decode_ms = 0; // guarded by decode_mutex
+    size_t candidate_samples = 0;   // guarded by decode_mutex
+    std::string latest_hypothesis;  // guarded by decode_mutex
+
     // Decode worker.
     struct Job {
         int64_t utterance_id = 0;
         bool final = false;
+        bool candidate = false;  // speculative final: store, do not emit final
         engine::runtime::AudioBuffer audio;
     };
     std::mutex decode_mutex;
@@ -181,30 +265,56 @@ struct VoiceLiveRunner::Impl {
         }
     }
 
+    void emit_final(int64_t utt, const TranscribeResult & result, double decode_ms, size_t audio_samples) {
+        std::ostringstream extra;
+        extra << "\"text\":\"" << json_escape(result.text) << "\""
+              << ",\"language\":\"" << json_escape(result.language) << "\""
+              << ",\"timings\":{"
+              << "\"speech_started_ms\":" << static_cast<int64_t>(elapsed_ms(t0) - elapsed_ms(speech_started_at))
+              << ",\"speech_ended_ms\":" << static_cast<int64_t>(elapsed_ms(t0) - elapsed_ms(speech_ended_at))
+              << ",\"first_partial_ms\":" << static_cast<int64_t>(first_partial_ms)
+              << ",\"first_stable_ms\":" << static_cast<int64_t>(first_stable_ms)
+              << ",\"eot_to_final_ms\":" << static_cast<int64_t>(elapsed_ms(speech_ended_at))
+              << ",\"final_decode_ms\":" << static_cast<int64_t>(decode_ms)
+              << ",\"audio_ms\":" << static_cast<int64_t>(
+                     1000.0 * static_cast<double>(audio_samples) / 16000.0)
+              << "}";
+        emit_event("final_transcript", utt, extra.str());
+        engine::debug::timing_log_scalar("voice.eot_to_final_ms", elapsed_ms(speech_ended_at));
+    }
+
     void handle_result(const Job & job, const TranscribeResult & result, double decode_ms) {
         engine::debug::timing_log_scalar("voice.decode_ms", decode_ms);
         if (job.final) {
-            const double final_at = now_ms();
-            std::ostringstream extra;
-            extra << "\"text\":\"" << json_escape(result.text) << "\""
-                  << ",\"language\":\"" << json_escape(result.language) << "\""
-                  << ",\"timings\":{"
-                  << "\"speech_started_ms\":" << static_cast<int64_t>(elapsed_ms(t0) - elapsed_ms(speech_started_at))
-                  << ",\"speech_ended_ms\":" << static_cast<int64_t>(elapsed_ms(t0) - elapsed_ms(speech_ended_at))
-                  << ",\"first_partial_ms\":" << static_cast<int64_t>(first_partial_ms)
-                  << ",\"first_stable_ms\":" << static_cast<int64_t>(first_stable_ms)
-                  << ",\"eot_to_final_ms\":" << static_cast<int64_t>(elapsed_ms(speech_ended_at))
-                  << ",\"final_decode_ms\":" << static_cast<int64_t>(decode_ms)
-                  << ",\"audio_ms\":" << static_cast<int64_t>(
-                         1000.0 * static_cast<double>(job.audio.samples.size()) / 16000.0)
-                  << "}";
-            emit_event("final_transcript", job.utterance_id, extra.str());
-            engine::debug::timing_log_scalar("voice.eot_to_final_ms", elapsed_ms(speech_ended_at));
-            (void) final_at;
+            emit_final(job.utterance_id, result, decode_ms, job.audio.samples.size());
             return;
+        }
+        // A decode whose audio already trails off into silence has seen the
+        // whole utterance: it doubles as the final-transcript candidate, so
+        // the commit usually finds its answer precomputed. The explicit
+        // pending-end job qualifies by construction.
+        bool tail_quiet = job.candidate;
+        if (!tail_quiet && job.audio.samples.size() >= 1600) {
+            double energy = 0;
+            const size_t tail = 1600;  // last 100 ms
+            for (size_t i = job.audio.samples.size() - tail; i < job.audio.samples.size(); ++i) {
+                energy += static_cast<double>(job.audio.samples[i]) * job.audio.samples[i];
+            }
+            tail_quiet = energy / tail < 1.6e-5;  // rms < ~0.004 full scale
+        }
+        if (tail_quiet && !result.text.empty()) {
+            std::lock_guard<std::mutex> lock(decode_mutex);
+            candidate = result;
+            candidate_valid = true;
+            candidate_decode_ms = decode_ms;
+            candidate_samples = job.audio.samples.size();
         }
         if (result.text.empty()) {
             return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(decode_mutex);
+            latest_hypothesis = result.text;
         }
         const bool stable_grew = tracker.update(result.text);
         if (stable_grew) {
@@ -227,10 +337,11 @@ struct VoiceLiveRunner::Impl {
         }
     }
 
-    void enqueue_decode(bool final) {
+    void enqueue_decode(bool final, bool candidate_job = false) {
         Job job;
         job.utterance_id = utterance_id;
         job.final = final;
+        job.candidate = candidate_job;
         job.audio.sample_rate = 16000;
         job.audio.channels = 1;
         {
@@ -239,6 +350,10 @@ struct VoiceLiveRunner::Impl {
                 // The final decode must see all audio and run after any
                 // in-flight partial: wait the worker idle, then queue.
                 idle_cv.wait(lock, [&] { return !worker_busy; });
+            } else if (candidate_job) {
+                // The speculative final replaces any queued partial and runs
+                // right after the in-flight one.
+                pending.reset();
             } else if (worker_busy || pending.has_value()) {
                 return;  // partials are best-effort; never queue behind one
             }
@@ -255,6 +370,8 @@ struct VoiceLiveRunner::Impl {
 
     void begin_utterance() {
         speaking = true;
+        pending_end = false;
+        gap_buffer.clear();
         ++utterance_id;
         speech_started_at = Clock::now();
         last_partial_enqueue = Clock::now();
@@ -265,20 +382,88 @@ struct VoiceLiveRunner::Impl {
         {
             std::lock_guard<std::mutex> lock(decode_mutex);
             utterance = preroll;
+            candidate_valid = false;
+            latest_hypothesis.clear();
         }
         emit_event("speech_started", utterance_id);
     }
 
-    void end_utterance() {
+    // VAD reports silence: freeze the utterance, start the speculative final
+    // decode, and let the adaptive hold decide whether this was really the
+    // end. speech_ended_at marks THIS moment -- the user experienced the end
+    // of their own speech here, so eot_to_final honestly includes the hold.
+    void begin_pending_end() {
+        pending_end = true;
+        pending_since = Clock::now();
+        speech_ended_at = pending_since;
+        gap_buffer.clear();
+        // A quiet-tail partial may have precomputed the final already; only
+        // spend a speculative decode when nothing that fresh exists.
+        bool have_candidate = false;
+        {
+            std::lock_guard<std::mutex> lock(decode_mutex);
+            have_candidate = candidate_valid && candidate_samples + 16 * 480 >= utterance.size();
+        }
+        if (!have_candidate) {
+            enqueue_decode(false, true);
+        }
+    }
+
+    // Speech resumed during the hold: the turn continues, gap audio included.
+    void resume_from_pending() {
+        pending_end = false;
+        {
+            std::lock_guard<std::mutex> lock(decode_mutex);
+            utterance.insert(utterance.end(), gap_buffer.begin(), gap_buffer.end());
+            candidate_valid = false;
+        }
+        gap_buffer.clear();
+    }
+
+    void commit_utterance() {
         speaking = false;
-        speech_ended_at = Clock::now();
+        pending_end = false;
+        gap_buffer.clear();
         emit_event("speech_ended", utterance_id);
-        enqueue_decode(true);
-        wait_worker_idle();
+        // If the speculative final already decoded the frozen utterance, it
+        // IS the final -- no second decode.
+        bool served_from_candidate = false;
+        {
+            std::unique_lock<std::mutex> lock(decode_mutex);
+            idle_cv.wait(lock, [&] { return !worker_busy && !pending.has_value(); });
+            // A quiet-tail partial that covered all but the trailing
+            // silence is as final as a dedicated decode.
+            if (candidate_valid && candidate_samples + 16 * 480 >= utterance.size()) {
+                served_from_candidate = true;
+            }
+        }
+        if (served_from_candidate) {
+            TranscribeResult result;
+            double decode_ms = 0;
+            size_t samples = 0;
+            {
+                std::lock_guard<std::mutex> lock(decode_mutex);
+                result = candidate;
+                decode_ms = candidate_decode_ms;
+                samples = utterance.size();
+                candidate_valid = false;
+            }
+            emit_final(utterance_id, result, decode_ms, samples);
+        } else {
+            enqueue_decode(true);
+            wait_worker_idle();
+        }
         {
             std::lock_guard<std::mutex> lock(decode_mutex);
             utterance.clear();
         }
+    }
+
+    // Kept for stream teardown and the runaway-utterance cap, where there is
+    // no hold to adapt.
+    void end_utterance() {
+        speech_ended_at = Clock::now();
+        commit_utterance();
     }
 
     void run(const minitts::app::AudioChunkStream & stream) {
@@ -318,7 +503,9 @@ struct VoiceLiveRunner::Impl {
                         window_event.voice_activity.end());
                 }
 
-                if (speaking) {
+                if (speaking && pending_end) {
+                    gap_buffer.insert(gap_buffer.end(), block.begin(), block.end());
+                } else if (speaking) {
                     std::lock_guard<std::mutex> lock(decode_mutex);
                     utterance.insert(utterance.end(), block.begin(), block.end());
                 } else {
@@ -332,14 +519,35 @@ struct VoiceLiveRunner::Impl {
 
                 for (const auto & activity : vad_event.voice_activity) {
                     using Kind = engine::runtime::VoiceActivityEvent::Kind;
-                    if (activity.kind == Kind::SpeechStart && !speaking) {
-                        begin_utterance();
-                    } else if (activity.kind == Kind::SpeechEnd && speaking) {
-                        end_utterance();
+                    if (activity.kind == Kind::SpeechStart) {
+                        if (!speaking) {
+                            begin_utterance();
+                        } else if (pending_end) {
+                            resume_from_pending();
+                        }
+                    } else if (activity.kind == Kind::SpeechEnd && speaking && !pending_end) {
+                        begin_pending_end();
                     }
                 }
 
-                if (speaking) {
+                if (speaking && pending_end) {
+                    // Adaptive hold: commit fast on a complete-looking
+                    // hypothesis, stretch when it ends mid-thought.
+                    std::string hypothesis;
+                    {
+                        std::lock_guard<std::mutex> lock(decode_mutex);
+                        hypothesis = latest_hypothesis;
+                    }
+                    const int hold = hypothesis_looks_incomplete(hypothesis)
+                        ? params.endpoint_hold_incomplete_ms
+                        : params.endpoint_hold_ms;
+                    if (elapsed_ms(pending_since) >= hold) {
+                        commit_utterance();
+                        continue;
+                    }
+                }
+
+                if (speaking && !pending_end) {
                     const double speech_ms = elapsed_ms(speech_started_at);
                     if (speech_ms > params.max_utterance_ms) {
                         // Runaway turn: close it out and let the VAD's next

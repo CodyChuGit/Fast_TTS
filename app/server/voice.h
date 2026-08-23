@@ -23,7 +23,16 @@ namespace minitts::server::voice {
 struct TurnParams {
     float vad_threshold = 0.5F;
     int min_speech_ms = 100;
-    int min_silence_ms = 250;    // conversational endpoint, per turn
+    // Acoustic silence before the VAD reports a possible end. The turn does
+    // not finalize here -- an adaptive hold follows, and a speculative final
+    // decode starts, so resumed speech cancels cheaply.
+    int min_silence_ms = 120;
+    // Additional hold after the VAD end before the turn commits: short when
+    // the hypothesis looks complete, long when it ends in a continuation
+    // word ("and", "的", "um") -- semantic endpointing without a second
+    // model.
+    int endpoint_hold_ms = 110;
+    int endpoint_hold_incomplete_ms = 350;
     int max_utterance_ms = 30000;
     int partial_interval_ms = 280;
     // Below this much captured speech, partial decodes are skipped: the ASR

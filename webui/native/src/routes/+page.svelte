@@ -61,14 +61,17 @@
   // events come back over one SSE connection. Solid text has stabilized
   // across ASR re-decodes; dimmed text is the still-revising tail.
   type VoiceTurn = {
-    id: number;
+    key: string;
+    kind: 'user' | 'assistant';
     stable: string;
     tentative: string;
     final?: string;
+    text?: string; // assistant reply accumulator
     timing?: { first_partial_ms: number; eot_to_final_ms: number };
   };
   let voiceActive = false;
   let voiceSpeechActive = false;
+  let voiceConverse = true;
   let voiceError = '';
   let voiceTurns: VoiceTurn[] = [];
   let voiceSessionId = '';
@@ -79,15 +82,96 @@
   let voicePending: Float32Array[] = [];
   let voiceFlushTimer: ReturnType<typeof setInterval> | null = null;
   let voicePostChain: Promise<unknown> = Promise.resolve();
+  // Conversation loop: her reply plays while the mic stays hot; speaking
+  // over her cuts the reply (barge-in), and every stable-prefix update
+  // speculates her reply on the server so it is often ready before the
+  // final transcript exists.
+  let voiceChat: ChatMessage[] = [];
+  let voiceReplyPlayer: Pcm16StreamPlayer | null = null;
+  let voiceReplyAborter: AbortController | null = null;
+  let voiceSpeakingReply = false;
+  let voiceReplyFinal = true;
+  let voiceReplyCounter = 0;
+  let lastVoiceSpeculated = '';
 
   function voiceTurn(id: number): VoiceTurn {
-    let turn = voiceTurns.find((t) => t.id === id);
+    const key = `u${id}`;
+    let turn = voiceTurns.find((t) => t.key === key);
     if (!turn) {
-      turn = { id, stable: '', tentative: '' };
+      turn = { key, kind: 'user', stable: '', tentative: '' };
       voiceTurns = [...voiceTurns, turn];
-      if (voiceTurns.length > 12) voiceTurns = voiceTurns.slice(-12);
+      if (voiceTurns.length > 24) voiceTurns = voiceTurns.slice(-24);
     }
     return turn;
+  }
+
+  function voiceMessages(draft: string): ChatMessage[] {
+    return [...voiceChat, { role: 'user' as const, content: draft }].slice(-24);
+  }
+
+  function stopVoiceReply() {
+    voiceReplyAborter?.abort();
+    voiceReplyAborter = null;
+    void voiceReplyPlayer?.stop();
+    voiceReplyPlayer = null;
+    voiceSpeakingReply = false;
+  }
+
+  async function sendVoiceTurn(content: string) {
+    stopVoiceReply();
+    voiceChat = [...voiceChat, { role: 'user', content }];
+    const reply: VoiceTurn = {
+      key: `a${voiceReplyCounter++}`,
+      kind: 'assistant',
+      stable: '',
+      tentative: '',
+      text: ''
+    };
+    voiceTurns = [...voiceTurns, reply];
+    voiceSpeakingReply = true;
+    voiceReplyFinal = false;
+    voiceReplyAborter = new AbortController();
+    try {
+      await primePcm16Playback();
+      voiceReplyPlayer = new Pcm16StreamPlayer(24000, 1, {
+        startBufferSeconds: 0.12,
+        startMaxWaitMs: 250
+      });
+      await voiceReplyPlayer.start();
+      const history = voiceChat.slice(-24).map(({ role, content: c }) => ({ role, content: c }));
+      await chatSpeak(
+        history,
+        (event) => {
+          if (event.type === 'token') {
+            reply.text = (reply.text ?? '') + event.text;
+            voiceTurns = voiceTurns;
+          } else if (event.type === 'audio') {
+            voiceReplyPlayer?.push(base64ToBytes(event.audio));
+          } else if (event.type === 'llm_done') {
+            voiceReplyFinal = true;
+          } else if (event.type === 'error') {
+            voiceError = event.message;
+          }
+        },
+        voiceReplyAborter.signal
+      );
+      await voiceReplyPlayer?.finish();
+      if (reply.text?.trim()) {
+        voiceChat = [...voiceChat, { role: 'assistant', content: reply.text }];
+      }
+    } catch (error) {
+      if ((error as Error)?.name !== 'AbortError') {
+        voiceError = error instanceof Error ? error.message : String(error);
+      } else if (reply.text?.trim()) {
+        // Barged-in mid-reply: keep what she actually said.
+        voiceChat = [...voiceChat, { role: 'assistant', content: reply.text }];
+      }
+    } finally {
+      void voiceReplyPlayer?.stop();
+      voiceReplyPlayer = null;
+      voiceSpeakingReply = false;
+      voiceReplyFinal = true;
+    }
   }
 
   async function startVoice() {
@@ -106,9 +190,23 @@
           if (event.type === 'speech_started') {
             voiceSpeechActive = true;
             voiceTurn(event.utterance_id);
+            // Barge-in: the user talking over her wins instantly.
+            if (voiceSpeakingReply) stopVoiceReply();
           } else if (event.type === 'stable_transcript') {
             voiceTurn(event.utterance_id).stable = event.text;
             voiceTurns = voiceTurns;
+            // Speculate her reply on the stabilized prefix while the user
+            // is still speaking; the punctuation-tolerant attach means the
+            // final send usually finds it ready.
+            if (
+              voiceConverse &&
+              voiceReplyFinal &&
+              event.text &&
+              event.text !== lastVoiceSpeculated
+            ) {
+              lastVoiceSpeculated = event.text;
+              speculateChat(voiceMessages(event.text));
+            }
           } else if (event.type === 'partial_transcript') {
             voiceTurn(event.utterance_id).tentative = event.text;
             voiceTurns = voiceTurns;
@@ -120,6 +218,10 @@
             turn.tentative = '';
             turn.timing = event.timings;
             voiceTurns = voiceTurns;
+            lastVoiceSpeculated = '';
+            if (voiceConverse && event.text?.trim()) {
+              void sendVoiceTurn(event.text);
+            }
           } else if (event.type === 'error') {
             voiceError = event.message;
           }
@@ -190,6 +292,7 @@
   async function stopVoice() {
     voiceActive = false;
     voiceSpeechActive = false;
+    stopVoiceReply();
     if (voiceFlushTimer !== null) {
       clearInterval(voiceFlushTimer);
       voiceFlushTimer = null;
@@ -1079,11 +1182,11 @@
     </section>
   {:else if view === 'voice'}
     <section class="panel" style="display:flex;flex-direction:column;gap:14px;">
-      <h2 style="margin:0;">Voice — live transcription</h2>
+      <h2 style="margin:0;">Voice — talk with her</h2>
       <p style="margin:0;opacity:.75;">
-        Speak into the microphone; words appear while you talk. Solid text is the stable
-        transcript, dimmed text is still being revised, and each turn finalizes the moment
-        you pause.
+        Speak; your words appear as you say them (solid = settled, dimmed = still revising).
+        The moment you pause, she answers out loud — her reply is speculated from the settled
+        part of your sentence while you're still talking. Speak over her to cut her off.
       </p>
       <div class="speak-actions">
         {#if !voiceActive}
@@ -1091,23 +1194,37 @@
         {:else}
           <button class="danger" on:click={stopVoice}>Stop</button>
           <span class="status" style="align-self:center;">
-            {voiceSpeechActive ? '● listening — speech detected' : '○ listening'}
+            {voiceSpeakingReply
+              ? '🗣 she’s speaking — talk to interrupt'
+              : voiceSpeechActive
+                ? '● listening — speech detected'
+                : '○ listening'}
           </span>
         {/if}
+        <label class="status" style="align-self:center;display:flex;gap:6px;align-items:center;cursor:pointer;">
+          <input type="checkbox" bind:checked={voiceConverse} />
+          conversation mode
+        </label>
       </div>
       {#if voiceError}
         <p class="status bad">{voiceError}</p>
       {/if}
       <div style="display:flex;flex-direction:column;gap:10px;min-height:120px;">
-        {#each voiceTurns as turn (turn.id)}
-          <div style="padding:10px 12px;border-radius:10px;background:rgba(127,127,127,.08);">
-            <span>{turn.final ?? turn.stable}</span>{#if !turn.final && turn.tentative}<span style="opacity:.45;font-style:italic;"> {turn.tentative}</span>{/if}
-            {#if turn.final && turn.timing}
-              <div style="margin-top:4px;font-size:.78em;opacity:.55;">
-                first partial {turn.timing.first_partial_ms} ms · end-of-turn → final {turn.timing.eot_to_final_ms} ms
-              </div>
-            {/if}
-          </div>
+        {#each voiceTurns as turn (turn.key)}
+          {#if turn.kind === 'user'}
+            <div style="padding:10px 12px;border-radius:10px;background:rgba(127,127,127,.08);max-width:85%;">
+              <span>{turn.final ?? turn.stable}</span>{#if !turn.final && turn.tentative}<span style="opacity:.45;font-style:italic;"> {turn.tentative}</span>{/if}
+              {#if turn.final && turn.timing}
+                <div style="margin-top:4px;font-size:.78em;opacity:.55;">
+                  stop → final {turn.timing.eot_to_final_ms} ms
+                </div>
+              {/if}
+            </div>
+          {:else}
+            <div style="padding:10px 12px;border-radius:10px;background:rgba(100,160,255,.10);align-self:flex-end;max-width:85%;">
+              <span>{turn.text || '…'}</span>
+            </div>
+          {/if}
         {/each}
         {#if voiceActive && voiceTurns.length === 0}
           <p class="status" style="opacity:.6;">Say something…</p>

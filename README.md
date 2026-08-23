@@ -1,100 +1,129 @@
-# Super Fast TTS
+# Super Fast Voice
 
-A standalone character-voice server for one machine and one job: **talk to a
-character, out loud, with the lowest net latency a single RTX 3090 can give**.
-Two models run resident side by side —
+A **real-time voice pipeline** for one machine and one job: *talk with a
+character, out loud, with the lowest latency a single RTX 3090 can give.*
 
-- **[Peach-2.0-9B-8k-Roleplay](https://huggingface.co/ClosedCharacter/Peach-2.0-9B-8k-Roleplay)**
-  (Q8_0, via a managed [llama.cpp](https://github.com/ggml-org/llama.cpp)
-  sidecar) writes the character's replies, and
-- **Qwen3-TTS 1.7B** (streaming CUDA inference, built on the
-  [audio.cpp](https://github.com/0xShug0/audio.cpp) engine) speaks them in the
-  character's voice
+Speak — your words appear while you say them. Pause — she answers in her own
+cloned voice, usually because her reply was already being generated from the
+stable half of your sentence *while you were still talking*. Speak over her —
+she stops. One server, three resident engines, no cloud, no Python in the
+hot path, no framework between the microphone and the GPU.
 
-— and the pipeline between them streams: tokens flow out as they are generated,
-each completed sentence is synthesized while the model writes the next one, and
-audio starts before the reply is half-written.
+```
+ microphone ──► Silero VAD ──► Qwen3-ASR (streaming re-decode)
+                                   │
+                     stable prefix │ tentative tail
+                                   ▼
+                     speculative LLM generation  ◄── prompt cache, coalesced warms
+                       (Gemma-4-26B, llama.cpp)
+                                   │  sentences, streamed
+                                   ▼
+                     Qwen3-TTS 1.7B (cloned character voice)
+                                   │  PCM, streamed per codec frame
+                                   ▼
+                               speakers ──► barge-in cuts everything above
+```
 
-Measured on an RTX 3090, warm, end to end from sending a message:
+## Measured latencies (RTX 3090, warm, end to end)
 
-| | first token | first audio |
-|---|---:|---:|
-| fresh conversation | 69 ms | **689 ms** |
-| later turns | 49 ms | **708 ms** |
+| Interaction | Result |
+|---|---|
+| Type, pause 2–3 s, send | her voice in **~150 ms** (reply pre-generated + pre-synthesized) |
+| Type and send immediately | **~750 ms** to her voice |
+| Speak, stop talking | final transcript in **170–300 ms**, reply follows |
+| Words on screen while speaking | stable prefix updates every **~300 ms** |
+| Plain TTS (speak endpoint) | first PCM in **~140 ms** |
+| Whole stack resident | 23.2 GB VRAM, all three engines warm |
 
-Plain text-to-speech (no LLM) reaches first audio in ~300–420 ms.
+These are honest numbers from the probes in `scripts/` (`real_user_sim.py`
+emulates typing users; `voice_probe.py` streams real-time-paced speech), not
+best-case singles.
+
+## What makes it fast
+
+Every stage overlaps the next, and everything that can be guessed is guessed:
+
+- **Speculative replies** — while you type (or speak), finished-looking
+  drafts trigger full reply generation server-side; the send attaches to the
+  in-flight buffer. Keys are punctuation-tolerant, so `"…tonight"` speculated
+  matches `"…tonight?"` sent. Send-shaped drafts also pre-synthesize the
+  first sentence of her *audio*.
+- **Streaming STT with a stable/tentative split** — the growing utterance is
+  re-decoded continuously; tokens that survive consecutive hypotheses commit
+  to a stable prefix (the thing worth speculating on), the rest stays
+  visibly tentative. Semantic endpointing holds the turn open when you stop
+  on "and…" and commits fast when you sound finished; a quiet-tail decode
+  usually has the final transcript computed *before* the VAD fires.
+- **A TTS engine tuned to its floor** — per-voice prompt caching, GPU-side
+  KV state transfer (no host round trips), pinned generation seed so the
+  character always sounds like herself. Sentence-by-sentence synthesis rides
+  ahead of playback.
+- **An LLM sidecar that never blocks the send** — prompt-cache prewarms are
+  coalesced (newest wins, one in flight, generations take priority),
+  speculation streams are serialized, and zombie requests that lose races
+  are dropped before they reach the GPU. Flash attention + q8 KV bought the
+  VRAM back for more resident experts.
+- **Character hygiene** — replies are scrubbed before the client, the TTS,
+  or the next prompt sees them; per-turn steering rides inside the newest
+  message so the prompt cache stays hot.
+
+## Models
+
+| Role | Model | Footprint |
+|---|---|---|
+| Reply generation | Gemma-4-26B-A4B (QAT, Q4_K_XL) via managed [llama.cpp](https://github.com/ggml-org/llama.cpp) sidecar | ~13 GB (MoE experts split CPU/GPU) |
+| Character voice | Qwen3-TTS 1.7B, 12.5 Hz codec, Q4 mix | ~2 GB |
+| Ears | Qwen3-ASR 0.6B, Q8_0 + bundled Silero VAD | ~1.5 GB (lazy) |
+
+The character is defined by a reference recording + persona; every saved
+character keeps its voice and can be re-activated in one click.
 
 ## Run
 
-Build once, then:
-
 ```powershell
-scripts\start.ps1 -Restart      # launch both servers, warm everything
-scripts\stop.ps1                # graceful shutdown, releases the VRAM
+scripts/start.ps1        # builds nothing; launches TTS server + llama sidecar
+# UI at http://127.0.0.1:8080  — Speak · Live · Voice · Chat · Settings
 ```
 
-`start.ps1` preflights free VRAM (~19 GB needed for both models), starts the
-llama.cpp sidecar so the 9.4 GB weight load overlaps the TTS warmup, raises
-both processes to high priority, warms every bundled voice **and the active
-character's voice**, records both PIDs for `stop.ps1`, and opens
-**http://127.0.0.1:18080/**. `-SkipLlm` starts speech-only.
-
-## The character
-
-One character is active at a time and it is **server state**: name, voice, and
-persona, persisted in `character/` across restarts.
-
-- **Voice** — a bundled demo voice, or cloned from 5–15 s of clean speech plus
-  its transcript (Settings warns when a sample is too long or short, plays back
-  what the clone is conditioned on, and has a Test button).
-- **Persona** — who the character is; it becomes Peach's system prompt, so the
-  same character both *is* and *sounds like* itself.
-- **Library** — every save is a preset; any saved character activates in one
-  click and the whole server switches: the web page, MCP callers, everything.
-
-## Surfaces
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /` | The app: Speak, Chat, Settings |
-| `POST /v1/chat/speak` | One SSE stream: LLM tokens + interleaved character audio |
-| `POST /v1/audio/speech` | OpenAI-compatible TTS; no `voice` field → the character speaks |
-| `POST /mcp` | Model Context Protocol (streamable HTTP) with a `speak` tool |
-| `GET/POST /v1/character`, `/v1/characters*` | The character and its library |
-| `GET /health` | Liveness, backend, LLM sidecar state |
-
-## How the latency is made
-
-- The TTS model stays resident with live CUDA graphs, a keepalive against GPU
-  downclocking, cached voice prompts, and a 25-frame sliding decoder that emits
-  PCM per codec frame — engine details in
-  [README_QWEN3_TTS_STREAMING.md](README_QWEN3_TTS_STREAMING.md).
-- llama.cpp runs fully on-GPU (`-ngl 99`, flash attention) with prompt caching
-  (`cache_prompt` + `--cache-reuse 256`), so a turn's prefill covers only what
-  is new — later-turn first tokens land in ~50 ms.
-- The sentence segmenter cuts the **first** segment early at a clause boundary
-  once ~60 characters have streamed — first audio does not wait for the first
-  period — and every later sentence is synthesized while the previous one
-  plays. Roleplay `*actions*` display in chat but are stripped from speech.
-- Replies default to Peach's card sampling (temperature 0.3, top_p 0.5,
-  repetition penalty 1.1) with a voice-sized 160-token ceiling.
-
-## Repository
-
-This began as a fork of [audio.cpp](https://github.com/0xShug0/audio.cpp) and
-keeps its engine (`src/`, `include/`, ggml CUDA backends) plus the Qwen3-TTS
-streaming work; the general-purpose studio, model manager, and multi-model
-surface have been removed. The build compiles exactly one model family:
+Building from source (CUDA):
 
 ```powershell
-cmake -S . -B build/windows-cuda-release -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=qwen3_tts
+cmake --preset windows-cuda-release
 cmake --build build/windows-cuda-release --target audiocpp_server
+cd webui/native && npm install && npm run build   # embedded on next build
 ```
 
-llama.cpp binaries live in `build/llama-cpp/` (prebuilt CUDA release) and the
-Peach GGUF in `models/Peach-2.0-9B-8k-Roleplay-GGUF/`.
+## Surface
 
-Tests: `ctest --test-dir build/windows-cuda-release -R "server_"` covers the
-MCP protocol, the character store and library, the sentence segmenter, and the
-LLM stream parsers — none need a model. `cd webui/native && npm run check &&
-npm run test:stream` covers the frontend.
+| Endpoint | What |
+|---|---|
+| `POST /v1/chat/speak` | chat turn → SSE of tokens + sentences + PCM audio (`prewarm`/`speculate` flags drive the latency machinery) |
+| `POST /v1/voice/live` | chunked 16 kHz PCM in → SSE transcript events out, one connection |
+| `POST /v1/voice/sessions` (+`/audio`, `/events`, `/stop`) | the same events for browsers |
+| `POST /v1/audio/speech` | plain TTS in the character voice |
+| `/mcp` | MCP (streamable HTTP): agents call `speak` and get WAV back |
+| `/v1/character`, `/v1/characters` | the character library |
+| `/v1/llm-settings` | master prompt + sampling, persisted |
+
+Voice tuning rides on the query string:
+`min_silence_ms`, `endpoint_hold_ms`, `endpoint_hold_incomplete_ms`,
+`partial_interval_ms`, `stable_hypothesis_count`, `language`, …
+
+## Tools
+
+- `scripts/real_user_sim.py` — five typing personas with real client timing;
+  the regression gate for anything touching the send path
+- `scripts/voice_probe.py` — streams a spoken utterance at real-time pace,
+  prints the event timeline and stop→final latency
+- `scripts/latency_matrix.py` — A/B harness across the latency strategies
+- `scripts/filler_qa.py` — multi-seed synthesis lottery that curates any
+  pre-rendered clip library by waveform scoring
+
+## Heritage
+
+The synthesis/recognition engine grew out of the excellent
+[audio.cpp](https://github.com/0xShug0/audio.cpp) architecture (ggml-based,
+many model families); replies run through [llama.cpp](https://github.com/ggml-org/llama.cpp).
+This repository has since become its own thing: a single-purpose, measured,
+end-to-end **real-time conversation pipeline** — the engines are the organs,
+the latency architecture is the animal.
