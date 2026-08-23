@@ -641,6 +641,184 @@ PromptEmbeddingState build_prompt_state(
     return state;
 }
 
+// The reference side of a voice-clone prompt: every row that does not depend
+// on the sentence being spoken. Chat speaks one short sentence at a time in
+// one voice, and rebuilding the reference rows for each -- hundreds of codec
+// embedding sums plus the reference transcript's host projection -- measured
+// ~157 ms per sentence, the largest share of time-to-first-sound. Cached,
+// a new sentence only projects its own few text rows. Row splits are exact:
+// text_project_host/linear_host compute each row with a fixed inner
+// accumulation order, so projecting reference and request text separately
+// yields bit-identical rows to the combined projection.
+struct VoicePromptParts {
+    std::vector<float> tts_bos;
+    std::vector<float> tts_eos;
+    std::vector<float> tts_pad;
+    // Role rows, fused codec-prefix rows, and the tts_bos fusion row: the
+    // prompt's constant head, exactly as build_prompt_state lays it out.
+    std::vector<float> header;
+    std::vector<float> ref_text_embed;  // projected reference transcript rows
+    std::vector<float> ref_codec;       // codec bos + summed reference frames
+};
+
+bool voice_parts_usable(const Qwen3TalkerPrefill & prefill) {
+    // Only the ICL voice-clone path is split; every other mode falls back to
+    // the monolithic builder.
+    return prefill.prompt_mode == Qwen3TalkerPromptMode::VoiceClone &&
+           !prefill.x_vector_only_mode &&
+           prefill.reference_codes.has_value() &&
+           prefill.reference_ids.size() >= 5 &&
+           prefill.input_ids.size() >= 8;
+}
+
+// talker_prefill_equal minus the request text: same voice, same template
+// head, any sentence.
+bool voice_parts_reusable(const Qwen3TalkerPrefill & lhs, const Qwen3TalkerPrefill & rhs) {
+    if (lhs.prompt_mode != rhs.prompt_mode ||
+        lhs.instruct_ids != rhs.instruct_ids ||
+        lhs.reference_ids != rhs.reference_ids ||
+        lhs.speaker != rhs.speaker ||
+        lhs.language != rhs.language ||
+        lhs.icl_mode != rhs.icl_mode ||
+        lhs.x_vector_only_mode != rhs.x_vector_only_mode ||
+        lhs.reference_codes.has_value() != rhs.reference_codes.has_value() ||
+        lhs.speaker_embedding.has_value() != rhs.speaker_embedding.has_value() ||
+        lhs.input_ids.size() < 3 || rhs.input_ids.size() < 3 ||
+        !std::equal(lhs.input_ids.begin(), lhs.input_ids.begin() + 3, rhs.input_ids.begin())) {
+        return false;
+    }
+    if (lhs.reference_codes.has_value() &&
+        !speech_codes_equal(*lhs.reference_codes, *rhs.reference_codes)) {
+        return false;
+    }
+    if (lhs.speaker_embedding.has_value() &&
+        !speaker_embedding_equal(*lhs.speaker_embedding, *rhs.speaker_embedding)) {
+        return false;
+    }
+    return true;
+}
+
+VoicePromptParts build_voice_parts(
+    const Qwen3TalkerPrefill & prefill,
+    const Qwen3TTSConfig & root_config,
+    const Qwen3TalkerWeights & weights) {
+    const auto & config = root_config.talker;
+    validate_qwen3_talker_voice_clone_prefill(prefill, config.hidden_size);
+    VoicePromptParts parts;
+    const auto tts_special_hidden = lookup_rows(
+        weights.text_embedding,
+        config.text_hidden_size,
+        {
+            static_cast<int32_t>(root_config.tts_bos_token_id),
+            static_cast<int32_t>(root_config.tts_eos_token_id),
+            static_cast<int32_t>(root_config.tts_pad_token_id),
+        });
+    const auto tts_special = text_project_host(tts_special_hidden, 3, weights, config);
+    parts.tts_bos = row_at(tts_special, 0, config.hidden_size);
+    parts.tts_eos = row_at(tts_special, 1, config.hidden_size);
+    parts.tts_pad = row_at(tts_special, 2, config.hidden_size);
+
+    const std::string language = ascii_lower(prefill.language);
+    std::vector<int32_t> codec_prefix;
+    if (language == "auto") {
+        codec_prefix = {
+            static_cast<int32_t>(config.codec_nothink_id),
+            static_cast<int32_t>(config.codec_think_bos_id),
+            static_cast<int32_t>(config.codec_think_eos_id),
+        };
+    } else {
+        const auto language_it = config.codec_language_id.find(language);
+        if (language_it == config.codec_language_id.end()) {
+            throw std::runtime_error("Qwen3 talker unsupported language: " + prefill.language);
+        }
+        codec_prefix = {
+            static_cast<int32_t>(config.codec_think_id),
+            static_cast<int32_t>(config.codec_think_bos_id),
+            static_cast<int32_t>(language_it->second),
+            static_cast<int32_t>(config.codec_think_eos_id),
+        };
+    }
+
+    const std::vector<int32_t> role_ids(prefill.input_ids.begin(), prefill.input_ids.begin() + 3);
+    append_rows(parts.header, text_project_host(lookup_rows(weights.text_embedding, config.text_hidden_size, role_ids), 3, weights, config));
+    auto codec_embed = lookup_rows(weights.codec_embedding, config.hidden_size, codec_prefix);
+    append_row(codec_embed, prefill.speaker_embedding->values);
+    append_rows(codec_embed, lookup_rows(
+                                 weights.codec_embedding,
+                                 config.hidden_size,
+                                 {
+                                     static_cast<int32_t>(config.codec_pad_id),
+                                     static_cast<int32_t>(config.codec_bos_id),
+                                 }));
+    const int64_t codec_rows = static_cast<int64_t>(codec_embed.size()) / config.hidden_size;
+    append_rows(parts.header, add_rows(repeat_row(parts.tts_pad, codec_rows - 2), std::vector<float>(
+                          codec_embed.begin(),
+                          codec_embed.begin() + static_cast<std::ptrdiff_t>((codec_rows - 2) * config.hidden_size))));
+    append_row(parts.header, add_rows(parts.tts_bos, row_at(codec_embed, codec_rows - 2, config.hidden_size)));
+
+    const std::vector<int32_t> ref_text_ids(prefill.reference_ids.begin() + 3, prefill.reference_ids.end() - 2);
+    parts.ref_text_embed = text_project_host(
+        lookup_rows(weights.text_embedding, config.text_hidden_size, ref_text_ids),
+        static_cast<int64_t>(ref_text_ids.size()),
+        weights,
+        config);
+
+    const auto & ref_codes = *prefill.reference_codes;
+    append_rows(parts.ref_codec, lookup_rows(weights.codec_embedding, config.hidden_size, {static_cast<int32_t>(config.codec_bos_id)}));
+    for (int64_t frame = 0; frame < ref_codes.frames; ++frame) {
+        std::vector<float> summed(config.hidden_size, 0.0F);
+        for (int64_t group = 0; group < ref_codes.code_groups; ++group) {
+            const int32_t code = ref_codes.codes[static_cast<size_t>(frame * ref_codes.code_groups + group)];
+            auto row = group == 0
+                ? lookup_rows(weights.codec_embedding, config.hidden_size, {code})
+                : lookup_rows(weights.code_predictor_embeddings.at(static_cast<size_t>(group - 1)), config.hidden_size, {code});
+            for (int64_t dim = 0; dim < config.hidden_size; ++dim) {
+                summed[static_cast<size_t>(dim)] += row[static_cast<size_t>(dim)];
+            }
+        }
+        append_row(parts.ref_codec, summed);
+    }
+    return parts;
+}
+
+PromptEmbeddingState build_prompt_state_from_parts(
+    const Qwen3TalkerPrefill & prefill,
+    const VoicePromptParts & parts,
+    const Qwen3TTSConfig & root_config,
+    const Qwen3TalkerWeights & weights) {
+    const auto & config = root_config.talker;
+    PromptEmbeddingState state;
+    state.tts_pad = parts.tts_pad;
+    state.prompt = parts.header;
+
+    const std::vector<int32_t> text_ids(prefill.input_ids.begin() + 3, prefill.input_ids.end() - 5);
+    auto text_embed = parts.ref_text_embed;
+    append_rows(
+        text_embed,
+        text_project_host(
+            lookup_rows(weights.text_embedding, config.text_hidden_size, text_ids),
+            static_cast<int64_t>(text_ids.size()),
+            weights,
+            config));
+    append_row(text_embed, parts.tts_eos);
+
+    const int64_t text_rows = static_cast<int64_t>(text_embed.size()) / config.hidden_size;
+    const int64_t ref_codec_rows = static_cast<int64_t>(parts.ref_codec.size()) / config.hidden_size;
+    if (text_rows > ref_codec_rows) {
+        std::vector<float> text_part(text_embed.begin(), text_embed.begin() + static_cast<std::ptrdiff_t>(parts.ref_codec.size()));
+        append_rows(state.prompt, add_rows(text_part, parts.ref_codec));
+        state.trailing_text.assign(
+            text_embed.begin() + static_cast<std::ptrdiff_t>(parts.ref_codec.size()),
+            text_embed.end());
+    } else {
+        std::vector<float> padded_text = text_embed;
+        append_rows(padded_text, repeat_row(parts.tts_pad, ref_codec_rows - text_rows));
+        append_rows(state.prompt, add_rows(padded_text, parts.ref_codec));
+        state.trailing_text = parts.tts_pad;
+    }
+    return state;
+}
+
 Qwen3TalkerWeights load_talker_weights(
     const Qwen3TTSAssets & assets,
     ggml_backend_t backend,
@@ -1732,7 +1910,20 @@ public:
         if (!cached_prompt_state_.has_value() ||
             !cached_prompt_prefill_.has_value() ||
             !talker_prefill_equal(*cached_prompt_prefill_, request)) {
-            cached_prompt_state_ = build_prompt_state(request, weights_->assets().config, weights_->weights());
+            if (voice_parts_usable(request)) {
+                // Same voice, new sentence: reuse the reference rows and
+                // project only the request text.
+                if (!cached_voice_parts_.has_value() ||
+                    !cached_voice_parts_prefill_.has_value() ||
+                    !voice_parts_reusable(*cached_voice_parts_prefill_, request)) {
+                    cached_voice_parts_ = build_voice_parts(request, weights_->assets().config, weights_->weights());
+                    cached_voice_parts_prefill_ = request;
+                }
+                cached_prompt_state_ = build_prompt_state_from_parts(
+                    request, *cached_voice_parts_, weights_->assets().config, weights_->weights());
+            } else {
+                cached_prompt_state_ = build_prompt_state(request, weights_->assets().config, weights_->weights());
+            }
             cached_prompt_prefill_ = request;
             cached_prefill_output_.reset();
         }
@@ -1959,6 +2150,10 @@ private:
     std::unique_ptr<CodePredictorGraph> code_predictor_graph_;
     std::optional<Qwen3TalkerPrefill> cached_prompt_prefill_;
     std::optional<PromptEmbeddingState> cached_prompt_state_;
+    // Voice-constant prompt rows, reused across sentences in the same voice;
+    // see VoicePromptParts.
+    std::optional<Qwen3TalkerPrefill> cached_voice_parts_prefill_;
+    std::optional<VoicePromptParts> cached_voice_parts_;
     std::optional<TalkerPrefillGraph::OutputWithCache> cached_prefill_output_;
 };
 
