@@ -3301,8 +3301,14 @@ void ServerState::chat_orchestrate(
                 }
             }
         }
-        if (!llm_ok && !llm_error.empty()) {
-            write_sse(writer, "{\"type\":\"error\",\"message\":" + json_quote(llm_error) + "}");
+        if (!llm_ok) {
+            // A failed generation with no message is still a failure -- the
+            // silent version once made a sidecar reload window look like 20
+            // clean-but-empty turns in the benchmark.
+            const std::string message = llm_error.empty()
+                ? "the language model returned nothing (it may be reloading); please retry"
+                : llm_error;
+            write_sse(writer, "{\"type\":\"error\",\"message\":" + json_quote(message) + "}");
         }
         std::ostringstream done;
         done << "{\"type\":\"done\",\"stats\":{"

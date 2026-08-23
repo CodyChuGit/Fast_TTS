@@ -320,10 +320,14 @@ if (Test-Path -LiteralPath $orcaModelPath -PathType Leaf) {
         }
     }
 }
-$orcaIq3Path = Join-Path $repoRoot "models\Qwen3.8-27B-OrcaRouter-GGUF\Qwen3.8-27B-Uncensored-OrcaRouter-Q3_K_M.gguf"
+$orcaIq3Path = Join-Path $repoRoot "models\Qwen3.8-27B-OrcaRouter-GGUF\Qwen3.8-27B-Uncensored-OrcaRouter-Q3_K_S.gguf"
 if (Test-Path -LiteralPath $orcaIq3Path -PathType Leaf) {
-    # The shootout's quality king, shrunk until it fits: Q3_K_M (13.5 GB,
-    # requantized locally from the mirror's near-lossless Q8_0)
+    # The shootout's quality king, shrunk until it fits: Q3_K_S (12.3 GB,
+    # requantized locally from the mirror's near-lossless Q8_0). K_M (13.5 GB)
+    # was tried first and PAGED under real traffic: sim-driven TTS graph
+    # captures on top of its weights crossed the ~23.8 GB cliff (23.98
+    # measured, llama decode collapsed to 7.7 t/s) -- the extra 1.2 GB is
+    # the difference between margin and the abyss
     # putting the dense 27B FULLY on the GPU beside the whole voice stack,
     # where the Q4_K_M could only crawl at 4 t/s on CPU-spilled layers.
     $llmModels += , [ordered]@{
