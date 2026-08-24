@@ -32,10 +32,29 @@ const REBUFFER_MAX_WAIT_MS = 800;
 // resuming, and closing a context around every request adds work directly on
 // the click-to-audio path and can force the browser to reopen the device.
 let sharedPlaybackContext: AudioContext | null = null;
+let preferredSinkId = '';
+
+// Route ALL page playback (chat replies, voice replies, previews) to a
+// specific output device -- e.g. a controller's speaker. Empty string means
+// the browser default. Applies to the live context and to future ones.
+export async function setPlaybackSink(sinkId: string): Promise<void> {
+  preferredSinkId = sinkId;
+  const context = sharedPlaybackContext as (AudioContext & {
+    setSinkId?: (id: string) => Promise<void>;
+  }) | null;
+  if (context && context.state !== 'closed' && typeof context.setSinkId === 'function') {
+    try {
+      await context.setSinkId(sinkId);
+    } catch {
+      // The device may have been unplugged; default output keeps working.
+    }
+  }
+}
 
 export async function primePcm16Playback(): Promise<AudioContext> {
   if (!sharedPlaybackContext || sharedPlaybackContext.state === 'closed') {
     sharedPlaybackContext = new AudioContext({ latencyHint: 'interactive' });
+    if (preferredSinkId) void setPlaybackSink(preferredSinkId);
   }
   if (sharedPlaybackContext.state !== 'running') await sharedPlaybackContext.resume();
   return sharedPlaybackContext;
