@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
+#include <iomanip>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -44,6 +46,26 @@ std::string json_escape(const std::string & text) {
         }
     }
     return out;
+}
+
+// Root-mean-square level of a block, in full-scale units.
+float rms_of(const std::vector<float> & block) {
+    if (block.empty()) {
+        return 0.0F;
+    }
+    double sum = 0.0;
+    for (const float sample : block) {
+        sum += static_cast<double>(sample) * sample;
+    }
+    return static_cast<float>(std::sqrt(sum / static_cast<double>(block.size())));
+}
+
+// Compact fixed-point rendering for event payloads: RMS values are small and
+// the default float formatting would emit scientific notation.
+std::string format_rms(float value) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(5) << value;
+    return out.str();
 }
 
 // Semantic endpointing, the cheap way: the ASR punctuates every hypothesis,
@@ -143,6 +165,8 @@ TurnParams turn_params_from_query(const std::string & query) {
             else if (key == "max_utterance_ms") params.max_utterance_ms = std::stoi(value);
             else if (key == "partial_interval_ms") params.partial_interval_ms = std::stoi(value);
             else if (key == "min_partial_audio_ms") params.min_partial_audio_ms = std::stoi(value);
+            else if (key == "min_speech_snr") params.min_speech_snr = std::stof(value);
+            else if (key == "min_speech_rms") params.min_speech_rms = std::stof(value);
             else if (key == "endpoint_hold_ms") params.endpoint_hold_ms = std::stoi(value);
             else if (key == "endpoint_hold_incomplete_ms") params.endpoint_hold_incomplete_ms = std::stoi(value);
             else if (key == "speech_pad_ms") params.speech_pad_ms = std::stoi(value);
@@ -215,6 +239,10 @@ struct VoiceLiveRunner::Impl {
     std::string last_growth_hypothesis;
     int hypothesis_stalls = 0;
     int64_t endpoint_likely_utt = -1;
+    // Loudness gating state. The floor starts at a typical clean-mic value and
+    // converges to the real room within a second of idle audio.
+    std::atomic<float> noise_floor_rms{0.004F};
+    float utterance_peak_rms = 0.0F;
 
     void emit(const std::string & json) {
         if (hooks.emit) {
@@ -306,7 +334,8 @@ struct VoiceLiveRunner::Impl {
             for (size_t i = job.audio.samples.size() - tail; i < job.audio.samples.size(); ++i) {
                 energy += static_cast<double>(job.audio.samples[i]) * job.audio.samples[i];
             }
-            tail_quiet = energy / tail < 1.6e-5;  // rms < ~0.004 full scale
+            const double quiet_rms = std::max(0.004F, 1.5F * noise_floor_rms.load());
+            tail_quiet = energy / tail < quiet_rms * quiet_rms;
         }
         if (tail_quiet && !result.text.empty()) {
             std::lock_guard<std::mutex> lock(decode_mutex);
@@ -411,6 +440,7 @@ struct VoiceLiveRunner::Impl {
         last_growth_hypothesis.clear();
         hypothesis_stalls = 0;
         endpoint_likely_utt = -1;
+        utterance_peak_rms = 0.0F;
         {
             std::lock_guard<std::mutex> lock(decode_mutex);
             utterance = preroll;
@@ -456,6 +486,22 @@ struct VoiceLiveRunner::Impl {
         speaking = false;
         pending_end = false;
         gap_buffer.clear();
+        // Loudness gate: an "utterance" that never rose meaningfully above the
+        // room's own noise is room tone the VAD misread. Transcribing it is
+        // worse than dropping it -- the ASR answers noise with confident
+        // fragments, which then speculate replies and speak them aloud.
+        const float gate = std::max(params.min_speech_rms,
+                                    params.min_speech_snr * noise_floor_rms.load());
+        if (params.min_speech_snr > 0.0F && utterance_peak_rms < gate) {
+            emit_event("speech_discarded", utterance_id,
+                       "\"reason\":\"below_noise_gate\",\"peak_rms\":" +
+                           format_rms(utterance_peak_rms) + ",\"gate_rms\":" + format_rms(gate));
+            std::lock_guard<std::mutex> lock(decode_mutex);
+            utterance.clear();
+            candidate_valid = false;
+            latest_hypothesis.clear();
+            return;
+        }
         emit_event("speech_ended", utterance_id);
         // If the speculative final already decoded the frozen utterance, it
         // IS the final -- no second decode.
@@ -533,6 +579,20 @@ struct VoiceLiveRunner::Impl {
                         vad_event.voice_activity.end(),
                         window_event.voice_activity.begin(),
                         window_event.voice_activity.end());
+                }
+
+                const float block_rms = rms_of(block);
+                if (speaking) {
+                    utterance_peak_rms = std::max(utterance_peak_rms, block_rms);
+                } else {
+                    // Idle audio IS the noise floor. Track it as a fast-down,
+                    // slow-up envelope so a quiet room lowers the gate within
+                    // a second while a passing truck cannot raise it enough to
+                    // deafen the next sentence.
+                    const float floor_now = noise_floor_rms.load();
+                    noise_floor_rms.store(block_rms < floor_now
+                        ? 0.90F * floor_now + 0.10F * block_rms
+                        : 0.995F * floor_now + 0.005F * block_rms);
                 }
 
                 if (speaking && pending_end) {

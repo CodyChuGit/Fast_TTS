@@ -40,6 +40,16 @@ struct TurnParams {
     // would just have to disbelieve.
     int min_partial_audio_ms = 700;
     int speech_pad_ms = 240;     // audio retained from before the VAD trigger
+    // Loudness gate, in multiples of the measured noise floor. A microphone's
+    // hiss is steady and its speech is not: a controller headset mic measured
+    // a floor of ~0.035 RMS with real speech at 0.14-0.57, so an utterance
+    // whose loudest moment never rises this far above the floor is room tone
+    // the VAD mistook for voice, and is dropped without transcription (the
+    // ASR hallucinates confident fragments on noise). Zero disables the gate.
+    float min_speech_snr = 3.0F;
+    // Absolute floor for that gate, so a silent studio mic (noise floor near
+    // zero) still requires real signal before an utterance is accepted.
+    float min_speech_rms = 0.012F;
     StabilityParams stability;
     std::string language;        // empty = auto-detect
 };
