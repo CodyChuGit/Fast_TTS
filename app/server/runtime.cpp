@@ -2789,6 +2789,14 @@ void ServerState::start_chat_speculation(
                 // sentence makes her timbre drift within one reply.
                 fields.emplace("seed", Value::make_number(
                     static_cast<double>(tts_seed >= 0 ? tts_seed : 777)));
+                // Bound the synthesis to the text: a noisy reference voice
+                // can make end-of-speech unreliable, and an unbounded talker
+                // once generated 655 SECONDS of audio from one sentence.
+                // ~0.85 codec frames/char is natural EN pace; x4 covers CJK
+                // and slow deliveries with margin while capping a runaway at
+                // seconds instead of minutes.
+                fields.emplace("max_tokens", Value::make_number(static_cast<double>(
+                    std::min<int64_t>(720, 48 + 4 * static_cast<int64_t>(spoken.size())))));
                 const auto speech_body = Value::make_object(std::move(fields));
                 auto request = build_speech_request(*model, speech_body);
                 request.options["stream_accumulate"] = "false";
@@ -3241,6 +3249,9 @@ void ServerState::chat_orchestrate(
                 // above: random seeds make short sentences a quality lottery.
                 fields.emplace("seed", Value::make_number(
                     static_cast<double>(tts_seed >= 0 ? tts_seed : 777)));
+                // Same runaway bound as the speculative writer above.
+                fields.emplace("max_tokens", Value::make_number(static_cast<double>(
+                    std::min<int64_t>(720, 48 + 4 * static_cast<int64_t>(spoken.size())))));
                 const auto speech_body = Value::make_object(std::move(fields));
                 auto request = build_speech_request(model, speech_body);
                 request.options["stream_accumulate"] = "false";

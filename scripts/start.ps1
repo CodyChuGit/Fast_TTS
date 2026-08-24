@@ -690,6 +690,9 @@ if (-not $SkipWarmup -and -not $LlmOnly) {
                 decoder_context_frames = 25
                 stream_accumulate = $false
                 seed = 777
+                # Bounded: an unbounded warm once ran away for minutes with a
+                # noisy reference voice and wedged the whole boot.
+                max_tokens = 400
             }
             $characterResponse = Invoke-WebRequest -Uri "$baseUrl/v1/audio/speech" -Method Post `
                 -ContentType "application/json" -Body ($characterWarm | ConvertTo-Json -Compress) `
