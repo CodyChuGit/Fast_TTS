@@ -209,6 +209,12 @@ struct VoiceLiveRunner::Impl {
 
     StableTracker tracker{StabilityParams{}};
     std::string last_partial_emitted;
+    // Endpoint anticipation state (docs/speech-endpoint-anticipation.md):
+    // consecutive re-decodes with an unchanged, complete-looking hypothesis
+    // predict the endpoint before the VAD silence + hold path detects it.
+    std::string last_growth_hypothesis;
+    int hypothesis_stalls = 0;
+    int64_t endpoint_likely_utt = -1;
 
     void emit(const std::string & json) {
         if (hooks.emit) {
@@ -335,6 +341,29 @@ struct VoiceLiveRunner::Impl {
                 "partial_transcript", job.utterance_id,
                 "\"text\":\"" + json_escape(tentative) + "\"");
         }
+        // Endpoint anticipation: while the VAD still reports speech, a
+        // hypothesis that has stopped growing across consecutive re-decodes
+        // AND looks complete usually is complete -- the speaker is inside
+        // their final word or the pre-endpoint pause. Firing here beats the
+        // silence + hold trigger by one or more re-decode cycles; the client
+        // treats it as a speculation trigger only, never an endpoint. Growth
+        // after a fire re-arms it (newest-wins speculation coalescing on the
+        // client absorbs the superseded fire).
+        if (result.text == last_growth_hypothesis) {
+            ++hypothesis_stalls;
+        } else {
+            last_growth_hypothesis = result.text;
+            hypothesis_stalls = 0;
+            if (endpoint_likely_utt == job.utterance_id) {
+                endpoint_likely_utt = -1;
+            }
+        }
+        if (hypothesis_stalls >= 1 && endpoint_likely_utt != job.utterance_id &&
+            !hypothesis_looks_incomplete(result.text)) {
+            endpoint_likely_utt = job.utterance_id;
+            emit_event("endpoint_likely", job.utterance_id,
+                       "\"text\":\"" + json_escape(result.text) + "\"");
+        }
     }
 
     void enqueue_decode(bool final, bool candidate_job = false) {
@@ -379,6 +408,9 @@ struct VoiceLiveRunner::Impl {
         first_stable_ms = -1;
         tracker.reset();
         last_partial_emitted.clear();
+        last_growth_hypothesis.clear();
+        hypothesis_stalls = 0;
+        endpoint_likely_utt = -1;
         {
             std::lock_guard<std::mutex> lock(decode_mutex);
             utterance = preroll;
