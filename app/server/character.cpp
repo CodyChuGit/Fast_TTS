@@ -261,6 +261,14 @@ std::string render_master_prompt(
     const std::string & name,
     const std::string & persona) {
     std::string prompt = settings.master_prompt;
+    // A hand-edited master prompt that lost its {persona} placeholder would
+    // silently play every character as whoever the prompt names -- a HAL that
+    // insisted it was not a controller, because its persona never reached the
+    // model. The character always wins: if the template cannot say who they
+    // are, prepend it.
+    if (!persona.empty() && prompt.find("{persona}") == std::string::npos) {
+        prompt = "You are {name}. " + persona + "\n\n" + prompt;
+    }
     for (const auto & [placeholder, value] : {
              std::pair<std::string, const std::string &>{"{name}", name},
              std::pair<std::string, const std::string &>{"{persona}", persona},

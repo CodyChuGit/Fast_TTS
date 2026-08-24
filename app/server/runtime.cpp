@@ -1722,6 +1722,9 @@ HttpResponse ServerState::handle_character_get() {
     if (!character.persona.empty()) {
         body += ",\"persona\":" + json_quote(character.persona);
     }
+    if (character.tts_seed >= 0) {
+        body += ",\"tts_seed\":" + std::to_string(character.tts_seed);
+    }
     body += ",\"available_presets\":" + presets + "}";
     return json_response(body);
 }
