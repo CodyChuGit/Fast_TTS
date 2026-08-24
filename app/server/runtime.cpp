@@ -340,6 +340,17 @@ std::vector<uint8_t> encode_pcm16_samples(const engine::runtime::AudioBuffer & a
     return out;
 }
 
+// Unicode codepoints in a UTF-8 string: the unit synthesis budgets scale
+// with. Bytes overshoot 3x on CJK, which turned the runaway cap into a
+// 38-second allowance for a 36-character Chinese sentence.
+size_t utf8_codepoints(const std::string & text) {
+    size_t count = 0;
+    for (const unsigned char ch : text) {
+        count += (ch & 0xC0) != 0x80;
+    }
+    return count;
+}
+
 void write_sse(HttpStreamWriter & writer, const std::string & json) {
     writer.write("data: " + json + "\n\n");
 }
@@ -1747,6 +1758,14 @@ HttpResponse ServerState::handle_character_set(const HttpRequest & request) {
                     character.transcript = part.data;
                 } else if (part.name == "persona") {
                     character.persona = part.data;
+                } else if (part.name == "tts_seed") {
+                    // A new recording resets the curated seed unless the
+                    // uploader provides one: seeds are voice-coupled.
+                    try {
+                        character.tts_seed = std::stoll(part.data);
+                    } catch (const std::exception &) {
+                        character.tts_seed = -1;
+                    }
                 }
             }
             if (file_part == nullptr || file_part->data.empty()) {
@@ -2406,7 +2425,14 @@ HttpResponse ServerState::handle_chat_speak(const std::string & body_text) {
         ? explicit_max->as_i64()
         : ramped_max_tokens(settings, assistant_turns);
     const int64_t llm_seed = engine::io::json::optional_i64(body, "seed", -1);
-    const int64_t tts_seed = engine::io::json::optional_i64(body, "tts_seed", -1);
+    // Seed precedence: explicit request > the character's curated seed > the
+    // app default (777, applied downstream). Seeds are a per-voice, even
+    // per-language lottery, so a character ships with the seed that measured
+    // stable for ITS reference.
+    int64_t tts_seed = engine::io::json::optional_i64(body, "tts_seed", -1);
+    if (tts_seed < 0 && character.tts_seed >= 0) {
+        tts_seed = character.tts_seed;
+    }
     // A prewarm request is the same conversation the client is ABOUT to send:
     // the draft the user is still typing rides as the newest message, and the
     // sidecar prefills it in the background. Each successive prewarm extends
@@ -2796,7 +2822,8 @@ void ServerState::start_chat_speculation(
                 // and slow deliveries with margin while capping a runaway at
                 // seconds instead of minutes.
                 fields.emplace("max_tokens", Value::make_number(static_cast<double>(
-                    std::min<int64_t>(720, 48 + 4 * static_cast<int64_t>(spoken.size())))));
+                    std::min<int64_t>(720,
+                        48 + 4 * static_cast<int64_t>(utf8_codepoints(spoken))))));
                 const auto speech_body = Value::make_object(std::move(fields));
                 auto request = build_speech_request(*model, speech_body);
                 request.options["stream_accumulate"] = "false";
@@ -3251,7 +3278,8 @@ void ServerState::chat_orchestrate(
                     static_cast<double>(tts_seed >= 0 ? tts_seed : 777)));
                 // Same runaway bound as the speculative writer above.
                 fields.emplace("max_tokens", Value::make_number(static_cast<double>(
-                    std::min<int64_t>(720, 48 + 4 * static_cast<int64_t>(spoken.size())))));
+                    std::min<int64_t>(720,
+                        48 + 4 * static_cast<int64_t>(utf8_codepoints(spoken))))));
                 const auto speech_body = Value::make_object(std::move(fields));
                 auto request = build_speech_request(model, speech_body);
                 request.options["stream_accumulate"] = "false";

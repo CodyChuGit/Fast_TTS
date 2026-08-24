@@ -27,6 +27,11 @@ struct CharacterConfig {
     // model voices them. Empty means a generic in-character prompt is built
     // from the name.
     std::string persona;
+    // The pinned synthesis seed for this voice. Seeds are a per-voice quality
+    // lottery (a reference can be stable on one seed and babble on another,
+    // measured per language); -1 means the app default. Curate per character
+    // with a duration-band scan across candidate seeds.
+    long long tts_seed = -1;
 
     bool is_custom() const { return !voice_file.empty(); }
 };
