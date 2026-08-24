@@ -73,10 +73,19 @@ export class DualSenseLight {
       if (!device) return false;
       if (!device.opened) await device.open();
       this.device = device;
-      // Bluetooth exposes the big 0x31 output report; USB exposes 0x02.
-      this.bluetooth = !device.collections.some((c) =>
-        (c.outputReports ?? []).some((r) => r.reportId === 0x02)
-      );
+      // Bluetooth exposes the big 0x31 output report; USB exposes 0x02. The
+      // descriptor is the hint, but some HID stacks do not enumerate output
+      // reports at all, so the real test is whether a write succeeds.
+      const reports = device.collections.flatMap((c) => c.outputReports ?? []);
+      this.bluetooth =
+        reports.length > 0 && !reports.some((r) => r.reportId === 0x02);
+      if (!(await this.probe())) {
+        this.bluetooth = !this.bluetooth;
+        if (!(await this.probe())) {
+          this.device = null;
+          return false;
+        }
+      }
       this.start();
       return true;
     } catch {
@@ -144,10 +153,37 @@ export class DualSenseLight {
     }
   }
 
+  // One write, reporting success -- used to settle the transport question
+  // before the animation loop starts (where failures are silent by design).
+  private async probe(): Promise<boolean> {
+    const device = this.device;
+    if (!device) return false;
+    try {
+      await this.send(device, 40, 0, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async write(r: number, g: number, b: number): Promise<void> {
     const device = this.device;
     if (!device || !device.opened) return;
     try {
+      await this.send(device, r, g, b);
+    } catch {
+      // Unplugged mid-frame, or the report was rejected: stop animating
+      // rather than throwing on every tick.
+      if (this.timer !== null) {
+        clearInterval(this.timer);
+        this.timer = null;
+      }
+      this.device = null;
+    }
+  }
+
+  private async send(device: HIDDevice, r: number, g: number, b: number): Promise<void> {
+    {
       if (this.bluetooth) {
         // Report 0x31: one leading flag byte, the USB body shifted by one,
         // then a CRC32 over the 0xA2 seed plus the whole report.
@@ -183,14 +219,6 @@ export class DualSenseLight {
         data[46] = b;
         await device.sendReport(0x02, data);
       }
-    } catch {
-      // Unplugged mid-frame, or the report was rejected: stop animating
-      // rather than throwing on every tick.
-      if (this.timer !== null) {
-        clearInterval(this.timer);
-        this.timer = null;
-      }
-      this.device = null;
     }
   }
 }

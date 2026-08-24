@@ -763,14 +763,16 @@ void handle_client(SocketHandle client, IHttpHandler & handler, uint64_t max_req
             try {
                 response.stream_body(writer);
             } catch (const std::exception & ex) {
+                // Always record it. Reporting a stream failure to the client
+                // is best-effort -- the client is often the reason it failed
+                // -- so the log is the only place the cause survives.
+                std::cerr << "audiocpp_server streaming response failed: " << ex.what() << "\n";
                 if (response.content_type.rfind("text/event-stream", 0) == 0) {
                     const std::string data =
                         "data: {\"type\":\"error\",\"error\":{\"message\":" +
                         json_quote(ex.what()) +
                         "}}\n\n";
                     writer.write(data);
-                } else {
-                    std::cerr << "audiocpp_server streaming response failed: " << ex.what() << "\n";
                 }
             }
             writer.finish();
@@ -778,10 +780,14 @@ void handle_client(SocketHandle client, IHttpHandler & handler, uint64_t max_req
             send_all(socket.get(), serialize_response(response));
         }
     } catch (const std::exception & ex) {
+        // The cause first: a request that failed AND lost its client used to
+        // leave only "failed to send error response" behind, which says
+        // nothing about what went wrong.
+        std::cerr << "audiocpp_server request failed: " << ex.what() << "\n";
         try {
             send_all(socket.get(), serialize_response(error_response(500, ex.what(), "server_error")));
         } catch (const std::exception & send_error) {
-            std::cerr << "audiocpp_server failed to send error response: " << send_error.what() << "\n";
+            std::cerr << "  (could not report it to the client: " << send_error.what() << ")\n";
         }
     }
 }
