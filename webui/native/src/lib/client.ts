@@ -335,6 +335,10 @@ export interface LlmSettings {
   // Empty model + empty models means the server does not manage the sidecar.
   model: string;
   models: LlmModelOption[];
+  // False when the running model's KV cache cannot rewind to a divergence
+  // point: speculating on an evolving transcript then costs a full prompt
+  // pass per revision instead of a cheap extension.
+  cache_rollback?: boolean;
 }
 
 export function getLlmSettings(): Promise<LlmSettings> {

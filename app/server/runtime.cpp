@@ -2138,6 +2138,11 @@ std::string ServerState::llm_settings_json() const {
     // could be. Empty registry (launcher-owned sidecar) reports no models and
     // the UI hides the picker.
     std::string current = llm_manager_ ? llm_manager_->current_model_id() : std::string();
+    // Whether the running model's KV cache can rewind to a divergence point.
+    // Clients use it to decide whether speculating on an evolving draft (or a
+    // growing transcript) is cheap or costs a full prompt pass every time.
+    out << ",\"cache_rollback\":"
+        << (active_llm_cache_rollback() ? "true" : "false");
     out << ",\"model\":" << json_quote(current) << ",\"models\":[";
     bool first = true;
     for (const auto & spec : config_.llm_models) {
