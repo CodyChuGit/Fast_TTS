@@ -387,16 +387,37 @@ if (Test-Path -LiteralPath $ollamaDir) {
         # when IT starts, which is before the TTS has captured its graphs, so
         # a 17 GB model happily takes the card to the paging cliff and leaves
         # the voice nothing.
+        # The budget, not the file size, is what matters: the voice stack holds
+        # ~5.5 GB and the paging cliff is ~23.8 GB, so llama has ~17.5 GB to
+        # work with and anything up to ~15.5 GB of weights can sit entirely on
+        # the card. Only what cannot fit gets layers pushed to the CPU.
         $gb = $gguf.Length / 1GB
-        $ngl = if ($gb -gt 14) { "46" } elseif ($gb -gt 10) { "60" } else { "99" }
+        $ngl = if ($gb -gt 15.5) { "46" } else { "99" }
         $llmModels += , [ordered]@{
             id = $slug
             name = ("{0} ({1:N0} GB)" -f $gguf.BaseName, $gb)
             path = ($gguf.FullName -replace "\\", "/")
             # --reasoning-budget is ignored by some templates; the kwarg is
             # what actually silences the thinking block on these.
-            extra_args = @("-ngl", $ngl, "-ub", "2048", "--reasoning-budget", "0",
+            extra_args = @("-ngl", $ngl, "-ub", "1024", "--reasoning-budget", "0",
                 "--chat-template-kwargs", '{"enable_thinking":false}')
+        }
+        # A build that kept its multi-token-prediction head (MTP in the file
+        # name) can draft its own continuations: the head lives in the same
+        # file, so it is both model and drafter. Registered as a separate
+        # entry rather than a default, because acceptance -- and therefore
+        # whether it wins anything -- depends on what is being written.
+        if ($gguf.BaseName -match "MTP") {
+            $llmModels += , [ordered]@{
+                id = ($slug + "-mtp")
+                name = ("{0} + MTP ({1:N0} GB)" -f $gguf.BaseName, $gb)
+                path = ($gguf.FullName -replace "\\", "/")
+                extra_args = @("-ngl", "58", "-ub", "512", "--reasoning-budget", "0",
+                    "--chat-template-kwargs", '{"enable_thinking":false}',
+                    "--spec-type", "draft-mtp", "-md", ($gguf.FullName -replace "\\", "/"),
+                    "-ngld", "99", "-ctkd", "q8_0", "-ctvd", "q8_0",
+                    "--spec-draft-n-max", "4", "--spec-draft-n-min", "1")
+            }
         }
     }
 }
