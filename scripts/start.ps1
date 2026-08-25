@@ -380,11 +380,23 @@ $ollamaDir = Join-Path $repoRoot "models\ollama"
 if (Test-Path -LiteralPath $ollamaDir) {
     foreach ($gguf in Get-ChildItem -LiteralPath $ollamaDir -Filter *.gguf -File | Sort-Object Name) {
         $slug = ($gguf.BaseName -replace "[^A-Za-z0-9]+", "-").ToLower().Trim("-")
+        # Two things every imported model needs. Thinking OFF: a reasoning
+        # model spends its whole budget in reasoning_content and answers with
+        # an empty string, which reaches the speaker as silence. And a layer
+        # cap for the big ones: llama.cpp fits layers to the VRAM that is free
+        # when IT starts, which is before the TTS has captured its graphs, so
+        # a 17 GB model happily takes the card to the paging cliff and leaves
+        # the voice nothing.
+        $gb = $gguf.Length / 1GB
+        $ngl = if ($gb -gt 14) { "46" } elseif ($gb -gt 10) { "60" } else { "99" }
         $llmModels += , [ordered]@{
             id = $slug
-            name = ("{0} ({1:N0} GB)" -f $gguf.BaseName, ($gguf.Length / 1GB))
+            name = ("{0} ({1:N0} GB)" -f $gguf.BaseName, $gb)
             path = ($gguf.FullName -replace "\\", "/")
-            extra_args = @("-ub", "2048")
+            # --reasoning-budget is ignored by some templates; the kwarg is
+            # what actually silences the thinking block on these.
+            extra_args = @("-ngl", $ngl, "-ub", "2048", "--reasoning-budget", "0",
+                "--chat-template-kwargs", '{"enable_thinking":false}')
         }
     }
 }
