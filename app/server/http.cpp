@@ -728,9 +728,13 @@ UniqueSocket bind_listen_socket(const std::string & host, int port) {
 
 void handle_client(SocketHandle client, IHttpHandler & handler, uint64_t max_request_body_bytes) {
     UniqueSocket socket(client);
+    // Named outside the try so a failure can say which request it was: the
+    // request object itself does not survive into the catch.
+    std::string request_label = "(request not read)";
     try {
         std::string leftover;
         auto request = read_http_request(socket.get(), max_request_body_bytes, leftover);
+        request_label = request.method + " " + request.path;
         const bool incremental_body = wants_incremental_body(request);
         // Asked for once, before the stream exists, because the streambuf takes its
         // bounds at construction. The handler resolves them from server config and
@@ -766,7 +770,8 @@ void handle_client(SocketHandle client, IHttpHandler & handler, uint64_t max_req
                 // Always record it. Reporting a stream failure to the client
                 // is best-effort -- the client is often the reason it failed
                 // -- so the log is the only place the cause survives.
-                std::cerr << "audiocpp_server streaming response failed: " << ex.what() << "\n";
+                std::cerr << "audiocpp_server streaming response failed: " << request_label
+                          << ": " << ex.what() << "\n";
                 if (response.content_type.rfind("text/event-stream", 0) == 0) {
                     const std::string data =
                         "data: {\"type\":\"error\",\"error\":{\"message\":" +
@@ -783,7 +788,8 @@ void handle_client(SocketHandle client, IHttpHandler & handler, uint64_t max_req
         // The cause first: a request that failed AND lost its client used to
         // leave only "failed to send error response" behind, which says
         // nothing about what went wrong.
-        std::cerr << "audiocpp_server request failed: " << ex.what() << "\n";
+        std::cerr << "audiocpp_server request failed: " << request_label << ": "
+                  << ex.what() << "\n";
         try {
             send_all(socket.get(), serialize_response(error_response(500, ex.what(), "server_error")));
         } catch (const std::exception & send_error) {
