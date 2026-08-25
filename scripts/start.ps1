@@ -392,7 +392,11 @@ if (Test-Path -LiteralPath $ollamaDir) {
         # work with and anything up to ~15.5 GB of weights can sit entirely on
         # the card. Only what cannot fit gets layers pushed to the CPU.
         $gb = $gguf.Length / 1GB
-        $ngl = if ($gb -gt 15.5) { "46" } else { "99" }
+        # Measured, not estimated: llama needs about 2.6 GB beyond the weights
+        # for KV and compute, the voice holds ~5.5 GB, and paging starts near
+        # 23.5 GB of the card. A 15.4 GB model at full offload measured 23.6 GB
+        # and collapsed to 0.7 t/s, so the ceiling for full residency is 14.5.
+        $ngl = if ($gb -gt 14.5) { "46" } else { "99" }
         $llmModels += , [ordered]@{
             id = $slug
             name = ("{0} ({1:N0} GB)" -f $gguf.BaseName, $gb)
