@@ -93,6 +93,14 @@ void test_speech_markup_is_stripped_for_tts() {
     const auto unbalanced = strip_speech_markup("*She leans in. Are you coming or not?");
     require(unbalanced.find("Are you coming") != std::string::npos,
         "an unbalanced action marker does not silence the speech");
+    // Emoji are written, never spoken: read aloud they become a word, or a
+    // token the synthesiser has no sound for at all.
+    require(strip_speech_markup("Yay, boba! \xF0\x9F\x92\x96\xE2\x9C\xA8") == "Yay, boba!",
+        "emoji and pictographs are not read aloud");
+    require(strip_speech_markup("Sun \xE2\x98\x80\xEF\xB8\x8F today.") == "Sun  today.",
+        "a variation selector leaves nothing behind either");
+    require(strip_speech_markup("Cost is 50\xE2\x82\xAC today.") == "Cost is 50\xE2\x82\xAC today.",
+        "ordinary non-Latin characters still speak");
 }
 
 void test_a_runon_opener_is_cut_at_a_word_boundary() {

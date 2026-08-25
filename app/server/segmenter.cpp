@@ -198,6 +198,30 @@ std::string strip_speech_markup(const std::string & text) {
         if (ch == '#' || ch == '`') {
             continue;  // Markdown noise.
         }
+        // Emoji and other pictographs are written, never spoken: a model that
+        // ends a line with a sparkle either has it read out as a word or
+        // hands the synthesiser a token it has no sound for. Drop the whole
+        // UTF-8 sequence, and any variation selector or zero-width joiner
+        // trailing it, so a compound emoji leaves nothing behind.
+        const auto lead = static_cast<unsigned char>(ch);
+        if (lead >= 0xF0) {
+            // Four-byte sequences: U+1F300 and up is emoji territory.
+            index += 3;
+            continue;
+        }
+        if (lead == 0xE2 && index + 2 < text.size()) {
+            const auto second = static_cast<unsigned char>(text[index + 1]);
+            // U+2600-27BF: miscellaneous symbols and dingbats.
+            if (second >= 0x98 && second <= 0x9E) {
+                index += 2;
+                continue;
+            }
+        }
+        if (lead == 0xEF && index + 2 < text.size() &&
+            static_cast<unsigned char>(text[index + 1]) == 0xB8) {
+            index += 2;  // variation selectors, U+FE00-FE0F
+            continue;
+        }
         out += ch;
     }
     // An unbalanced '*' would have swallowed real speech; better to read the
