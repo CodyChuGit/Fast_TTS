@@ -694,6 +694,7 @@ add_executable(audiocpp_server
     app/server/chat_hygiene.cpp
     app/server/config.cpp
     app/server/voice.cpp
+    app/server/voice_identity.cpp
     app/server/voice_stability.cpp
     app/server/http.cpp
     app/server/llm_client.cpp

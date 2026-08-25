@@ -7,6 +7,7 @@
 #include "llm_manager.h"
 #include "mcp.h"
 #include "voice.h"
+#include "voice_identity.h"
 
 #include "../streaming/streaming.h"
 
@@ -190,6 +191,9 @@ private:
     bool active_llm_cache_rollback() const;
     // The active character's name, for spoken-name normalization.
     std::string character_name_for_speech() const;
+    // What the active character is supposed to sound like, summarised from
+    // their reference recording and cached until the character changes.
+    const VoiceProfile & reference_voice_profile() const;
     // Stops the running sidecar, starts `spec`, and blocks until its /health
     // reports the model loaded. On failure the previous model is restarted.
     // Serialized by llm_switch_mutex_.
@@ -318,6 +322,9 @@ private:
     int llm_generations_active_ = 0;
     // Serializes appends to data/typing_episodes.jsonl.
     std::mutex typing_log_mutex_;
+    mutable std::mutex reference_voice_mutex_;
+    mutable std::string reference_voice_key_;
+    mutable VoiceProfile reference_voice_profile_;
     // Rolling decode rate of the active sidecar model (tokens/sec), fed by
     // every finished generation. The opener segmenter reads it: a slow
     // decoder gets a shorter first cut so time-to-first-audio stays bounded

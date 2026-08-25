@@ -1,5 +1,7 @@
 #include "runtime.h"
 
+#include "voice_identity.h"
+
 #include "base64.h"
 #include "llm_client.h"
 #include "segmenter.h"
@@ -391,6 +393,13 @@ std::string speak_name_as_written(std::string text, const std::string & name) {
     }
     return text;
 }
+
+// How much the opening of a short line must resemble the character before it
+// is allowed through. Calibrated against this measure's own distribution over
+// real replies: takes in the character's voice cluster at 0.88-0.96, the
+// impostors at 0.69-0.75. The gap is wide and empty, so the threshold sits in
+// the middle of it and neither waits on good audio nor passes a stranger.
+constexpr float kVoiceIdentityFloor = 0.80F;
 
 void write_sse(HttpStreamWriter & writer, const std::string & json) {
     writer.write("data: " + json + "\n\n");
@@ -1856,6 +1865,13 @@ HttpResponse ServerState::handle_character_set(const HttpRequest & request) {
                 persona != nullptr && persona->is_string()) {
                 character.persona = persona->as_string();
             }
+            // The curated synthesis seed is editable here too. Without this,
+            // a JSON edit silently kept the old seed while reporting success,
+            // which hid a voice that drifted to a different speaker.
+            if (const auto * seed = body.find("tts_seed");
+                seed != nullptr && seed->is_number()) {
+                character.tts_seed = seed->as_i64();
+            }
             if (character.preset.empty() && !character.is_custom()) {
                 throw std::runtime_error("the character needs a voice: name a 'preset' or upload a recording");
             }
@@ -2236,6 +2252,32 @@ HttpResponse ServerState::handle_typing_telemetry(const std::string & body_text)
                std::chrono::system_clock::now().time_since_epoch()).count()
         << ",\"episode\":" << body_text << "}\n";
     return json_response("{\"status\":\"recorded\"}");
+}
+
+// The character's own reference recording, summarised once: what the voice is
+// supposed to sound like. Recomputed whenever the character changes.
+const VoiceProfile & ServerState::reference_voice_profile() const {
+    std::lock_guard<std::mutex> lock(reference_voice_mutex_);
+    std::string current;
+    {
+        std::lock_guard<std::mutex> character_lock(character_mutex_);
+        current = character_.voice_file.empty() ? character_.preset : character_.voice_file;
+        current += "|" + character_.name;
+    }
+    if (current != reference_voice_key_) {
+        reference_voice_key_ = current;
+        reference_voice_profile_ = VoiceProfile{};
+        auto * model = const_cast<ServerState *>(this)->find_speech_model();
+        if (model != nullptr) {
+            std::shared_lock<std::shared_mutex> meta(model->metadata_mutex);
+            if (model->default_voice_preset.has_value() &&
+                model->default_voice_preset->audio.has_value()) {
+                const auto & audio = *model->default_voice_preset->audio;
+                reference_voice_profile_ = voice_profile(audio.samples, audio.sample_rate);
+            }
+        }
+    }
+    return reference_voice_profile_;
 }
 
 // The active character's name, for spoken-name normalization.
@@ -2834,7 +2876,7 @@ void ServerState::start_chat_speculation(
         // fuller clause than the miss path's 16 without pushing the first
         // sound noticeably later; a settled hover-hit plays it instantly
         // either way.
-        SentenceSegmenter segmenter(SentenceSegmenter::Options{28, 56, 300});
+        SentenceSegmenter segmenter(SentenceSegmenter::Options{40, 64, 300});
         hygiene::StreamScrubber scrubber;
         // Synthesizes one sentence into the speculation buffer unless another
         // trigger got there first (the audio_state handoff below). The settle
@@ -3146,12 +3188,12 @@ void ServerState::chat_orchestrate(
         // before synthesis exists to contend with, plays ~4 s of runway,
         // and carries natural prosody. ~1 s later to first sound, clean
         // from the first word on.
-        // One opener for every model: the 16-char clause cut. Slow decoders
-        // used to need a longer opener, but the real thief was synthesis
-        // sprinting ahead of playback and starving decode on the shared GPU
-        // -- the realtime-aware throttle in the synthesis sink fixes the
-        // cause, and the client's paced reserve absorbs what remains.
-        SentenceSegmenter segmenter(SentenceSegmenter::Options{16, 28, 300});
+        // The opener is cut early because time-to-first-sound is set by it
+        // alone. Short openers are also where the TTS can lose hold of WHO is
+        // speaking -- but that is now caught and re-made in the synthesis
+        // path, so the cut can stay short for latency instead of being padded
+        // out for safety. 24 characters buys a clause without the wait.
+        SentenceSegmenter segmenter(SentenceSegmenter::Options{24, 48, 300});
         hygiene::StreamScrubber scrubber;
         auto emit = [&](const std::string & clean) {
             if (clean.empty()) {
@@ -3327,20 +3369,41 @@ void ServerState::chat_orchestrate(
                     // Synthesis failed or produced nothing; fall through and
                     // synthesize this sentence normally.
                 }
-                Value::Object fields;
-                fields.emplace("input", Value::make_string(spoken));
-                // Pinned for the same reason as the speculative synthesis
-                // above: random seeds make short sentences a quality lottery.
-                fields.emplace("seed", Value::make_number(
-                    static_cast<double>(tts_seed >= 0 ? tts_seed : 777)));
-                // Same runaway bound as the speculative writer above.
-                fields.emplace("max_tokens", Value::make_number(static_cast<double>(
-                    std::min<int64_t>(720,
-                        48 + 4 * static_cast<int64_t>(utf8_codepoints(spoken))))));
-                const auto speech_body = Value::make_object(std::move(fields));
-                auto request = build_speech_request(model, speech_body);
-                request.options["stream_accumulate"] = "false";
-                run_streaming_model(model, request, [&](const engine::runtime::StreamEvent & stream_event) {
+                // A short line is where the voice can slip: below about a
+                // second and a half the TTS intermittently renders someone
+                // else, the same text and seed giving a stranger on one run
+                // and the character on the next. Such a line is quick to make,
+                // so it is made in full, checked against the character's own
+                // reference, and re-made once if it came out wrong. Nobody
+                // hears the bad take. Longer lines stream as they always have:
+                // they do not drift, and they are what first audio waits on.
+                const bool verify_voice =
+                    utf8_codepoints(spoken) <= 48 && reference_voice_profile().mel_mean.size() > 0;
+                std::vector<std::vector<uint8_t>> held;
+                std::vector<float> held_samples;
+                int64_t held_rate = 24000;
+                bool voice_cleared = false;
+                auto emit_pcm = [&](const std::vector<uint8_t> & pcm) {
+                    if (first_audio_ms < 0) {
+                        first_audio_ms = elapsed();
+                    }
+                    audio_bytes += pcm.size();
+                    write_sse(writer, "{\"type\":\"audio\",\"audio\":" + json_quote(base64_encode(pcm)) + "}");
+                };
+                auto synthesize = [&](long long seed) {
+                    held.clear();
+                    held_samples.clear();
+                    voice_cleared = false;
+                    // Rebuilt per attempt: a retry differs only by its seed.
+                    Value::Object attempt;
+                    attempt.emplace("input", Value::make_string(spoken));
+                    attempt.emplace("seed", Value::make_number(static_cast<double>(seed)));
+                    attempt.emplace("max_tokens", Value::make_number(static_cast<double>(
+                        std::min<int64_t>(720,
+                            48 + 4 * static_cast<int64_t>(utf8_codepoints(spoken))))));
+                    auto request = build_speech_request(model, Value::make_object(std::move(attempt)));
+                    request.options["stream_accumulate"] = "false";
+                    run_streaming_model(model, request, [&](const engine::runtime::StreamEvent & stream_event) {
                     drain_tokens();
                     std::vector<engine::runtime::AudioBuffer> buffers;
                     if (stream_event.audio_output.has_value()) {
@@ -3354,11 +3417,35 @@ void ServerState::chat_orchestrate(
                         if (pcm.empty()) {
                             continue;
                         }
-                        if (first_audio_ms < 0) {
-                            first_audio_ms = elapsed();
+                        if (verify_voice && !voice_cleared) {
+                            held.push_back(pcm);
+                            held_samples.insert(held_samples.end(),
+                                                audio.samples.begin(), audio.samples.end());
+                            held_rate = audio.sample_rate > 0 ? audio.sample_rate : held_rate;
+                            // Judge the opening moments rather than the whole
+                            // line: the voice is either right from the first
+                            // syllables or it is not, and waiting for the rest
+                            // would put a second of silence in front of every
+                            // short reply. Once cleared, the remainder streams
+                            // as normal.
+                            const size_t enough =
+                                static_cast<size_t>(static_cast<double>(held_rate) * 0.55);
+                            if (held_samples.size() >= enough) {
+                                const auto opening = voice_profile(held_samples, held_rate);
+                                const float like_them =
+                                    voice_similarity(opening, reference_voice_profile());
+                                engine::debug::timing_log_scalar("chat.voice.opening_similarity", like_them);
+                                if (like_them >= kVoiceIdentityFloor) {
+                                    voice_cleared = true;
+                                    for (const auto & queued : held) {
+                                        emit_pcm(queued);
+                                    }
+                                    held.clear();
+                                }
+                            }
+                        } else {
+                            emit_pcm(pcm);
                         }
-                        audio_bytes += pcm.size();
-                        write_sse(writer, "{\"type\":\"audio\",\"audio\":" + json_quote(base64_encode(pcm)) + "}");
                     }
                     // Realtime-aware pacing: the speakers play 1 s of audio
                     // per second no matter how fast it is synthesized, and a
@@ -3376,7 +3463,32 @@ void ServerState::chat_orchestrate(
                             std::this_thread::sleep_for(std::chrono::milliseconds(90));
                         }
                     }
-                });
+                    });
+                };
+                const long long base_seed = tts_seed >= 0 ? tts_seed : 777;
+                synthesize(base_seed);
+                if (verify_voice && !voice_cleared) {
+                    const auto spoke = voice_profile(held_samples, held_rate);
+                    const float like_them = voice_similarity(spoke, reference_voice_profile());
+                    // 0.85 sits between the same speaker (above ~0.93 in
+                    // measurement) and a different one (~0.75).
+                    engine::debug::timing_log_scalar("chat.voice.segment_similarity", like_them);
+                    if (like_them >= 0.0F && like_them < kVoiceIdentityFloor) {
+                        const auto wrong = held;
+                        synthesize(base_seed + 1);
+                        const auto retry_profile = voice_profile(held_samples, held_rate);
+                        const float retry_like = voice_similarity(retry_profile, reference_voice_profile());
+                        // Keep whichever take sounds more like the character;
+                        // a second miss is still better than the worse take.
+                        if (retry_like < like_them) {
+                            held = wrong;
+                        }
+                    }
+                    for (const auto & pcm : held) {
+                        drain_tokens();
+                        emit_pcm(pcm);
+                    }
+                }
             } else {
                 llm_finished = true;
                 llm_ok = event.ok;
