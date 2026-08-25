@@ -351,6 +351,47 @@ size_t utf8_codepoints(const std::string & text) {
     return count;
 }
 
+// A character's name is spoken the way it is written. Text-to-speech reads an
+// all-capital word as separate letters, so a model that writes HAL where the
+// character is called Hal turns a name into an initialism. Rewrites whole-word
+// case variants of each name token to the configured spelling. Tokens shorter
+// than three letters are left alone: a character called "F" must not rewrite
+// every stray f in the sentence.
+std::string speak_name_as_written(std::string text, const std::string & name) {
+    std::istringstream names(name);
+    std::string token;
+    while (names >> token) {
+        if (token.size() < 3 ||
+            !std::all_of(token.begin(), token.end(),
+                         [](unsigned char c) { return std::isalpha(c) != 0; })) {
+            continue;
+        }
+        const auto is_word_char = [](char c) {
+            const auto u = static_cast<unsigned char>(c);
+            return std::isalnum(u) != 0 || c == '\'';
+        };
+        size_t pos = 0;
+        while (pos + token.size() <= text.size()) {
+            const bool matches = std::equal(
+                token.begin(), token.end(), text.begin() + static_cast<std::ptrdiff_t>(pos),
+                [](char a, char b) {
+                    return std::tolower(static_cast<unsigned char>(a)) ==
+                           std::tolower(static_cast<unsigned char>(b));
+                });
+            const bool left_free = pos == 0 || !is_word_char(text[pos - 1]);
+            const bool right_free = pos + token.size() == text.size() ||
+                                    !is_word_char(text[pos + token.size()]);
+            if (matches && left_free && right_free) {
+                text.replace(pos, token.size(), token);
+                pos += token.size();
+            } else {
+                ++pos;
+            }
+        }
+    }
+    return text;
+}
+
 void write_sse(HttpStreamWriter & writer, const std::string & json) {
     writer.write("data: " + json + "\n\n");
 }
@@ -2197,6 +2238,12 @@ HttpResponse ServerState::handle_typing_telemetry(const std::string & body_text)
     return json_response("{\"status\":\"recorded\"}");
 }
 
+// The active character's name, for spoken-name normalization.
+std::string ServerState::character_name_for_speech() const {
+    std::lock_guard<std::mutex> lock(character_mutex_);
+    return character_.name;
+}
+
 bool ServerState::active_llm_cache_rollback() const {
     if (llm_manager_ == nullptr) {
         return true;
@@ -2803,7 +2850,8 @@ void ServerState::start_chat_speculation(
             if (spec->abort.load()) {
                 return;
             }
-            const auto spoken = strip_speech_markup(sentence);
+            const auto spoken = speak_name_as_written(
+                strip_speech_markup(sentence), character_name_for_speech());
             if (spoken.empty()) {
                 return;
             }
@@ -3206,7 +3254,8 @@ void ServerState::chat_orchestrate(
             if (event.kind == ChatEvent::Kind::Token) {
                 write_token(event.text);
             } else if (event.kind == ChatEvent::Kind::Sentence) {
-                const auto spoken = strip_speech_markup(event.text);
+                const auto spoken = speak_name_as_written(
+                    strip_speech_markup(event.text), character_name_for_speech());
                 if (spoken.empty()) {
                     continue;
                 }

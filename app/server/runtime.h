@@ -188,6 +188,8 @@ private:
     const LlmModelSpec * find_llm_spec(const std::string & id) const;
     // True unless the ACTIVE sidecar model is flagged cache_rollback=false.
     bool active_llm_cache_rollback() const;
+    // The active character's name, for spoken-name normalization.
+    std::string character_name_for_speech() const;
     // Stops the running sidecar, starts `spec`, and blocks until its /health
     // reports the model loaded. On failure the previous model is restarted.
     // Serialized by llm_switch_mutex_.
