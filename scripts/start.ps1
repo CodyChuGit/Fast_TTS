@@ -371,6 +371,23 @@ if (Test-Path -LiteralPath $bonsaiModelPath -PathType Leaf) {
             "--chat-template-kwargs", '{"enable_thinking":false}')
     }
 }
+# Models moved in from the Ollama store (and anything else dropped here):
+# every GGUF in models\ollama is registered automatically, so adding a brain is
+# a file copy rather than an edit. Layer placement is left to llama.cpp's own
+# fitter -- this shelf is deliberately heterogeneous (8B to 27B), and what fits
+# depends on whether the voice stack is resident.
+$ollamaDir = Join-Path $repoRoot "models\ollama"
+if (Test-Path -LiteralPath $ollamaDir) {
+    foreach ($gguf in Get-ChildItem -LiteralPath $ollamaDir -Filter *.gguf -File | Sort-Object Name) {
+        $slug = ($gguf.BaseName -replace "[^A-Za-z0-9]+", "-").ToLower().Trim("-")
+        $llmModels += , [ordered]@{
+            id = $slug
+            name = ("{0} ({1:N0} GB)" -f $gguf.BaseName, ($gguf.Length / 1GB))
+            path = ($gguf.FullName -replace "\\", "/")
+            extra_args = @("-ub", "2048")
+        }
+    }
+}
 $llmAvailable = $false
 if (-not $SkipLlm) {
     if (-not (Test-Path -LiteralPath $llmExe -PathType Leaf)) {
